@@ -1,0 +1,12 @@
+[project]
+name = "marioai"
+version = "0.1.0"
+description = "PPO agent that plays Super Mario Bros from raw pixels"
+requires-python = ">=3.13"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

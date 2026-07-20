@@ -1,0 +1,13 @@
+# Native Gymnasium stack (Python 3.13). UNPINNED on purpose - pip resolves latest
+# 3.13-compatible versions; this file is overwritten by `pip freeze` after the
+# Phase 0 spike passes (see docs/superpowers/plans). Do NOT hand-pin: guessed
+# versions may not exist on PyPI and would hard-fail install before the spike.
+stable-baselines3
+gymnasium
+nes-py
+gym-super-mario-bros
+torch
+opencv-python
+imageio
+tensorboard
+pyyaml
