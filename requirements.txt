@@ -1,13 +1,34 @@
-# Native Gymnasium stack (Python 3.13). UNPINNED on purpose - pip resolves latest
-# 3.13-compatible versions; this file is overwritten by `pip freeze` after the
-# Phase 0 spike passes (see docs/superpowers/plans). Do NOT hand-pin: guessed
-# versions may not exist on PyPI and would hard-fail install before the spike.
-stable-baselines3
-gymnasium
-nes-py
-gym-super-mario-bros
-torch
-opencv-python
-imageio
-tensorboard
-pyyaml
+# Native Gymnasium stack - FROZEN after the Phase 0 spike passed (Python 3.13).
+# On the cloud Linux GPU box: reinstall from this file, then swap the CUDA torch
+# wheel per scripts/aws_provision.md. Regenerate with: uv pip freeze.
+absl-py==2.5.0
+cloudpickle==3.1.2
+farama-notifications==0.0.6
+filelock==3.31.1
+fsspec==2026.6.0
+grpcio==1.82.1
+gym-super-mario-bros==9.1.0
+gymnasium==1.3.0
+imageio==2.37.4
+jinja2==3.1.6
+markdown==3.10.2
+markupsafe==3.0.3
+mpmath==1.3.0
+nes-py==9.0.1
+networkx==3.6.1
+numpy==2.5.1
+opencv-python==5.0.0.93
+packaging==26.2
+pillow==12.3.0
+protobuf==7.35.1
+pyglet==1.5.21
+pyyaml==6.0.3
+setuptools==83.0.0
+stable-baselines3==2.9.0
+sympy==1.14.0
+tensorboard==2.21.0
+tensorboard-data-server==0.7.2
+torch==2.13.0
+tqdm==4.69.0
+typing-extensions==4.16.0
+werkzeug==3.1.8
