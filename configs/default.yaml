@@ -7,10 +7,10 @@ env:
   shape: 84
 train:
   n_envs: 8
-  total_timesteps: 5000000
+  total_timesteps: 6000000
   device: auto          # auto -> cuda if available, else cpu
   seed: 42
-  checkpoint_freq: 100000
+  checkpoint_freq: 500000
   normalize_reward: true
 ppo:
   n_steps: 512
