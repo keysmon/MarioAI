@@ -1,0 +1,35 @@
+# ── Python ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.python-version
+
+# ── ML / RL artifacts ──────────────────────────────────
+# Training logs, tensorboard runs, and checkpoints are large / regenerable.
+runs/
+logs/
+tensorboard/
+*.log
+checkpoints/
+# The FINAL model ships as a GitHub Release asset, NOT in-tree.
+# models/ holds only local checkpoints during training.
+models/
+/mario_*.zip
+
+# ── OS / editor cruft ──────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# ── Claude Code / AI-workflow scaffolding (LOCAL ONLY, never pushed) ──
+# Per personal git-workflow rule: AI tooling + superpowers specs stay local.
+CLAUDE.md
+.claude/
+docs/superpowers/
