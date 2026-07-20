@@ -21,6 +21,8 @@ def main():
     p.add_argument("--levels", nargs="+", default=None,
                    help="Override training levels, e.g. --levels 1-1 1-2")
     p.add_argument("--timesteps", type=int, default=None)
+    p.add_argument("--n-envs", type=int, default=None,
+                   help="Override parallel env count (lower = less memory).")
     p.add_argument("--run-name", required=True)
     args = p.parse_args()
 
@@ -28,11 +30,12 @@ def main():
         cfg = yaml.safe_load(f)
     levels = args.levels or cfg["levels"]["train"]
     timesteps = args.timesteps or cfg["train"]["total_timesteps"]
+    n_envs = args.n_envs or cfg["train"]["n_envs"]
     device = resolve_device(cfg["train"]["device"])
     ppo = cfg["ppo"]
 
     venv = make_vec_env(
-        levels, n_envs=cfg["train"]["n_envs"],
+        levels, n_envs=n_envs,
         frame_stack=cfg["env"]["frame_stack"], skip=cfg["env"]["skip"],
         shape=cfg["env"]["shape"], normalize_reward=cfg["train"]["normalize_reward"],
     )
@@ -49,7 +52,7 @@ def main():
     out_dir = f"models/{args.run_name}"
     os.makedirs(out_dir, exist_ok=True)
     ckpt = CheckpointCallback(
-        save_freq=max(cfg["train"]["checkpoint_freq"] // cfg["train"]["n_envs"], 1),
+        save_freq=max(cfg["train"]["checkpoint_freq"] // n_envs, 1),
         save_path=out_dir, name_prefix="ckpt",
     )
     # verbose=1 prints the per-rollout table (incl. ep_rew_mean); TensorBoard logs
