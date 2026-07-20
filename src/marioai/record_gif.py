@@ -7,21 +7,27 @@ from marioai.envs import make_mario_env
 
 
 def _rollout(model, level, max_steps, skip, shape, frame_stack):
-    """One rollout. Returns (frames, cleared, max_x, steps)."""
+    """One rollout. Returns (frames, cleared, max_x, steps).
+
+    Captures EVERY native game frame (all `skip` intra-step frames), not just
+    1-of-`skip`, so the GIF is smooth rather than choppy.
+    """
     venv = VecFrameStack(
-        DummyVecEnv([lambda: make_mario_env(level=level, skip=skip, shape=shape)]),
+        DummyVecEnv([lambda: make_mario_env(
+            level=level, skip=skip, shape=shape, capture_frames=True)]),
         n_stack=frame_stack, channels_order="last",
     )
     obs = venv.reset()
-    frames, cleared, max_x = [], False, 0
+    frames = [venv.render()]   # initial native 240x256 RGB frame
+    cleared, max_x = False, 0
     step = 0
     for step in range(max_steps):
-        frames.append(venv.render())   # native 240x256 RGB (render_mode set at construction)
         # deterministic=False: the NES emulator is deterministic, so greedy rollouts
         # would be identical every time. Sampling gives the variation that makes
         # "keep the cleanest of N" meaningful.
         action, _ = model.predict(obs, deterministic=False)
         obs, _, dones, infos = venv.step(action)
+        frames.extend(venv.get_attr("last_frames")[0])  # all intra-skip native frames
         cleared = cleared or bool(infos[0].get("flag_get", False))
         max_x = max(max_x, int(infos[0].get("x_pos", 0)))
         if bool(dones[0]):
@@ -41,8 +47,15 @@ def record(model, level, out, rollouts=5, fps=30, max_steps=3000,
     else:
         best = max(runs, key=lambda r: r[2])        # best partial = furthest x
         outcome = f"partial (x_pos={best[2]})"
-    imageio.mimsave(out, best[0], fps=fps)
-    print(f"{level}: {outcome} -> {out}")
+    frames = best[0]
+    # Cap GIF length for a reasonable README file size. Subsampling a full-frame
+    # capture by ~2x and playing at fps=30 also yields roughly real-time speed.
+    max_gif_frames = 900
+    if len(frames) > max_gif_frames:
+        stride = len(frames) // max_gif_frames + 1
+        frames = frames[::stride]
+    imageio.mimsave(out, frames, fps=fps)
+    print(f"{level}: {outcome} -> {out} ({len(frames)} frames)")
     return outcome
 
 

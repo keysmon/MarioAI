@@ -21,6 +21,9 @@ class _FakeEnv(gym.Env):
         obs = np.full((240, 256, 3), self.steps, np.uint8)
         return obs, 1.0, self.steps >= self.term_at, False, {"steps": self.steps}
 
+    def render(self):
+        return np.full((240, 256, 3), self.steps, np.uint8)
+
 
 def test_skipframe_sums_reward_over_skip():
     env = SkipFrame(_FakeEnv(), skip=4)
@@ -37,6 +40,28 @@ def test_skipframe_breaks_on_early_termination():
     obs, reward, terminated, truncated, info = env.step(0)
     assert reward == 2.0
     assert terminated
+
+
+def test_skipframe_captures_intra_skip_frames():
+    env = SkipFrame(_FakeEnv(), skip=4, capture_frames=True)
+    env.reset()
+    env.step(0)
+    assert len(env.last_frames) == 4
+    assert env.last_frames[0].shape == (240, 256, 3)
+
+
+def test_skipframe_capture_stops_at_termination():
+    env = SkipFrame(_FakeEnv(term_at=2), skip=4, capture_frames=True)
+    env.reset()
+    env.step(0)
+    assert len(env.last_frames) == 2
+
+
+def test_skipframe_no_capture_by_default():
+    env = SkipFrame(_FakeEnv(), skip=4)
+    env.reset()
+    env.step(0)
+    assert env.last_frames == []
 
 
 def test_grayscale_resize_shape_and_dtype():
