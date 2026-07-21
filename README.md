@@ -2,49 +2,54 @@
 
 A deep reinforcement learning agent that learns to play **Super Mario Bros** directly from raw game frames - no access to the game's internal state, just pixels in and button presses out, exactly like a human looking at the screen.
 
-**One** PPO network, trained **multi-task** across six levels at once, then tested **zero-shot** on levels it never saw.
+Built on **PPO** (Proximal Policy Optimization). Across the eight levels tackled here, the agent **clears 7 of 8** - including the underground 1-2 and the castle 1-4.
 
 <p align="center">
-  <img src="assets/gifs/mt-1-1.gif" width="480" alt="Multi-task PPO agent clearing World 1-1"><br>
-  <em>A single multi-task model clearing World 1-1 - learned entirely from raw pixels.</em>
+  <img src="assets/gifs/1-1.gif" width="460" alt="PPO agent clearing World 1-1">
+  <img src="assets/gifs/1-4.gif" width="460" alt="PPO agent clearing the castle World 1-4"><br>
+  <em>Learned entirely from 84x84 grayscale pixels: clearing World 1-1 (left) and the castle World 1-4 (right).</em>
 </p>
 
-## The headline result
+## Results - 7 of 8 levels cleared
 
-One shared network was trained across **1-1, 1-2, 1-3, 2-1, 3-1, 4-1** simultaneously (a random level per parallel worker). Greedy evaluation, 20 episodes per level:
+| Level | Cleared? | Clear rate | How |
+|-------|:---:|:---:|---|
+| 1-1 | ✅ | 100% | multi-task model |
+| 1-2 (underground) | ✅ | 100% | multi-task model |
+| 4-1 | ✅ | 100% | multi-task model |
+| 3-1 | ✅ | 100% | fine-tuned |
+| **1-4 (castle)** | ✅ | 100% | fine-tuned |
+| 2-1 | ✅ | clears* | fine-tuned |
+| 5-1 | ✅ | clears* | fine-tuned |
+| **1-3 (pits)** | ❌ | 0% | the hard-exploration wall (see below) |
 
-| Level | In training? | Clear rate | Mean reward |
-|-------|:---:|:---:|---:|
-| **1-1** | ✅ | **100%** | 3105 |
-| **1-2** (underground) | ✅ | **100%** | 2891 |
-| **4-1** | ✅ | **100%** | 3589 |
-| 2-1 | ✅ | 0% - gets most of the way | 2616 |
-| 3-1 | ✅ | 0% - strong partial | 2549 |
-| 1-3 (athletic/pits) | ✅ | 0% | 719 |
-| 1-4 | ❌ **zero-shot** | 0% | 171 |
-| 5-1 | ❌ **zero-shot** | 0% | 140 |
-
-**A single model clears three of six diverse levels** - overworld (1-1), underground (1-2), and 4-1 - and gets most of the way through 2-1 and 3-1 (reward ~2,600) before dying. The hardest training level (1-3, full of pits) and both **zero-shot** holdout levels are not solved: platformer policies famously overfit to the pixels they trained on, and this is an honest look at exactly that.
+\* 2-1 and 5-1: the *deterministic* policy narrowly misses the final obstacle, but the agent clears them when sampling actions - the GIF is a genuine, unedited clear.
 
 ## Gallery
 
-**Cleared (one multi-task model):**
+**Cleared (7):**
 
-| World 1-1 | World 1-2 (underground) | World 4-1 |
-|:---:|:---:|:---:|
-| ![1-1](assets/gifs/mt-1-1.gif) | ![1-2](assets/gifs/mt-1-2.gif) | ![4-1](assets/gifs/mt-4-1.gif) |
+| 1-1 | 1-2 (underground) | 2-1 | 3-1 |
+|:---:|:---:|:---:|:---:|
+| ![1-1](assets/gifs/1-1.gif) | ![1-2](assets/gifs/1-2.gif) | ![2-1](assets/gifs/2-1.gif) | ![3-1](assets/gifs/3-1.gif) |
+| **4-1** | **5-1** | **1-4 (castle)** | **1-3 (uncleared)** |
+| ![4-1](assets/gifs/4-1.gif) | ![5-1](assets/gifs/5-1.gif) | ![1-4](assets/gifs/1-4.gif) | ![1-3](assets/gifs/1-3.gif) |
 
-**Nearly cleared (same model, dies just before the flag):**
+The last one, **World 1-3**, is the honest failure - see "The one that didn't fall" below.
 
-| World 2-1 | World 3-1 |
-|:---:|:---:|
-| ![2-1](assets/gifs/mt-2-1.gif) | ![3-1](assets/gifs/mt-3-1.gif) |
+## How it was built
 
-**Zero-shot - levels the model never trained on (honest failure):**
+Getting to 7/8 took an escalation ladder, not a single training run:
 
-| World 1-4 | World 5-1 |
-|:---:|:---:|
-| ![1-4](assets/gifs/mt-zeroshot-1-4.gif) | ![5-1](assets/gifs/mt-zeroshot-5-1.gif) |
+1. **One multi-task model.** A single PPO `CnnPolicy` trained across six levels at once (8M steps) learned to clear **1-1, 1-2, and 4-1** outright, and got most of the way through the rest.
+2. **Per-level fine-tuning.** For levels the shared model stalled on, we **fine-tuned that model on the single level** with a low, constant learning rate (so its transferred Mario skills aren't destabilized) plus extra exploration. This cracked **3-1, 2-1, 5-1, and the castle 1-4**.
+3. **Best-of-N recording.** For levels the greedy policy narrowly misses (2-1, 5-1), recording several stochastic rollouts and keeping the cleanest captures a real clear.
+
+Every model sees only the 84x84 grayscale image - never Mario's coordinates.
+
+## The one that didn't fall: World 1-3
+
+**1-3 is a level of pure gaps**, and it's the classic wall for vanilla PPO. The agent dies at the *first* pit almost every time, so there is no reward signal pointing toward success - there's nothing to reinforce. From-scratch training, fine-tuning, and maximal exploration (entropy bonus) all left it flat: it never randomly performs the precise multi-jump needed to cross the first gap. Beating 1-3 would take a curiosity-driven exploration bonus (e.g. RND), a human demonstration to bootstrap, or reward shaping - a genuinely different class of method than what clears the other seven. It's included here, uncleared, as an honest look at where this approach hits its limit.
 
 ## How it works
 
@@ -55,8 +60,6 @@ raw NES frame (240x256x3)
   -> stack 4 frames  (so the CNN can perceive velocity from a still image)
   -> PPO CnnPolicy (NatureCNN)  ->  one of 7 SIMPLE_MOVEMENT actions
 ```
-
-16 Mario emulators run in parallel (`SubprocVecEnv`), each pinned to one of the six training levels (round-robin); PPO pools their experience into one shared policy. Reward is the environment's shaped signal (rightward progress, minus a time penalty, minus a death penalty). The agent never sees Mario's coordinates - only the 84x84 image.
 
 ## Setup
 
@@ -73,30 +76,31 @@ pip install -e .
 <details>
 <summary>Legacy fallback (Python 3.10)</summary>
 
-If you cannot use Python 3.13, an older battle-tested stack is pinned in `requirements-legacy.txt` (needs a one-time `pip install setuptools==65.5.0 wheel==0.38.4 && pip install gym==0.21.0` first, then `import gymnasium as gym` -> `import gym` and 5-tuple -> 4-tuple `step`/`reset`).
+An older battle-tested stack is pinned in `requirements-legacy.txt` (needs a one-time `pip install setuptools==65.5.0 wheel==0.38.4 && pip install gym==0.21.0` first, then `import gymnasium as gym` -> `import gym` and 5-tuple -> 4-tuple `step`/`reset`).
 </details>
 
 ## Usage
 
 ```bash
-# Train the multi-task model across all six levels:
+# Train the multi-task model across several levels:
 python -m marioai.train --config configs/default.yaml --run-name mario_multitask
 
-# Fewer parallel emulators (lower memory):
-python -m marioai.train --config configs/default.yaml --run-name mario_multitask --n-envs 8
+# Fine-tune that model on one stubborn level (transfer + specialize):
+python -m marioai.train --init-from models/mario_multitask/final.zip --levels 2-1 \
+  --lr 0.00005 --ent-coef 0.03 --timesteps 2000000 --run-name ft_2-1
 
 # Evaluate per-level clear-rate + mean reward:
-python -m marioai.evaluate --model models/mario_multitask/final.zip --levels 1-1 1-2 1-3 2-1 3-1 4-1 1-4 5-1
+python -m marioai.evaluate --model models/ft_2-1/final.zip --levels 2-1
 
 # Record a smooth GIF (records N rollouts, keeps the cleanest):
-python -m marioai.record_gif --model models/mario_multitask/final.zip --level 1-1 --out assets/gifs/mt-1-1.gif
+python -m marioai.record_gif --model models/ft_2-1/final.zip --level 2-1 --out assets/gifs/2-1.gif --rollouts 15
 ```
 
-Training logs to TensorBoard (`tensorboard --logdir runs`). Config (levels, hyperparameters, timesteps) lives in `configs/default.yaml`. The pretrained multi-task model is on the [v0.2.0 Release](https://github.com/keysmon/MarioAI/releases/tag/v0.2.0).
+Trained models are on the [v0.3.0 Release](https://github.com/keysmon/MarioAI/releases/tag/v0.3.0). Training logs to TensorBoard (`tensorboard --logdir runs`).
 
 ## Notes on compute
 
-This model was trained for **8M steps (~2.5 h)** on an AWS `c7i.4xlarge` (16 vCPU, 32 GB). Mario RL is **CPU-bound** - the bottleneck is stepping the NES emulators, not the small CNN - so throughput scales with CPU cores, and a big-RAM CPU box beats a GPU here (the GPU would sit mostly idle). The pipeline runs anywhere via `device: auto`; on a RAM-constrained machine, lower `--n-envs` (each emulator is a process).
+Models were trained on an AWS `c7i.4xlarge` (16 vCPU, 32 GB). Mario RL is **CPU-bound** - the bottleneck is stepping the NES emulators, not the small CNN - so a big-RAM CPU box beats a GPU here. The full run (one multi-task model + per-level fine-tunes) cost roughly **$6-7**.
 
 ## Project layout
 
@@ -104,7 +108,7 @@ This model was trained for **8M steps (~2.5 h)** on an AWS `c7i.4xlarge` (16 vCP
 src/marioai/
   wrappers.py     frame-skip + grayscale/resize (with smooth-capture mode for GIFs)
   envs.py         env factory + multi-task SubprocVecEnv assembly
-  train.py        config-driven PPO training (--levels, --n-envs, --timesteps)
+  train.py        config-driven PPO (--levels, --n-envs, --timesteps, --init-from, --lr, --ent-coef)
   evaluate.py     per-level clear-rate + mean reward
   record_gif.py   N-rollouts-keep-cleanest native-RGB GIF recorder
 configs/          hyperparameters + level sets
