@@ -194,6 +194,7 @@ def test_vec_env_with_snapshot_starts_smoke(tmp_path):
             obs, rewards, dones, infos = venv.step(
                 np.array([RIGHT_B, RIGHT_B]))
         assert obs.shape == (2, 84, 84, 4)
+        assert len(infos) == 2
         assert all("curriculum_frontier" in i for i in infos)
     finally:
         venv.close()
