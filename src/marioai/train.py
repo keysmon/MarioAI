@@ -26,6 +26,9 @@ def main():
     p.add_argument("--init-from", default=None,
                    help="Fine-tune: load policy weights from this model .zip and "
                         "continue training on --levels (transfer from a strong base).")
+    p.add_argument("--lr", type=float, default=None,
+                   help="Constant learning rate override (use a low value like 5e-5 "
+                        "when fine-tuning, so a converged policy isn't destabilized).")
     p.add_argument("--run-name", required=True)
     args = p.parse_args()
 
@@ -49,6 +52,11 @@ def main():
         print(f"FINE-TUNE from {args.init_from}")
         model = PPO.load(args.init_from, env=venv, device=device,
                          tensorboard_log=f"runs/{args.run_name}")
+        if args.lr:
+            # Override the restored (high, scheduled) LR with a low constant one so
+            # the converged policy is nudged, not knocked off its solution.
+            model.learning_rate = args.lr
+            model.lr_schedule = lambda _progress, _lr=args.lr: _lr
     else:
         model = PPO(
             "CnnPolicy", venv, device=device, seed=cfg["train"]["seed"],
