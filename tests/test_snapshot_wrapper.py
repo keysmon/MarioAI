@@ -80,6 +80,50 @@ def test_corrupt_route_fails_loud(tmp_path):
     wrapped.close()
 
 
+def test_restore_earlier_waypoint_resyncs_caches(tmp_path):
+    # three-waypoint route so a NON-final index is restored for real:
+    # capture leaves the emulator at frame 80, then reset jumps BACK to
+    # frame 40 - a genuine position-jump restore that only passes if the
+    # reward caches were re-based on the restored state
+    env = _raw_env()
+    _, info = env.reset(seed=0)
+    xs = {0: int(info["x_pos"])}
+    actions = []
+    for f in range(1, 81):
+        _, _, term, trunc, info = env.step(RIGHT_B)
+        assert not (term or trunc), "died while building the probe route"
+        actions.append(RIGHT_B)
+        if f in (40, 80):
+            xs[f] = int(info["x_pos"])
+    env.close()
+    route = {
+        "level": "1-1",
+        "actions": actions,
+        "waypoints": [
+            {"index": 0, "frame": 0, "x_pos": xs[0]},
+            {"index": 1, "frame": 40, "x_pos": xs[40]},
+            {"index": 2, "frame": 80, "x_pos": xs[80]},
+        ],
+    }
+    save_route(route, tmp_path)
+
+    sched = CurriculumSchedule(3, window=1, history=1)
+    sched.frontier = 1  # force restores of the MIDDLE waypoint only
+    wrapped = SnapshotStartWrapper(_raw_env(), load_route(tmp_path),
+                                   schedule=sched)
+    _, info = wrapped.reset(seed=0)
+    assert info["curriculum_start"] == 1
+    assert abs(info["x_pos"] - xs[40]) <= 4
+    raw = wrapped.env.unwrapped
+    # resync must have re-based every reward cache on the RESTORED state
+    assert raw._time_last == raw._time
+    assert raw._x_position_max == raw._x_position
+    assert raw._score_last == raw._score
+    _, reward, _, _, _ = wrapped.step(0)
+    assert -2.0 <= reward <= 6.0
+    wrapped.close()
+
+
 class _FakeSnapEnv(gym.Env):
     """Emulator-free stand-in exposing the attrs SnapshotStartWrapper touches.
 
