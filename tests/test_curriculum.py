@@ -1,6 +1,8 @@
 """Pure-logic tests for the reverse-curriculum schedule and waypoint IO."""
 import random
 
+import pytest
+
 from marioai.curriculum import (
     CurriculumSchedule,
     Waypoint,
@@ -12,6 +14,11 @@ from marioai.curriculum import (
 def test_frontier_starts_at_last_waypoint():
     s = CurriculumSchedule(8)
     assert s.frontier == 7
+
+
+def test_window_must_be_positive():
+    with pytest.raises(ValueError):
+        CurriculumSchedule(8, window=0)
 
 
 def test_sample_start_stays_in_window():

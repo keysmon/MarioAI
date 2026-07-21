@@ -35,6 +35,8 @@ class CurriculumSchedule:
                  history=10, rng=None):
         if n_waypoints < 1:
             raise ValueError("need at least one waypoint")
+        if window < 1:
+            raise ValueError("window must be >= 1")
         self.n = n_waypoints
         self.window = window
         self.advance_threshold = advance_threshold
@@ -49,7 +51,7 @@ class CurriculumSchedule:
     def record(self, cleared):
         self._results.append(bool(cleared))
         full = len(self._results) == self._results.maxlen
-        rate = sum(self._results) / max(len(self._results), 1)
+        rate = sum(self._results) / len(self._results)
         if self.frontier > 0 and full and rate >= self.advance_threshold:
             self.frontier -= 1
             self._results.clear()
@@ -71,6 +73,11 @@ def save_waypoints(waypoints, out_dir):
 
 
 def load_waypoints(in_dir):
+    """Load waypoints saved by `save_waypoints`.
+
+    Snapshots are unpickled; only load waypoint dirs produced by our own
+    solver (scripts/solve_level.py).
+    """
     src = Path(in_dir)
     with open(src / "manifest.json") as f:
         manifest = json.load(f)
