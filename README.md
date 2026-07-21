@@ -2,55 +2,49 @@
 
 A deep reinforcement learning agent that learns to play **Super Mario Bros** directly from raw game frames - no access to the game's internal state, just pixels in and button presses out, exactly like a human looking at the screen.
 
-Built on **PPO** (Proximal Policy Optimization) and the `gym-super-mario-bros` NES environment.
+**One** PPO network, trained **multi-task** across six levels at once, then tested **zero-shot** on levels it never saw.
 
 <p align="center">
-  <img src="assets/gifs/1-1.gif" width="480" alt="PPO agent clearing World 1-1"><br>
-  <em>The trained agent clearing World 1-1 - learned entirely from raw pixels, <b>100% clear rate</b> over 20 greedy episodes.</em>
+  <img src="assets/gifs/mt-1-1.gif" width="480" alt="Multi-task PPO agent clearing World 1-1"><br>
+  <em>A single multi-task model clearing World 1-1 - learned entirely from raw pixels.</em>
 </p>
 
-## What's here
+## The headline result
 
-This repo is a complete, tested PPO pipeline for Mario:
+One shared network was trained across **1-1, 1-2, 1-3, 2-1, 3-1, 4-1** simultaneously (a random level per parallel worker). Greedy evaluation, 20 episodes per level:
 
-- **Learning from pixels alone.** The agent never sees Mario's x-position or enemy locations as numbers - it perceives them from an 84x84 grayscale image, like the classic DeepMind Atari work. A convolutional network does the seeing.
-- **A multi-task training pipeline.** `train.py` trains one network across a *set* of levels at once (a worker per level in a `SubprocVecEnv`), so a single model can learn many levels - and an `evaluate.py` that measures per-level clear-rate for a held-out **zero-shot** generalization test.
-- **Smooth GIF recording.** `record_gif.py` plays N rollouts, keeps the cleanest, and captures every native game frame for smooth playback.
+| Level | In training? | Clear rate | Mean reward |
+|-------|:---:|:---:|---:|
+| **1-1** | ✅ | **100%** | 3105 |
+| **1-2** (underground) | ✅ | **100%** | 2891 |
+| **4-1** | ✅ | **100%** | 3589 |
+| 2-1 | ✅ | 0% - gets most of the way | 2616 |
+| 3-1 | ✅ | 0% - strong partial | 2549 |
+| 1-3 (athletic/pits) | ✅ | 0% | 719 |
+| 1-4 | ❌ **zero-shot** | 0% | 171 |
+| 5-1 | ❌ **zero-shot** | 0% | 140 |
 
-## What this build demonstrates
-
-This session trained on an 18 GB laptop (CPU), which bounds what fits in memory. What's shown here:
-
-1. **World 1-1 specialist - solved.** Trained to a **100% clear rate** (20/20 greedy episodes, mean reward 3106). That's the hero GIF above.
-2. **Zero-shot generalization of that specialist.** The 1-1 model has only ever seen World 1-1. Below it plays **six levels it has never encountered**. It doesn't clear them - platformer agents famously overfit to the pixels they trained on - but it clearly transfers "run right, jump gaps, stomp enemies," navigating the opening stretch of each unseen level. An honest look at what a single-level agent generalizes.
-
-> **The full multi-task run** (one model trained across all six levels + the designed zero-shot holdout on `1-4`, `5-1`) is fully implemented and runnable - it just needs more RAM than this laptop had (the 8-emulator job was killed by the OS memory manager). Run `python -m marioai.train --config configs/default.yaml --run-name mario_multitask` on a machine with more memory, or use the documented AWS GPU workflow in [`scripts/aws_provision.md`](scripts/aws_provision.md).
-
-## Results
-
-| Model | Level | Seen in training? | Outcome |
-|-------|-------|:---:|---------|
-| 1-1 specialist | 1-1 | ✅ | **100% clear** (mean reward 3106) |
-| 1-1 specialist | 2-1 | ❌ zero-shot | partial - navigates the opening overworld section |
-| 1-1 specialist | 1-2 | ❌ zero-shot | partial - runs through the underground start, stomping enemies |
-| 1-1 specialist | 3-1 | ❌ zero-shot | partial - clears the first obstacles |
-| 1-1 specialist | 4-1 | ❌ zero-shot | partial - handles the opening platforms |
-
-📦 **Pretrained 1-1 model:** download `mario_1-1_ppo.zip` from the [v0.1.0 Release](https://github.com/keysmon/MarioAI/releases/tag/v0.1.0) and load it with `PPO.load(...)`.
+**A single model clears three of six diverse levels** - overworld (1-1), underground (1-2), and 4-1 - and gets most of the way through 2-1 and 3-1 (reward ~2,600) before dying. The hardest training level (1-3, full of pits) and both **zero-shot** holdout levels are not solved: platformer policies famously overfit to the pixels they trained on, and this is an honest look at exactly that.
 
 ## Gallery
 
-**Trained (World 1-1) - cleared:** see the hero GIF above.
+**Cleared (one multi-task model):**
 
-**Zero-shot - the 1-1 model on levels it never trained on:**
+| World 1-1 | World 1-2 (underground) | World 4-1 |
+|:---:|:---:|:---:|
+| ![1-1](assets/gifs/mt-1-1.gif) | ![1-2](assets/gifs/mt-1-2.gif) | ![4-1](assets/gifs/mt-4-1.gif) |
 
-| World 2-1 | World 1-2 |
+**Nearly cleared (same model, dies just before the flag):**
+
+| World 2-1 | World 3-1 |
 |:---:|:---:|
-| ![2-1](assets/gifs/zeroshot-2-1.gif) | ![1-2](assets/gifs/zeroshot-1-2.gif) |
-| **World 3-1** | **World 4-1** |
-| ![3-1](assets/gifs/zeroshot-3-1.gif) | ![4-1](assets/gifs/zeroshot-4-1.gif) |
+| ![2-1](assets/gifs/mt-2-1.gif) | ![3-1](assets/gifs/mt-3-1.gif) |
 
-*These are honest partials: the agent plays smoothly but dies before the flag - it was only ever trained on 1-1.*
+**Zero-shot - levels the model never trained on (honest failure):**
+
+| World 1-4 | World 5-1 |
+|:---:|:---:|
+| ![1-4](assets/gifs/mt-zeroshot-1-4.gif) | ![5-1](assets/gifs/mt-zeroshot-5-1.gif) |
 
 ## How it works
 
@@ -62,7 +56,7 @@ raw NES frame (240x256x3)
   -> PPO CnnPolicy (NatureCNN)  ->  one of 7 SIMPLE_MOVEMENT actions
 ```
 
-Parallel Mario emulators run in a `SubprocVecEnv`; PPO pools their experience into one shared policy. Reward is the environment's shaped signal (rightward progress, minus a time penalty, minus a death penalty).
+16 Mario emulators run in parallel (`SubprocVecEnv`), each pinned to one of the six training levels (round-robin); PPO pools their experience into one shared policy. Reward is the environment's shaped signal (rightward progress, minus a time penalty, minus a death penalty). The agent never sees Mario's coordinates - only the 84x84 image.
 
 ## Setup
 
@@ -79,36 +73,30 @@ pip install -e .
 <details>
 <summary>Legacy fallback (Python 3.10)</summary>
 
-If you cannot use Python 3.13, an older battle-tested stack is pinned in `requirements-legacy.txt`. It needs a one-time pre-step (the `gym==0.21` setuptools quirk):
-
-```bash
-pip install setuptools==65.5.0 wheel==0.38.4
-pip install gym==0.21.0
-pip install -r requirements-legacy.txt
-```
-Then switch `import gymnasium as gym` -> `import gym` and the 5-tuple `step`/`reset` to old-gym 4-tuples.
+If you cannot use Python 3.13, an older battle-tested stack is pinned in `requirements-legacy.txt` (needs a one-time `pip install setuptools==65.5.0 wheel==0.38.4 && pip install gym==0.21.0` first, then `import gymnasium as gym` -> `import gym` and 5-tuple -> 4-tuple `step`/`reset`).
 </details>
 
 ## Usage
 
 ```bash
-# Train a single level (this is how the 1-1 specialist above was made):
-python -m marioai.train --config configs/default.yaml --levels 1-1 --timesteps 1000000 --run-name mario_1_1
-
-# Train the multi-task model across all default levels (needs more RAM):
+# Train the multi-task model across all six levels:
 python -m marioai.train --config configs/default.yaml --run-name mario_multitask
 
-# Lower memory: fewer parallel emulators
-python -m marioai.train --config configs/default.yaml --levels 1-1 --n-envs 4 --run-name mario_1_1
+# Fewer parallel emulators (lower memory):
+python -m marioai.train --config configs/default.yaml --run-name mario_multitask --n-envs 8
 
-# Evaluate clear-rate + mean reward:
-python -m marioai.evaluate --model models/mario_1_1/final.zip --levels 1-1 2-1 1-2
+# Evaluate per-level clear-rate + mean reward:
+python -m marioai.evaluate --model models/mario_multitask/final.zip --levels 1-1 1-2 1-3 2-1 3-1 4-1 1-4 5-1
 
 # Record a smooth GIF (records N rollouts, keeps the cleanest):
-python -m marioai.record_gif --model models/mario_1_1/final.zip --level 1-1 --out assets/gifs/1-1.gif
+python -m marioai.record_gif --model models/mario_multitask/final.zip --level 1-1 --out assets/gifs/mt-1-1.gif
 ```
 
-Training logs to TensorBoard (`tensorboard --logdir runs`). Config (levels, hyperparameters, timesteps) lives in `configs/default.yaml`.
+Training logs to TensorBoard (`tensorboard --logdir runs`). Config (levels, hyperparameters, timesteps) lives in `configs/default.yaml`. The pretrained multi-task model is on the [v0.2.0 Release](https://github.com/keysmon/MarioAI/releases/tag/v0.2.0).
+
+## Notes on compute
+
+This model was trained for **8M steps (~2.5 h)** on an AWS `c7i.4xlarge` (16 vCPU, 32 GB). Mario RL is **CPU-bound** - the bottleneck is stepping the NES emulators, not the small CNN - so throughput scales with CPU cores, and a big-RAM CPU box beats a GPU here (the GPU would sit mostly idle). The pipeline runs anywhere via `device: auto`; on a RAM-constrained machine, lower `--n-envs` (each emulator is a process).
 
 ## Project layout
 
@@ -123,10 +111,6 @@ configs/          hyperparameters + level sets
 scripts/          spike, train, record, AWS runbook
 tests/            wrapper unit tests + PPO smoke test
 ```
-
-## Notes on training & compute
-
-The pipeline runs on CPU or GPU (`device: auto`). Emulators are CPU-bound, so throughput scales with CPU cores; a GPU mainly speeds the policy update. Parallel emulators are memory-hungry - on a RAM-constrained machine, lower `--n-envs` (each emulator is a process). The 1-1 specialist here trained in ~15 minutes on an M3 Pro at 8 envs (~1000 env-steps/sec). `scripts/aws_provision.md` documents an on-demand AWS GPU workflow (quota preflight -> train -> download -> terminate) for the full multi-task run.
 
 ## License
 
