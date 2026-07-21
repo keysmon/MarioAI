@@ -16,6 +16,7 @@ from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
 from nes_py.wrappers import JoypadSpace
 
 from marioai.curriculum import CurriculumSchedule, load_route, save_route
+from marioai.envs import make_vec_env
 from marioai.wrappers import SnapshotStartWrapper
 
 RIGHT_B = 3
@@ -180,3 +181,19 @@ def test_wrapper_advances_frontier_on_clears():
         assert "curriculum_frontier" in info
     # 2 clears -> frontier 1, history reset; 2 more clears -> frontier 0
     assert sched.frontier == 0
+
+
+def test_vec_env_with_snapshot_starts_smoke(tmp_path):
+    """Full stack: SubprocVecEnv workers replay the route from disk."""
+    save_route(_make_route(), tmp_path)
+    venv = make_vec_env(["1-1"], n_envs=2, snapshot_dir=str(tmp_path))
+    try:
+        obs = venv.reset()
+        assert obs.shape == (2, 84, 84, 4)
+        for _ in range(20):
+            obs, rewards, dones, infos = venv.step(
+                np.array([RIGHT_B, RIGHT_B]))
+        assert obs.shape == (2, 84, 84, 4)
+        assert all("curriculum_frontier" in i for i in infos)
+    finally:
+        venv.close()
