@@ -23,6 +23,9 @@ def main():
     p.add_argument("--timesteps", type=int, default=None)
     p.add_argument("--n-envs", type=int, default=None,
                    help="Override parallel env count (lower = less memory).")
+    p.add_argument("--init-from", default=None,
+                   help="Fine-tune: load policy weights from this model .zip and "
+                        "continue training on --levels (transfer from a strong base).")
     p.add_argument("--run-name", required=True)
     args = p.parse_args()
 
@@ -40,14 +43,21 @@ def main():
         shape=cfg["env"]["shape"], normalize_reward=cfg["train"]["normalize_reward"],
     )
 
-    model = PPO(
-        "CnnPolicy", venv, device=device, seed=cfg["train"]["seed"],
-        n_steps=ppo["n_steps"], batch_size=ppo["batch_size"],
-        n_epochs=ppo["n_epochs"], gamma=ppo["gamma"],
-        learning_rate=LinearSchedule(ppo["learning_rate"], 0.0, 1.0),
-        clip_range=ppo["clip_range"], ent_coef=ppo["ent_coef"],
-        vf_coef=ppo["vf_coef"], tensorboard_log=f"runs/{args.run_name}", verbose=1,
-    )
+    if args.init_from:
+        # Fine-tune: load the pretrained policy, attach the new (single-level) env,
+        # and continue. reset_num_timesteps=True (below) restarts the LR schedule.
+        print(f"FINE-TUNE from {args.init_from}")
+        model = PPO.load(args.init_from, env=venv, device=device,
+                         tensorboard_log=f"runs/{args.run_name}")
+    else:
+        model = PPO(
+            "CnnPolicy", venv, device=device, seed=cfg["train"]["seed"],
+            n_steps=ppo["n_steps"], batch_size=ppo["batch_size"],
+            n_epochs=ppo["n_epochs"], gamma=ppo["gamma"],
+            learning_rate=LinearSchedule(ppo["learning_rate"], 0.0, 1.0),
+            clip_range=ppo["clip_range"], ent_coef=ppo["ent_coef"],
+            vf_coef=ppo["vf_coef"], tensorboard_log=f"runs/{args.run_name}", verbose=1,
+        )
 
     out_dir = f"models/{args.run_name}"
     os.makedirs(out_dir, exist_ok=True)
@@ -57,7 +67,7 @@ def main():
     )
     # verbose=1 prints the per-rollout table (incl. ep_rew_mean); TensorBoard logs
     # the full curves. No progress_bar to avoid the extra `rich` dependency.
-    model.learn(total_timesteps=timesteps, callback=ckpt)
+    model.learn(total_timesteps=timesteps, callback=ckpt, reset_num_timesteps=True)
     model.save(f"{out_dir}/final")
     if cfg["train"]["normalize_reward"]:
         venv.save(f"{out_dir}/vecnormalize.pkl")
