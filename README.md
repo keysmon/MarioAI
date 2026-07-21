@@ -36,6 +36,8 @@ This session trained on an 18 GB laptop (CPU), which bounds what fits in memory.
 | 1-1 specialist | 3-1 | ❌ zero-shot | partial - clears the first obstacles |
 | 1-1 specialist | 4-1 | ❌ zero-shot | partial - handles the opening platforms |
 
+📦 **Pretrained 1-1 model:** download `mario_1-1_ppo.zip` from the [v0.1.0 Release](https://github.com/keysmon/MarioAI/releases/tag/v0.1.0) and load it with `PPO.load(...)`.
+
 ## Gallery
 
 **Trained (World 1-1) - cleared:** see the hero GIF above.
