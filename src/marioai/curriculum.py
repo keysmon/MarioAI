@@ -1,24 +1,18 @@
-"""Reverse-curriculum schedule + waypoint persistence for snapshot starts.
+"""Reverse-curriculum schedule + route persistence for snapshot starts.
 
-Waypoints are emulator snapshots along a solved trajectory (see
-scripts/solve_level.py). Index 0 is the level start; the last index is
-nearest the flag. The schedule starts episodes near the flag and slides the
-start earlier as the policy masters each segment (Salimans & Chen 2018).
+A route is a solved trajectory (see scripts/solve_level.py) persisted as an
+action sequence plus waypoint markers - not emulator snapshots directly,
+since nes-py snapshots are same-process-only and can't cross disk or a
+subprocess boundary. Waypoint index 0 is the level start; the last index is
+nearest the flag. SnapshotStartWrapper replays the actions once per worker to
+rebuild in-process snapshots at each waypoint frame. The schedule starts
+episodes near the flag and slides the start earlier as the policy masters
+each segment (Salimans & Chen 2018).
 """
 import json
-import pickle
 import random
 from collections import deque
-from dataclasses import dataclass
 from pathlib import Path
-
-
-@dataclass
-class Waypoint:
-    index: int
-    frame: int
-    x_pos: int
-    state: object  # opaque nes-py emulator snapshot (dump_state())
 
 
 class CurriculumSchedule:
@@ -59,34 +53,19 @@ class CurriculumSchedule:
             self._results.clear()
 
 
-def save_waypoints(waypoints, out_dir):
-    """Write snapshots as wp_NNN.pkl plus a manifest.json describing them."""
+def save_route(route, out_dir):
+    """Write a solved route (action sequence + waypoint markers) as JSON."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    manifest = []
-    for wp in waypoints:
-        fname = f"wp_{wp.index:03d}.pkl"
-        with open(out / fname, "wb") as f:
-            pickle.dump(wp.state, f)
-        manifest.append(dict(index=wp.index, frame=wp.frame,
-                             x_pos=int(wp.x_pos), file=fname))
-    with open(out / "manifest.json", "w") as f:
-        json.dump(manifest, f, indent=2)
+    with open(out / "route.json", "w") as f:
+        json.dump(route, f, indent=2)
 
 
-def load_waypoints(in_dir):
-    """Load waypoints saved by `save_waypoints`.
-
-    Snapshots are unpickled; only load waypoint dirs produced by our own
-    solver (scripts/solve_level.py).
-    """
-    src = Path(in_dir)
-    with open(src / "manifest.json") as f:
-        manifest = json.load(f)
-    waypoints = []
-    for entry in sorted(manifest, key=lambda e: e["index"]):
-        with open(src / entry["file"], "rb") as f:
-            state = pickle.load(f)
-        waypoints.append(Waypoint(entry["index"], entry["frame"],
-                                  entry["x_pos"], state))
-    return waypoints
+def load_route(in_dir):
+    """Load route.json; raises ValueError if required keys are missing."""
+    with open(Path(in_dir) / "route.json") as f:
+        route = json.load(f)
+    for key in ("level", "actions", "waypoints"):
+        if key not in route:
+            raise ValueError(f"route.json missing key: {key}")
+    return route

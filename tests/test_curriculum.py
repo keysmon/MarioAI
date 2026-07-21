@@ -1,13 +1,12 @@
-"""Pure-logic tests for the reverse-curriculum schedule and waypoint IO."""
+"""Pure-logic tests for the reverse-curriculum schedule and route IO."""
 import random
 
 import pytest
 
 from marioai.curriculum import (
     CurriculumSchedule,
-    Waypoint,
-    load_waypoints,
-    save_waypoints,
+    load_route,
+    save_route,
 )
 
 
@@ -66,10 +65,20 @@ def test_frontier_never_goes_below_zero():
     assert s.frontier == 0
 
 
-def test_waypoint_roundtrip_through_disk(tmp_path):
-    wps = [Waypoint(i, i * 100, 40 + 150 * i, {"blob": i}) for i in range(3)]
-    save_waypoints(wps, tmp_path)
-    loaded = load_waypoints(tmp_path)
-    assert [w.index for w in loaded] == [0, 1, 2]
-    assert [w.x_pos for w in loaded] == [40, 190, 340]
-    assert loaded[2].state == {"blob": 2}
+def test_route_roundtrip_through_disk(tmp_path):
+    route = {
+        "level": "1-1",
+        "actions": [3, 3, 4],
+        "waypoints": [
+            {"index": 0, "frame": 0, "x_pos": 40},
+            {"index": 1, "frame": 3, "x_pos": 60},
+        ],
+    }
+    save_route(route, tmp_path)
+    assert load_route(tmp_path) == route
+
+
+def test_load_route_rejects_missing_keys(tmp_path):
+    (tmp_path / "route.json").write_text('{"actions": []}')
+    with pytest.raises(ValueError):
+        load_route(tmp_path)
