@@ -100,7 +100,7 @@ Trained models are on the [v0.3.0 Release](https://github.com/keysmon/MarioAI/re
 
 ## Notes on compute
 
-Models were trained on an AWS `c7i.4xlarge` (16 vCPU, 32 GB). Mario RL is **CPU-bound** - the bottleneck is stepping the NES emulators, not the small CNN - so a big-RAM CPU box beats a GPU here. The full run (one multi-task model + per-level fine-tunes) cost roughly **$6-7**.
+Models were trained on an AWS `c7i.4xlarge` (16 vCPU, 32 GB). Mario RL is **CPU-bound** - the bottleneck is stepping the NES emulators, not the small CNN - so a big-RAM CPU box beats a GPU here.
 
 ## Project layout
 
