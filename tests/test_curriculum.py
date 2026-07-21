@@ -21,6 +21,11 @@ def test_window_must_be_positive():
         CurriculumSchedule(8, window=0)
 
 
+def test_history_must_be_positive():
+    with pytest.raises(ValueError):
+        CurriculumSchedule(8, history=0)
+
+
 def test_sample_start_stays_in_window():
     s = CurriculumSchedule(8, window=3, rng=random.Random(1))
     s.frontier = 4

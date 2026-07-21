@@ -37,6 +37,8 @@ class CurriculumSchedule:
             raise ValueError("need at least one waypoint")
         if window < 1:
             raise ValueError("window must be >= 1")
+        if history < 1:
+            raise ValueError("history must be >= 1")
         self.n = n_waypoints
         self.window = window
         self.advance_threshold = advance_threshold
