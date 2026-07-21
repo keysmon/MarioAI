@@ -29,6 +29,9 @@ def main():
     p.add_argument("--lr", type=float, default=None,
                    help="Constant learning rate override (use a low value like 5e-5 "
                         "when fine-tuning, so a converged policy isn't destabilized).")
+    p.add_argument("--ent-coef", type=float, default=None,
+                   help="Entropy coefficient override (raise to ~0.05 for more "
+                        "exploration to break past a stubborn obstacle).")
     p.add_argument("--run-name", required=True)
     args = p.parse_args()
 
@@ -66,6 +69,9 @@ def main():
             clip_range=ppo["clip_range"], ent_coef=ppo["ent_coef"],
             vf_coef=ppo["vf_coef"], tensorboard_log=f"runs/{args.run_name}", verbose=1,
         )
+
+    if args.ent_coef is not None:
+        model.ent_coef = args.ent_coef
 
     out_dir = f"models/{args.run_name}"
     os.makedirs(out_dir, exist_ok=True)
