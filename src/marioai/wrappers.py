@@ -78,14 +78,15 @@ class SnapshotStartWrapper(gym.Wrapper):
     native frame and reset() returns a raw RGB frame for GrayScaleResize.
     """
 
-    def __init__(self, env, route, schedule=None, seed=0):
+    def __init__(self, env, route, schedule=None, seed=0, advance_threshold=0.5):
         super().__init__(env)
         if not route.get("waypoints"):
             raise ValueError("route has no waypoints")
         self._route = route
         self._snapshots = None  # replay-captured lazily on first reset
         self._schedule = schedule or CurriculumSchedule(
-            len(route["waypoints"]), rng=random.Random(seed)
+            len(route["waypoints"]), advance_threshold=advance_threshold,
+            rng=random.Random(seed)
         )
 
     def reset(self, *, seed=None, options=None):

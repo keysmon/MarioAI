@@ -13,7 +13,8 @@ from .wrappers import SkipFrame, GrayScaleResize, SnapshotStartWrapper
 
 
 def make_mario_env(level="1-1", skip=4, shape=84, render_mode="rgb_array",
-                   capture_frames=False, snapshot_dir=None, snapshot_seed=0):
+                   capture_frames=False, snapshot_dir=None, snapshot_seed=0,
+                   curriculum_threshold=0.5):
     """Build a single fully-wrapped Mario env for one level (e.g. '1-1').
 
     capture_frames=True makes SkipFrame buffer every intra-skip native frame in
@@ -23,7 +24,8 @@ def make_mario_env(level="1-1", skip=4, shape=84, render_mode="rgb_array",
     emulator snapshots rebuilt by replaying the route emitted by
     scripts/solve_level.py, sampled near the flag first and sliding back
     toward the level start as the policy improves. snapshot_seed
-    decorrelates the sampling streams of parallel workers.
+    decorrelates the sampling streams of parallel workers. curriculum_threshold
+    is the clear-rate needed to advance the frontier.
     """
     route = None
     if snapshot_dir:
@@ -37,14 +39,16 @@ def make_mario_env(level="1-1", skip=4, shape=84, render_mode="rgb_array",
     )
     env = JoypadSpace(env, SIMPLE_MOVEMENT)
     if route is not None:
-        env = SnapshotStartWrapper(env, route, seed=snapshot_seed)
+        env = SnapshotStartWrapper(env, route, seed=snapshot_seed,
+                                   advance_threshold=curriculum_threshold)
     env = SkipFrame(env, skip=skip, capture_frames=capture_frames)
     env = GrayScaleResize(env, shape=shape)
     return env
 
 
 def make_vec_env(levels, n_envs, frame_stack=4, skip=4, shape=84,
-                 normalize_reward=False, monitor=True, snapshot_dir=None):
+                 normalize_reward=False, monitor=True, snapshot_dir=None,
+                 curriculum_threshold=0.5):
     """SubprocVecEnv of n_envs Marios; worker i is fixed to levels[i % len(levels)].
 
     Fixing one level per worker (rather than recreating a random level on each
@@ -55,7 +59,8 @@ def make_vec_env(levels, n_envs, frame_stack=4, skip=4, shape=84,
         def _init():
             return make_mario_env(level=level, skip=skip, shape=shape,
                                   snapshot_dir=snapshot_dir,
-                                  snapshot_seed=worker_idx)
+                                  snapshot_seed=worker_idx,
+                                  curriculum_threshold=curriculum_threshold)
         return _init
 
     assigned = [levels[i % len(levels)] for i in range(n_envs)]

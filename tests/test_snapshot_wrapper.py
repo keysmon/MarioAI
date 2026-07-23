@@ -204,3 +204,13 @@ def test_route_level_mismatch_rejected(tmp_path):
     save_route(_make_route(level="1-1"), tmp_path)
     with pytest.raises(ValueError, match="route is for level"):
         make_mario_env(level="1-2", snapshot_dir=str(tmp_path))
+
+
+def test_advance_threshold_reaches_schedule(tmp_path):
+    route = {
+        "level": "test", "actions": [],
+        "waypoints": [{"index": i, "frame": 0, "x_pos": 40}
+                      for i in range(3)],
+    }
+    w = SnapshotStartWrapper(_FakeSnapEnv(), route, advance_threshold=0.25)
+    assert w._schedule.advance_threshold == 0.25

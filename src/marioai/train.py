@@ -50,6 +50,10 @@ def main():
                         "route, near the flag first, sliding back to the "
                         "level start as the policy improves (reverse "
                         "curriculum). Single-level runs only.")
+    p.add_argument("--curriculum-threshold", type=float, default=0.5,
+                   help="Clear-rate needed to advance the reverse-curriculum "
+                        "frontier; lower it (e.g. 0.1) when the goal is "
+                        "best-of-N clears rather than mastery.")
     p.add_argument("--run-name", required=True)
     args = p.parse_args()
 
@@ -69,6 +73,7 @@ def main():
         frame_stack=cfg["env"]["frame_stack"], skip=cfg["env"]["skip"],
         shape=cfg["env"]["shape"], normalize_reward=cfg["train"]["normalize_reward"],
         snapshot_dir=args.start_snapshots,
+        curriculum_threshold=args.curriculum_threshold,
     )
 
     if args.init_from:
