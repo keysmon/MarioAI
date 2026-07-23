@@ -144,7 +144,7 @@ def try_candidate(env, snap, x0, y0, frontier, known, wait, offset, jump,
     return ok, False, info, trace
 
 
-def solve_obstacle(env, history, obstacle_x):
+def solve_obstacle(env, history):
     """Search the macro menu and pick the BEST passing hop, not the first.
 
     Greedy first-ok selection committed descending dead-end hops (run 9:
@@ -265,7 +265,7 @@ def main():
                   f"partial route.")
         else:
             for retry in range(3):
-                solved = solve_obstacle(env, history, obstacle_x)
+                solved = solve_obstacle(env, history)
                 if solved is not None or len(history) <= 2:
                     break
                 # dead-end perch: BAN the newest landings (else the
@@ -348,7 +348,13 @@ def main():
         was_grounded = is_grounded
 
     if not flag:
-        print("FAILED: frame budget exhausted before the flag.")
+        for i, w in enumerate(waypoints):
+            w["index"] = i
+        save_route({"level": args.level, "actions": actions,
+                    "waypoints": waypoints, "partial": True,
+                    "blocked_x": last_x}, out_dir + "-partial")
+        print(f"FAILED: frame budget exhausted before the flag (x={last_x}). "
+              f"Partial route saved to {out_dir}-partial.")
         sys.exit(1)
 
     for i, w in enumerate(waypoints):
