@@ -4,7 +4,7 @@ import os
 import yaml
 import torch
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.utils import LinearSchedule
 from marioai.envs import make_vec_env
 
@@ -13,6 +13,18 @@ def resolve_device(name):
     if name != "auto":
         return name
     return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+class CurriculumLogCallback(BaseCallback):
+    """TensorBoard curve of the reverse-curriculum frontier (0 = level start)."""
+
+    def _on_step(self):
+        fronts = [info["curriculum_frontier"] for info in self.locals["infos"]
+                  if "curriculum_frontier" in info]
+        if fronts:
+            self.logger.record("curriculum/frontier_mean",
+                               sum(fronts) / len(fronts))
+        return True
 
 
 def main():
@@ -32,6 +44,12 @@ def main():
     p.add_argument("--ent-coef", type=float, default=None,
                    help="Entropy coefficient override (raise to ~0.05 for more "
                         "exploration to break past a stubborn obstacle).")
+    p.add_argument("--start-snapshots", default=None,
+                   help="Route dir from scripts/solve_level.py: episodes "
+                        "start from snapshots rebuilt by replaying the "
+                        "route, near the flag first, sliding back to the "
+                        "level start as the policy improves (reverse "
+                        "curriculum). Single-level runs only.")
     p.add_argument("--run-name", required=True)
     args = p.parse_args()
 
@@ -43,10 +61,14 @@ def main():
     device = resolve_device(cfg["train"]["device"])
     ppo = cfg["ppo"]
 
+    if args.start_snapshots and len(levels) != 1:
+        p.error("--start-snapshots requires exactly one level")
+
     venv = make_vec_env(
         levels, n_envs=n_envs,
         frame_stack=cfg["env"]["frame_stack"], skip=cfg["env"]["skip"],
         shape=cfg["env"]["shape"], normalize_reward=cfg["train"]["normalize_reward"],
+        snapshot_dir=args.start_snapshots,
     )
 
     if args.init_from:
@@ -81,7 +103,11 @@ def main():
     )
     # verbose=1 prints the per-rollout table (incl. ep_rew_mean); TensorBoard logs
     # the full curves. No progress_bar to avoid the extra `rich` dependency.
-    model.learn(total_timesteps=timesteps, callback=ckpt, reset_num_timesteps=True)
+    callbacks = [ckpt]
+    if args.start_snapshots:
+        callbacks.append(CurriculumLogCallback())
+    model.learn(total_timesteps=timesteps, callback=callbacks,
+                reset_num_timesteps=True)
     model.save(f"{out_dir}/final")
     if cfg["train"]["normalize_reward"]:
         venv.save(f"{out_dir}/vecnormalize.pkl")
