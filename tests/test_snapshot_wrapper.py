@@ -16,7 +16,7 @@ from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
 from nes_py.wrappers import JoypadSpace
 
 from marioai.curriculum import CurriculumSchedule, load_route, save_route
-from marioai.envs import make_vec_env
+from marioai.envs import make_mario_env, make_vec_env
 from marioai.wrappers import SnapshotStartWrapper
 
 RIGHT_B = 3
@@ -198,3 +198,9 @@ def test_vec_env_with_snapshot_starts_smoke(tmp_path):
         assert all("curriculum_frontier" in i for i in infos)
     finally:
         venv.close()
+
+
+def test_route_level_mismatch_rejected(tmp_path):
+    save_route(_make_route(level="1-1"), tmp_path)
+    with pytest.raises(ValueError, match="route is for level"):
+        make_mario_env(level="1-2", snapshot_dir=str(tmp_path))

@@ -25,13 +25,19 @@ def make_mario_env(level="1-1", skip=4, shape=84, render_mode="rgb_array",
     toward the level start as the policy improves. snapshot_seed
     decorrelates the sampling streams of parallel workers.
     """
+    route = None
+    if snapshot_dir:
+        route = load_route(snapshot_dir)
+        if route["level"] != level:
+            raise ValueError(
+                f"route is for level {route['level']!r}, env is {level!r}"
+            )
     env = gym_super_mario_bros.make(
         f"SuperMarioBros-{level}-v0", render_mode=render_mode
     )
     env = JoypadSpace(env, SIMPLE_MOVEMENT)
-    if snapshot_dir:
-        env = SnapshotStartWrapper(env, load_route(snapshot_dir),
-                                   seed=snapshot_seed)
+    if route is not None:
+        env = SnapshotStartWrapper(env, route, seed=snapshot_seed)
     env = SkipFrame(env, skip=skip, capture_frames=capture_frames)
     env = GrayScaleResize(env, shape=shape)
     return env
