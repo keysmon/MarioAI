@@ -1,8 +1,12 @@
 # MarioAI 🍄 - PPO Agent That Plays Super Mario Bros From Raw Pixels
 
-A deep reinforcement learning agent that learns to play **Super Mario Bros** directly from raw game frames - no access to the game's internal state, just pixels in and button presses out, exactly like a human looking at the screen.
+A deep reinforcement learning agent that plays **Super Mario Bros** from raw
+game frames. At inference time every policy sees only pixels and emits button
+presses, exactly like a human looking at the screen.
 
-Built on **PPO** (Proximal Policy Optimization). Across the eight levels tackled here, the agent **clears 7 of 8** - including the underground 1-2 and the castle 1-4.
+Built on **PPO** (Proximal Policy Optimization). Across the eight levels
+tackled here, the agent **clears all 8** - including the underground 1-2,
+the castle 1-4, and the gap-heavy 1-3.
 
 <p align="center">
   <img src="assets/gifs/1-1.gif" width="460" alt="PPO agent clearing World 1-1">
@@ -10,7 +14,7 @@ Built on **PPO** (Proximal Policy Optimization). Across the eight levels tackled
   <em>Learned entirely from 84x84 grayscale pixels: clearing World 1-1 (left) and the castle World 1-4 (right).</em>
 </p>
 
-## Results - 7 of 8 levels cleared
+## Results - 8 of 8 levels cleared
 
 | Level | Cleared? | Clear rate | How |
 |-------|:---:|:---:|---|
@@ -21,35 +25,50 @@ Built on **PPO** (Proximal Policy Optimization). Across the eight levels tackled
 | **1-4 (castle)** | ✅ | 100% | fine-tuned |
 | 2-1 | ✅ | clears* | fine-tuned |
 | 5-1 | ✅ | clears* | fine-tuned |
-| **1-3 (pits)** | ❌ | 0% | the hard-exploration wall (see below) |
+| **1-3 (pits)** | ✅ | 100% | behavior cloning from a machine-searched route |
 
 \* 2-1 and 5-1: the *deterministic* policy narrowly misses the final obstacle, but the agent clears them when sampling actions - the GIF is a genuine, unedited clear.
 
+World 1-3 cleared all **15/15 sampled final-probe rollouts**. Its gallery GIF
+is a genuine, unedited **290-policy-step clear**.
+
 ## Gallery
 
-**Cleared (7):**
+**Cleared (8):**
 
 | 1-1 | 1-2 (underground) | 2-1 | 3-1 |
 |:---:|:---:|:---:|:---:|
 | ![1-1](assets/gifs/1-1.gif) | ![1-2](assets/gifs/1-2.gif) | ![2-1](assets/gifs/2-1.gif) | ![3-1](assets/gifs/3-1.gif) |
-| **4-1** | **5-1** | **1-4 (castle)** | **1-3 (uncleared)** |
+| **4-1** | **5-1** | **1-4 (castle)** | **1-3 (pits)** |
 | ![4-1](assets/gifs/4-1.gif) | ![5-1](assets/gifs/5-1.gif) | ![1-4](assets/gifs/1-4.gif) | ![1-3](assets/gifs/1-3.gif) |
-
-The last one, **World 1-3**, is the honest failure - see "The one that didn't fall" below.
 
 ## How it was built
 
-Getting to 7/8 took an escalation ladder, not a single training run:
+Getting to 8/8 took an escalation ladder, not a single training run:
 
 1. **One multi-task model.** A single PPO `CnnPolicy` trained across six levels at once (8M steps) learned to clear **1-1, 1-2, and 4-1** outright, and got most of the way through the rest.
 2. **Per-level fine-tuning.** For levels the shared model stalled on, we **fine-tuned that model on the single level** with a low, constant learning rate (so its transferred Mario skills aren't destabilized) plus extra exploration. This cracked **3-1, 2-1, 5-1, and the castle 1-4**.
-3. **Best-of-N recording.** For levels the greedy policy narrowly misses (2-1, 5-1), recording several stochastic rollouts and keeping the cleanest captures a real clear.
+3. **Machine-generated demonstration for 1-3.** An emulator-snapshot solver searched directly in the policy's skip-4 action space, producing a route whose action changes are executable at the policy's four-frame decision cadence. Behavior cloning that route through the exact preprocessing and frame-stack pipeline produced both greedy and stochastic clears.
+4. **Best-of-N recording.** For levels the greedy policy narrowly misses (2-1, 5-1), recording several stochastic rollouts and keeping the cleanest captures a real clear.
 
-Every model sees only the 84x84 grayscale image - never Mario's coordinates.
+Every policy sees only the 84x84 grayscale image. The offline route search for
+1-3 uses emulator snapshots and position state to generate its demonstration;
+none of that state is available to the cloned policy at inference time.
 
-## The one that didn't fall: World 1-3
+## The last one to fall: World 1-3
 
-**1-3 is a level of pure gaps**, and it's the classic wall for vanilla PPO. The agent dies at the *first* pit almost every time, so there is no reward signal pointing toward success - there's nothing to reinforce. From-scratch training, fine-tuning, and maximal exploration (entropy bonus) all left it flat: it never randomly performs the precise multi-jump needed to cross the first gap. Beating 1-3 would take a curiosity-driven exploration bonus (e.g. RND), a human demonstration to bootstrap, or reward shaping - a genuinely different class of method than what clears the other seven. It's included here, uncleared, as an honest look at where this approach hits its limit.
+**1-3 is a level of gaps and moving lifts**, and it remained the classic wall
+for vanilla PPO: true-start training repeatedly converged on a profitable
+sprint that died at the lift ferry, while snapshot curricula learned brittle
+timings tied to one platform phase.
+
+The successful route was generated without a human demonstration. A
+snapshot-search solver tried jump/wait macros, rewound dead ends, and searched
+at one action per four native frames - the same cadence the PPO policy uses.
+That detail matters: the first native-frame route cleared in the emulator but
+died when quantized to skip 4. The aligned route clears by construction, and
+behavior cloning it with the exact `84x84 x 4` observation stack yielded a
+greedy clear plus **15/15 sampled clears** in the final probe.
 
 ## How it works
 
@@ -94,13 +113,23 @@ python -m marioai.evaluate --model models/ft_2-1/final.zip --levels 2-1
 
 # Record a smooth GIF (records N rollouts, keeps the cleanest):
 python -m marioai.record_gif --model models/ft_2-1/final.zip --level 2-1 --out assets/gifs/2-1.gif --rollouts 15
+
+# Reproduce the 1-3 machine demonstration and clone it into a PPO policy:
+python scripts/solve_level.py --level 1-3 --skip 4
+python scripts/behavior_clone_route.py \
+  --route-dir models/ft_1-3/waypoints \
+  --init-from models/mario_multitask/final.zip \
+  --out models/ft_1-3/final.zip
 ```
 
-Trained models are on the [v0.3.0 Release](https://github.com/keysmon/MarioAI/releases/tag/v0.3.0). Training logs to TensorBoard (`tensorboard --logdir runs`).
+The original PPO checkpoints are on the [v0.3.0 Release](https://github.com/keysmon/MarioAI/releases/tag/v0.3.0). Training logs to TensorBoard (`tensorboard --logdir runs`).
 
 ## Notes on compute
 
-Models were trained on an AWS `c7i.4xlarge` (16 vCPU, 32 GB). Mario RL is **CPU-bound** - the bottleneck is stepping the NES emulators, not the small CNN - so a big-RAM CPU box beats a GPU here.
+Most models were trained on an AWS `c7i.4xlarge` (16 vCPU, 32 GB). Mario RL is
+**CPU-bound** - the bottleneck is stepping the NES emulators, not the small CNN.
+The final 1-3 behavior-cloning pass used a GPU, where supervised CNN updates
+benefit from acceleration.
 
 ## Project layout
 
@@ -111,8 +140,9 @@ src/marioai/
   train.py        config-driven PPO (--levels, --n-envs, --timesteps, --init-from, --lr, --ent-coef)
   evaluate.py     per-level clear-rate + mean reward
   record_gif.py   N-rollouts-keep-cleanest native-RGB GIF recorder
+  curriculum.py   reverse-curriculum schedule + route persistence
 configs/          hyperparameters + level sets
-scripts/          spike, train, record, AWS runbook
+scripts/          route solver, behavior cloning, train/record helpers, AWS runbook
 tests/            wrapper unit tests + PPO smoke test
 ```
 

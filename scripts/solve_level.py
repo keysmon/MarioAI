@@ -21,6 +21,16 @@ from marioai.curriculum import save_route
 
 NOOP, RIGHT, RIGHT_A, RIGHT_B, RIGHT_A_B, A, LEFT = range(7)
 
+# The solver runs in SOLVER-STEPS: each step holds one action for SKIP native
+# frames - the policy's action cadence. A route searched at skip=4 only ever
+# switches actions on 4-frame boundaries, so a frame-skip-4 agent can execute
+# it (an arbitrarily-aligned skip=1 route dies under skip-4 quantization).
+# SKIP is set from --skip in main. All frame-denominated constants below stay
+# in NATIVE frames and are divided by SKIP at use; the saved route is expanded
+# back to native frames so consumers (wrapper replay, curriculum) are unchanged
+# and it replays identically at both cadences.
+SKIP = 1
+
 SNAP_EVERY = 20         # frames between backtrack snapshots
 WAYPOINT_EVERY_X = 150  # min x-distance (px) between emitted waypoints
 BACKTRACK_DEPTH = 16    # how many snapshots back the solver may rewind
@@ -55,18 +65,40 @@ RIDES = (8, 60, 120, 180)             # NOOP frames after landing (lifts)
 
 
 def advance(env, action, n, log=None):
-    """Step `action` up to n frames; stop early when the episode ends.
+    """Run `action` for up to n SOLVER-STEPS; stop early when the episode ends.
 
-    Appends each executed action to `log` when provided.
+    Each solver-step executes `action` for SKIP native frames (SkipFrame's
+    reward-less core). Appends one action per STARTED solver-step to `log`,
+    including a terminal partial step: omitting the action that reaches the
+    flag leaves a saved route one decision short. Death traces are rewound or
+    rejected by callers. The route is stored in solver-steps and expanded to
+    native frames at save time (a no-op at skip=1).
     """
     info = {}
     for _ in range(n):
-        _, _, term, trunc, info = env.step(action)
         if log is not None:
             log.append(action)
-        if term or trunc:
-            return True, info
+        for _ in range(SKIP):
+            _, _, term, trunc, info = env.step(action)
+            if term or trunc:
+                return True, info
     return False, info
+
+
+def save_native_route(out_dir, level, actions, waypoints, **extra):
+    """Expand solver-step actions to native frames (each repeated SKIP times)
+    and scale waypoint frames by SKIP, matching the native-frame route schema.
+
+    The result is 4-aligned by construction (`actions[i] == actions[i-i%SKIP]`)
+    and a no-op at skip=1. Re-indexes waypoints. Returns (native_actions,
+    native_waypoints) for reporting.
+    """
+    native = [a for a in actions for _ in range(SKIP)]
+    wps = [{"index": i, "frame": w["frame"] * SKIP, "x_pos": w["x_pos"]}
+           for i, w in enumerate(waypoints)]
+    save_route({"level": level, "actions": native, "waypoints": wps, **extra},
+               out_dir)
+    return native, wps
 
 
 def push_history(history, entry):
@@ -113,21 +145,23 @@ def try_candidate(env, snap, x0, y0, frontier, known, wait, offset, jump,
     """
     env.unwrapped.load_state(snap)
     trace = []
-    done, info = advance(env, NOOP, wait, trace)
+    # menu values are NATIVE frame counts; convert to solver-steps (// SKIP)
+    land_stable = max(1, LAND_STABLE // SKIP)
+    done, info = advance(env, NOOP, wait // SKIP, trace)
     if not done:
-        done, info = advance(env, RIGHT_B, offset, trace)
+        done, info = advance(env, RIGHT_B, offset // SKIP, trace)
     if not done:
-        done, info = advance(env, jump, hold, trace)
+        done, info = advance(env, jump, hold // SKIP, trace)
     stable, frames = 0, 0
-    while not done and frames < ARC_CAP and stable < LAND_STABLE:
+    while not done and frames < ARC_CAP // SKIP and stable < land_stable:
         done, info = advance(env, arc, 1, trace)
         frames += 1
         stable = stable + 1 if grounded(env) else 0
     if info.get("flag_get"):
         return True, True, info, trace
-    if done or stable < LAND_STABLE:
+    if done or stable < land_stable:
         return False, False, info, trace  # died, or never came down grounded
-    done, info = advance(env, NOOP, ride, trace)
+    done, info = advance(env, NOOP, ride // SKIP, trace)
     if info.get("flag_get"):
         return True, True, info, trace
     if done or not grounded(env):
@@ -215,10 +249,11 @@ def solve_obstacle(env, history):
     passes.sort(key=lambda p: p[0], reverse=True)
     score, frame0, x0, snap, params, info, trace = passes[0]
     wait, offset, jump, hold, arc, ride = params
-    # re-execute the winner so the env holds its landed state
+    # re-execute the winner so the env holds its landed state (trace is in
+    # solver-actions; replay each at SKIP cadence)
     env.unwrapped.load_state(snap)
     for a in trace:
-        env.step(a)
+        advance(env, a, 1)
     print(f"  solved (best of {len(passes)}, score {score}): rewind to "
           f"x={x0}, wait={wait} offset={offset} jump={jump} hold={hold} "
           f"arc={arc} ride={ride} -> x={info['x_pos']} y={info['y_pos']}")
@@ -231,8 +266,12 @@ def main():
     ap.add_argument("--out", default=None,
                     help="route dir (default models/ft_<level>/waypoints)")
     ap.add_argument("--max-frames", type=int, default=60000,
-                    help="route-length budget before giving up")
+                    help="route-length budget (NATIVE frames) before giving up")
+    ap.add_argument("--skip", type=int, default=1,
+                    help="native frames per solver step (policy cadence; use 4)")
     args = ap.parse_args()
+    global SKIP
+    SKIP = args.skip
     out_dir = args.out or f"models/ft_{args.level}/waypoints"
 
     env = JoypadSpace(
@@ -285,11 +324,8 @@ def main():
                       f"({len(history) - 2} left)")
                 history = history[:-2]
         if solved is None:
-            for i, w in enumerate(waypoints):
-                w["index"] = i
-            save_route({"level": args.level, "actions": actions,
-                        "waypoints": waypoints, "partial": True,
-                        "blocked_x": obstacle_x}, out_dir + "-partial")
+            save_native_route(out_dir + "-partial", args.level, actions,
+                              waypoints, partial=True, blocked_x=obstacle_x)
             print(f"FAILED: no macro cleared x={obstacle_x}. Partial route "
                   f"saved to {out_dir}-partial for diagnosis.")
             sys.exit(1)
@@ -314,7 +350,7 @@ def main():
                                              int(info["y_pos"]),
                                              raw.dump_state()))
 
-    while len(actions) < args.max_frames and not flag:
+    while len(actions) * SKIP < args.max_frames and not flag:
         done, info = advance(env, RIGHT_B, 1, actions)
         frame = len(actions)
         if info.get("flag_get"):
@@ -327,7 +363,7 @@ def main():
         x = int(info["x_pos"])
         if x > last_x:
             last_x, last_progress_frame = x, frame
-        elif frame - last_progress_frame > STALL_FRAMES:
+        elif frame - last_progress_frame > STALL_FRAMES // SKIP:
             print(f"stall at x={last_x} (frame {frame}); solving...")
             handle_obstacle(last_x)
             continue
@@ -338,7 +374,7 @@ def main():
         # and a lift-riding window shorter than SNAP_EVERY would otherwise
         # never be captured (this exact miss blocked run 4 at x=745)
         if (is_grounded and not was_grounded) or (
-                frame % SNAP_EVERY == 0 and is_grounded):
+                frame % max(1, SNAP_EVERY // SKIP) == 0 and is_grounded):
             history = push_history(history, (frame, x, int(info["y_pos"]),
                                              raw.dump_state()))
             if x - waypoints[-1]["x_pos"] >= WAYPOINT_EVERY_X:
@@ -348,22 +384,16 @@ def main():
         was_grounded = is_grounded
 
     if not flag:
-        for i, w in enumerate(waypoints):
-            w["index"] = i
-        save_route({"level": args.level, "actions": actions,
-                    "waypoints": waypoints, "partial": True,
-                    "blocked_x": last_x}, out_dir + "-partial")
+        save_native_route(out_dir + "-partial", args.level, actions,
+                          waypoints, partial=True, blocked_x=last_x)
         print(f"FAILED: frame budget exhausted before the flag (x={last_x}). "
               f"Partial route saved to {out_dir}-partial.")
         sys.exit(1)
 
-    for i, w in enumerate(waypoints):
-        w["index"] = i            # re-index after splices dropped some
-    route = {"level": args.level, "actions": actions, "waypoints": waypoints}
-    save_route(route, out_dir)
-    print(f"CLEARED {args.level}: {len(waypoints)} waypoints, "
-          f"{len(actions)}-frame route -> {out_dir}")
-    for w in waypoints:
+    native, wps = save_native_route(out_dir, args.level, actions, waypoints)
+    print(f"CLEARED {args.level}: {len(wps)} waypoints, "
+          f"{len(native)}-frame route (skip={SKIP}) -> {out_dir}")
+    for w in wps:
         print(f"  wp{w['index']:03d} frame={w['frame']:5d} x={w['x_pos']}")
 
 
