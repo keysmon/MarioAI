@@ -33,3 +33,4 @@ models/
 CLAUDE.md
 .claude/
 docs/superpowers/
+.worktrees/
