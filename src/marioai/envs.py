@@ -11,6 +11,7 @@ from stable_baselines3.common.vec_env import (
 )
 from .curriculum import load_route
 from .actions import resolve_action_set
+from .sampling import assign_worker_levels
 from .wrappers import SkipFrame, GrayScaleResize, SnapshotStartWrapper
 
 
@@ -52,11 +53,12 @@ def make_vec_env(levels, n_envs, frame_stack=4, skip=4, shape=84,
                  normalize_reward=False, monitor=True, snapshot_dir=None,
                  curriculum_threshold=0.5, action_set: str = "simple",
                  level_weights: Mapping[str, float] | None = None):
-    """SubprocVecEnv of n_envs Marios; worker i is fixed to levels[i % len(levels)].
+    """SubprocVecEnv of n_envs Marios with each worker fixed to one stage.
 
     Fixing one level per worker (rather than recreating a random level on each
     reset) avoids nes-py's known memory leak on repeated env creation, while the
     shared PPO update still pools experience across all levels (multi-task).
+    Extra workers are allocated by deterministic weighted sampling.
     """
     def _thunk(level, worker_idx):
         def _init():
@@ -67,7 +69,7 @@ def make_vec_env(levels, n_envs, frame_stack=4, skip=4, shape=84,
                                   action_set=action_set)
         return _init
 
-    assigned = [levels[i % len(levels)] for i in range(n_envs)]
+    assigned = assign_worker_levels(levels, n_envs, level_weights)
     venv = SubprocVecEnv([_thunk(lvl, i) for i, lvl in enumerate(assigned)])
     if monitor:
         venv = VecMonitor(venv)
