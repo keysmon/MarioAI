@@ -244,6 +244,37 @@ def test_maze_rejections_are_scoped_to_their_junction():
     assert branches.excluded(later_junction) == frozenset()
 
 
+@pytest.mark.parametrize("mutation", ["same_locale_replacement", "cap_eviction"])
+def test_maze_retry_commit_preserves_restore_outside_mutable_history(mutation):
+    solver = _load_solver()
+    snapshot = object()
+    restore = (10, 600, 80, snapshot)
+    mutable_history = [restore]
+
+    if mutation == "same_locale_replacement":
+        mutable_history = solver.push_history(
+            mutable_history, (11, 605, 82, object())
+        )
+    else:
+        for index in range(solver.BACKTRACK_DEPTH + 5):
+            mutable_history = solver.push_history(
+                mutable_history,
+                (20 + index, 700 + 32 * index, 80, object()),
+            )
+
+    assert all(entry is not restore for entry in mutable_history)
+
+    selected, committed_history = solver.commit_maze_candidate(
+        search_history=[restore],
+        mutable_history=mutable_history,
+        frame0=10,
+    )
+
+    assert selected is restore
+    assert any(entry is restore for entry in committed_history)
+    assert selected[3] is snapshot
+
+
 def test_save_native_route_persists_policy_compatibility_metadata(
     tmp_path, monkeypatch
 ):

@@ -214,6 +214,29 @@ def push_history(history, entry):
     return history[-(BACKTRACK_DEPTH + 4):]
 
 
+def commit_maze_candidate(search_history, mutable_history, frame0):
+    """Commit from the history actually searched, preserving its snapshot.
+
+    `mutable_history` may have replaced or evicted the selected restore entry
+    while Mario traversed a maze branch. Rebuild the prefix around the exact
+    entry from `search_history`; never look it up in the mutable copy.
+    """
+    selected = None
+    for entry in search_history:
+        if entry[0] == frame0:
+            selected = entry
+            break
+    if selected is None:
+        raise RuntimeError(
+            f"maze candidate restore frame {frame0} was not searched"
+        )
+    committed = [
+        entry for entry in mutable_history if entry[0] < frame0
+    ]
+    committed.append(selected)
+    return selected, committed[-(BACKTRACK_DEPTH + 4):]
+
+
 def grounded(env):
     """True when Mario stands on solid ground or rides a platform.
 
@@ -569,11 +592,14 @@ def main():
                   f"partial route.")
         else:
             for retry in range(3):
-                solved = solve_obstacle(
-                    env,
+                search_history = (
                     [maze_restore]
                     if mode == "maze" and maze_minimum_branch
-                    else history,
+                    else history
+                )
+                solved = solve_obstacle(
+                    env,
+                    search_history,
                     mode,
                     excluded_branches=(
                         maze_branches.excluded(maze_restore)
@@ -625,8 +651,8 @@ def main():
             sys.exit(1)
         if mode == "maze":
             frame0, info, trace, selected_branch = solved
-            restore_entry = next(
-                entry for entry in history if entry[0] == frame0
+            restore_entry, committed_history = commit_maze_candidate(
+                search_history, history, frame0
             )
             maze_restore = restore_entry
             maze_branch = selected_branch
@@ -635,7 +661,11 @@ def main():
             frame0, info, trace = solved
         del actions[frame0:]          # rewind the route to the restore point
         actions.extend(trace)         # splice the successful macro in
-        history = [h for h in history if h[0] <= frame0]
+        history = (
+            committed_history
+            if mode == "maze"
+            else [entry for entry in history if entry[0] <= frame0]
+        )
         waypoints = [w for w in waypoints if w["frame"] <= frame0]
         last_x = int(info["x_pos"])
         last_progress_frame = len(actions)
