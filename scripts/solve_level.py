@@ -12,7 +12,7 @@ Usage: .venv/bin/python scripts/solve_level.py --level 1-3
 """
 import argparse
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import gym_super_mario_bros
@@ -89,6 +89,44 @@ class Macro:
 class MazeProgress:
     wrong_branch: bool
     next_branch: int
+
+
+@dataclass
+class MazeBranchMemory:
+    """Rejected stable branch IDs, scoped to one route snapshot junction."""
+
+    _rejected: list[tuple[tuple[int, int, int, object], set[int]]] = field(
+        default_factory=list
+    )
+
+    @staticmethod
+    def junction(history_entry) -> tuple[int, int, int, object]:
+        frame, x, y, snapshot = history_entry
+        return int(frame), int(x), int(y), snapshot
+
+    def _find(self, history_entry):
+        frame, x, y, snapshot = self.junction(history_entry)
+        for (saved_frame, saved_x, saved_y, saved_snapshot), branches in (
+            self._rejected
+        ):
+            if (
+                saved_frame == frame
+                and saved_x == x
+                and saved_y == y
+                and saved_snapshot is snapshot
+            ):
+                return branches
+        return None
+
+    def reject(self, history_entry, branch: int) -> None:
+        branches = self._find(history_entry)
+        if branches is None:
+            branches = set()
+            self._rejected.append((self.junction(history_entry), branches))
+        branches.add(branch)
+
+    def excluded(self, history_entry) -> frozenset[int]:
+        return frozenset(self._find(history_entry) or ())
 
 
 def level_mode(level: str) -> Literal["ground", "water", "maze"]:
@@ -270,17 +308,54 @@ def _solve_ground_obstacle(
     # winning launch at back=3+ was never reached (run 16, x=925). This
     # order sweeps ALL launch points with the cheap core menu before any
     # expensive wait slice is touched.
-    combos = ((back, wait, ride, jump, offset, hold, arc)
-              for wait, ride in extras
-              for back in range(1, depth + 1)
-              for jump in JUMP_ACTIONS
-              for offset in OFFSETS
-              for hold in HOLDS
-              for arc in ARC_ACTIONS)
+    if include_branch:
+        # A maze branch identifies only the generated macro, never the
+        # history-dependent rewind depth. After a wrong-route reset, the
+        # selected snapshot becomes the newest history entry; excluding the
+        # same macro ID must therefore remain valid when history gets shorter.
+        combos = (
+            (branch, back, wait, ride, jump, offset, hold, arc)
+            for branch, (wait, ride, jump, offset, hold, arc) in enumerate(
+                (
+                    (wait, ride, jump, offset, hold, arc)
+                    for wait, ride in extras
+                    for jump in JUMP_ACTIONS
+                    for offset in OFFSETS
+                    for hold in HOLDS
+                    for arc in ARC_ACTIONS
+                )
+            )
+            for back in range(1, depth + 1)
+        )
+    else:
+        # Preserve the legacy ground search's exact extras/back/macro order.
+        combos = (
+            (branch, back, wait, ride, jump, offset, hold, arc)
+            for branch, (
+                back,
+                wait,
+                ride,
+                jump,
+                offset,
+                hold,
+                arc,
+            ) in enumerate(
+                (
+                    (back, wait, ride, jump, offset, hold, arc)
+                    for wait, ride in extras
+                    for back in range(1, depth + 1)
+                    for jump in JUMP_ACTIONS
+                    for offset in OFFSETS
+                    for hold in HOLDS
+                    for arc in ARC_ACTIONS
+                )
+            )
+        )
     tried = 0
     first_pass_at = None
     passes = []  # (score, frame0, x0, snap, params, info, trace)
-    for branch, (
+    for (
+        branch,
         back,
         wait,
         ride,
@@ -288,7 +363,7 @@ def _solve_ground_obstacle(
         offset,
         hold,
         arc,
-    ) in enumerate(combos):
+    ) in combos:
         if branch < minimum_branch or branch in excluded_branches:
             continue
         if tried >= MAX_TRIES or len(passes) >= K_PASSES:
@@ -478,7 +553,7 @@ def main():
     flag = False
     previous_x = start_x
     maze_branch = 0
-    maze_excluded = set()
+    maze_branches = MazeBranchMemory()
     maze_restore = None
     maze_minimum_branch = 0
 
@@ -496,9 +571,17 @@ def main():
             for retry in range(3):
                 solved = solve_obstacle(
                     env,
-                    history,
+                    [maze_restore]
+                    if mode == "maze" and maze_minimum_branch
+                    else history,
                     mode,
-                    excluded_branches=maze_excluded,
+                    excluded_branches=(
+                        maze_branches.excluded(maze_restore)
+                        if mode == "maze"
+                        and maze_minimum_branch
+                        and maze_restore is not None
+                        else frozenset()
+                    ),
                     minimum_branch=maze_minimum_branch,
                 )
                 if solved is not None or len(history) <= 2:
@@ -594,7 +677,7 @@ def main():
                     handle_obstacle(x)
                 else:
                     reset_from_x = previous_x
-                    maze_excluded.add(maze_branch)
+                    maze_branches.reject(maze_restore, maze_branch)
                     maze_branch = progress.next_branch
                     maze_minimum_branch = maze_branch
                     frame0, restore_x, restore_y, snap = maze_restore

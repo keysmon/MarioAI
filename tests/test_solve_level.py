@@ -91,6 +91,14 @@ class _SwimEnv:
         )
 
 
+class _RestoreEnv:
+    def __init__(self):
+        self.unwrapped = self
+
+    def load_state(self, snapshot):
+        pass
+
+
 def test_swim_candidate_judges_progress_without_ground_state():
     solver = _load_solver()
     solver.SKIP = 4
@@ -158,6 +166,82 @@ def test_maze_search_excludes_rejected_branch_from_expansion(monkeypatch):
     )
 
     assert result is None
+
+
+def test_maze_branch_identity_survives_history_truncation(monkeypatch):
+    solver = _load_solver()
+    solver.SKIP = 4
+    monkeypatch.setattr(solver, "BACKTRACK_DEPTH", 3)
+    monkeypatch.setattr(solver, "WAITS", (0,))
+    monkeypatch.setattr(solver, "RIDES", (8,))
+    monkeypatch.setattr(
+        solver, "JUMP_ACTIONS", (solver.RIGHT_A_B, solver.RIGHT_A)
+    )
+    monkeypatch.setattr(solver, "OFFSETS", (0,))
+    monkeypatch.setattr(solver, "HOLDS", (8,))
+    monkeypatch.setattr(solver, "ARC_ACTIONS", (solver.RIGHT_B,))
+    history = [
+        (0, 100, 79, object()),
+        (1, 200, 79, object()),
+        (2, 300, 79, object()),
+    ]
+    retrying = False
+
+    def fake_candidate(
+        env,
+        snap,
+        x0,
+        y0,
+        frontier,
+        known,
+        wait,
+        offset,
+        jump,
+        hold,
+        arc,
+        ride,
+    ):
+        if retrying:
+            ok = jump == solver.RIGHT_A
+            x = 500
+        else:
+            ok = jump == solver.RIGHT_A_B
+            x = 1000 if x0 == 100 else 400
+        return ok, False, {"x_pos": x, "y_pos": y0}, []
+
+    monkeypatch.setattr(solver, "try_candidate", fake_candidate)
+    first = solver._solve_ground_obstacle(
+        _RestoreEnv(), history, include_branch=True
+    )
+    assert first is not None
+    frame, _, _, branch = first
+    assert frame == 0
+
+    retrying = True
+    retry = solver._solve_ground_obstacle(
+        _RestoreEnv(),
+        history[:2],
+        excluded_branches={branch},
+        minimum_branch=branch + 1,
+        include_branch=True,
+    )
+
+    assert retry is not None
+    assert retry[3] == branch + 1
+
+
+def test_maze_rejections_are_scoped_to_their_junction():
+    solver = _load_solver()
+    branches = solver.MazeBranchMemory()
+    first_junction = (20, 600, 80, object())
+    # Route rewrites can revisit the same frame/x/y with a different emulator
+    # snapshot; that is still a distinct junction search.
+    later_junction = (20, 600, 80, object())
+
+    branches.reject(first_junction, 2)
+
+    assert branches.excluded(first_junction) == frozenset({2})
+    assert branches.excluded(later_junction) == frozenset()
 
 
 def test_save_native_route_persists_policy_compatibility_metadata(

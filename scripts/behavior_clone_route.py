@@ -58,6 +58,16 @@ def action_accuracy(policy, observations, actions, sample_weights=None):
         )
 
 
+def level_balanced_minibatch_loss(
+    logits, actions, sample_weights, epoch_weight
+):
+    """Return this minibatch's additive share of one balanced epoch loss."""
+    if float(epoch_weight) <= 0:
+        raise ValueError("epoch sample weight must be positive")
+    per_sample_loss = F.cross_entropy(logits, actions, reduction="none")
+    return (per_sample_loss * sample_weights).sum() / epoch_weight
+
+
 def rollout(model, level, skip=4, shape=84, frame_stack=4,
             deterministic=True, action_set="complex"):
     """Run one true-start episode and return its terminal outcome."""
@@ -138,16 +148,6 @@ def train(args):
         batch.sample_weights, dtype=torch.float32, device=policy.device
     )
 
-    counts = np.bincount(
-        batch.actions,
-        weights=batch.sample_weights,
-        minlength=model.action_space.n,
-    )
-    class_weights = np.ones(model.action_space.n, dtype=np.float32)
-    present = counts > 0
-    class_weights[present] = counts[present].max() / counts[present]
-    weight_tensor = torch.as_tensor(class_weights, device=policy.device)
-
     parameters = (
         list(policy.features_extractor.parameters())
         + list(policy.mlp_extractor.policy_net.parameters())
@@ -169,31 +169,26 @@ def train(args):
         return True
 
     sample_count = len(action_tensor)
+    epoch_weight = sample_weight_tensor.sum()
     best_accuracy = initial_accuracy
     for epoch in range(1, args.epochs + 1):
         policy.set_training_mode(True)
         permutation = torch.randperm(sample_count, device=policy.device)
         total_loss = 0.0
+        optimizer.zero_grad()
         for start in range(0, sample_count, args.batch_size):
             index = permutation[start:start + args.batch_size]
             logits = _policy_logits(policy, obs_tensor[index])
-            per_sample_loss = F.cross_entropy(
+            loss = level_balanced_minibatch_loss(
                 logits,
                 action_tensor[index],
-                weight=weight_tensor,
-                reduction="none",
+                sample_weight_tensor[index],
+                epoch_weight,
             )
-            minibatch_weights = sample_weight_tensor[index]
-            loss = (
-                per_sample_loss * minibatch_weights
-            ).sum() / minibatch_weights.sum()
-            optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0)
-            optimizer.step()
-            total_loss += float(
-                (per_sample_loss.detach() * minibatch_weights).sum()
-            )
+            total_loss += float(loss.detach())
+        torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0)
+        optimizer.step()
 
         should_measure = (
             epoch == 1
@@ -208,7 +203,7 @@ def train(args):
         best_accuracy = max(best_accuracy, accuracy)
         print(
             f"epoch {epoch}: level-balanced loss="
-            f"{total_loss / sample_weight_tensor.sum().item():.6f} "
+            f"{total_loss:.6f} "
             f"accuracy={accuracy:.4f}",
             flush=True,
         )
