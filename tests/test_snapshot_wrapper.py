@@ -12,9 +12,9 @@ import pytest
 from gymnasium import spaces
 
 import gym_super_mario_bros
-from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
 from nes_py.wrappers import JoypadSpace
 
+from marioai.actions import resolve_action_set
 from marioai.curriculum import CurriculumSchedule, load_route, save_route
 from marioai.envs import make_mario_env, make_vec_env
 from marioai.wrappers import SnapshotStartWrapper
@@ -27,7 +27,7 @@ def _raw_env(level="1-1"):
     return JoypadSpace(
         gym_super_mario_bros.make(f"SuperMarioBros-{level}-v0",
                                   render_mode="rgb_array"),
-        SIMPLE_MOVEMENT,
+        resolve_action_set("simple"),
     )
 
 

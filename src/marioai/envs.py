@@ -1,6 +1,5 @@
 """Mario env factory + multi-task vectorized env assembly."""
 import gym_super_mario_bros
-from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
 from nes_py.wrappers import JoypadSpace
 from stable_baselines3.common.vec_env import (
     SubprocVecEnv,
@@ -9,12 +8,13 @@ from stable_baselines3.common.vec_env import (
     VecNormalize,
 )
 from .curriculum import load_route
+from .actions import resolve_action_set
 from .wrappers import SkipFrame, GrayScaleResize, SnapshotStartWrapper
 
 
 def make_mario_env(level="1-1", skip=4, shape=84, render_mode="rgb_array",
                    capture_frames=False, snapshot_dir=None, snapshot_seed=0,
-                   curriculum_threshold=0.5):
+                   curriculum_threshold=0.5, action_set="simple"):
     """Build a single fully-wrapped Mario env for one level (e.g. '1-1').
 
     capture_frames=True makes SkipFrame buffer every intra-skip native frame in
@@ -37,7 +37,7 @@ def make_mario_env(level="1-1", skip=4, shape=84, render_mode="rgb_array",
     env = gym_super_mario_bros.make(
         f"SuperMarioBros-{level}-v0", render_mode=render_mode
     )
-    env = JoypadSpace(env, SIMPLE_MOVEMENT)
+    env = JoypadSpace(env, resolve_action_set(action_set))
     if route is not None:
         env = SnapshotStartWrapper(env, route, seed=snapshot_seed,
                                    advance_threshold=curriculum_threshold)
@@ -48,7 +48,7 @@ def make_mario_env(level="1-1", skip=4, shape=84, render_mode="rgb_array",
 
 def make_vec_env(levels, n_envs, frame_stack=4, skip=4, shape=84,
                  normalize_reward=False, monitor=True, snapshot_dir=None,
-                 curriculum_threshold=0.5):
+                 curriculum_threshold=0.5, action_set="simple"):
     """SubprocVecEnv of n_envs Marios; worker i is fixed to levels[i % len(levels)].
 
     Fixing one level per worker (rather than recreating a random level on each
@@ -60,7 +60,8 @@ def make_vec_env(levels, n_envs, frame_stack=4, skip=4, shape=84,
             return make_mario_env(level=level, skip=skip, shape=shape,
                                   snapshot_dir=snapshot_dir,
                                   snapshot_seed=worker_idx,
-                                  curriculum_threshold=curriculum_threshold)
+                                  curriculum_threshold=curriculum_threshold,
+                                  action_set=action_set)
         return _init
 
     assigned = [levels[i % len(levels)] for i in range(n_envs)]
