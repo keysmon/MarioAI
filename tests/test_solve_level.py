@@ -2,6 +2,8 @@
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 def _load_solver():
     path = Path(__file__).parents[1] / "scripts" / "solve_level.py"
@@ -33,3 +35,152 @@ def test_advance_logs_decision_that_reaches_terminal_subframe():
     assert done
     assert info["flag_get"]
     assert actions == [4]
+
+
+@pytest.mark.parametrize(
+    ("level", "mode"),
+    [
+        ("2-2", "water"),
+        ("7-2", "water"),
+        ("4-4", "maze"),
+        ("7-4", "maze"),
+        ("8-4", "ground"),
+    ],
+)
+def test_level_mode(level, mode):
+    solver = _load_solver()
+
+    assert solver.level_mode(level) == mode
+
+
+def test_swim_candidates_are_aligned_to_four_frame_decisions():
+    solver = _load_solver()
+
+    candidates = solver.swim_candidates()
+
+    assert candidates
+    assert all(macro.frames % 4 == 0 for macro in candidates)
+    assert all(
+        pulse.frames % 4 == 0
+        and pulse.action in (solver.RIGHT_A_B, solver.A)
+        for macro in candidates
+        for pulse in macro.pulses
+    )
+
+
+class _SwimEnv:
+    def __init__(self):
+        self.unwrapped = self
+        self.calls = 0
+
+    @property
+    def ram(self):
+        raise AssertionError("water candidates must not use grounded()")
+
+    def load_state(self, snapshot):
+        self.calls = 0
+
+    def step(self, action):
+        self.calls += 1
+        return (
+            None,
+            0.0,
+            False,
+            False,
+            {"flag_get": False, "x_pos": 100 + 5 * self.calls},
+        )
+
+
+def test_swim_candidate_judges_progress_without_ground_state():
+    solver = _load_solver()
+    solver.SKIP = 4
+    macro = solver.Macro(
+        (
+            solver.Pulse(solver.RIGHT_A_B, 4),
+            solver.Pulse(solver.A, 4),
+        )
+    )
+
+    ok, flag_got, info, trace = solver.try_swim_candidate(
+        _SwimEnv(), object(), frontier=100, macro=macro
+    )
+
+    assert ok is True
+    assert flag_got is False
+    assert info["x_pos"] == 140
+    assert trace == [solver.RIGHT_A_B, solver.A]
+
+
+def test_maze_backward_snap_marks_wrong_branch():
+    solver = _load_solver()
+
+    progress = solver.maze_progress(
+        previous_x=1400, current_x=900, branch=2
+    )
+
+    assert progress.wrong_branch is True
+    assert progress.next_branch == 3
+
+
+def test_maze_small_backward_motion_keeps_current_branch():
+    solver = _load_solver()
+
+    progress = solver.maze_progress(
+        previous_x=1400, current_x=1145, branch=2
+    )
+
+    assert progress.wrong_branch is False
+    assert progress.next_branch == 2
+
+
+def test_maze_search_excludes_rejected_branch_from_expansion(monkeypatch):
+    solver = _load_solver()
+    monkeypatch.setattr(solver, "BACKTRACK_DEPTH", 1)
+    monkeypatch.setattr(solver, "WAITS", (0,))
+    monkeypatch.setattr(solver, "RIDES", (8,))
+    monkeypatch.setattr(solver, "JUMP_ACTIONS", (solver.RIGHT_A_B,))
+    monkeypatch.setattr(solver, "OFFSETS", (0,))
+    monkeypatch.setattr(solver, "HOLDS", (8,))
+    monkeypatch.setattr(solver, "ARC_ACTIONS", (solver.RIGHT_B,))
+    monkeypatch.setattr(
+        solver,
+        "try_candidate",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("rejected branch was expanded")
+        ),
+    )
+
+    result = solver._solve_ground_obstacle(
+        object(),
+        [(0, 40, 79, object())],
+        excluded_branches={0},
+        include_branch=True,
+    )
+
+    assert result is None
+
+
+def test_save_native_route_persists_policy_compatibility_metadata(
+    tmp_path, monkeypatch
+):
+    solver = _load_solver()
+    solver.SKIP = 4
+    saved = {}
+    monkeypatch.setattr(
+        solver,
+        "save_route",
+        lambda route, out_dir: saved.update(route),
+    )
+
+    solver.save_native_route(
+        tmp_path,
+        "1-1",
+        [3, 4],
+        [{"frame": 0, "x_pos": 40}],
+        action_set="complex",
+        decision_skip=4,
+    )
+
+    assert saved["action_set"] == "complex"
+    assert saved["decision_skip"] == 4
+    assert saved["actions"] == [3] * 4 + [4] * 4

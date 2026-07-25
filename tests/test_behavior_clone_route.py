@@ -49,3 +49,23 @@ def test_collect_demonstration_rejects_nonconstant_action_block(tmp_path):
         bc.collect_demonstration(
             tmp_path, level="1-1", skip=4, require_clear=False
         )
+
+
+def test_parser_accepts_repeated_routes_for_one_shared_checkpoint():
+    bc = _load_bc_module()
+
+    args = bc.parse_args(
+        [
+            "--route-dir",
+            "routes/2-2",
+            "--route-dir",
+            "routes/7-2",
+            "--init-from",
+            "models/shared.zip",
+            "--out",
+            "models/recovered.zip",
+        ]
+    )
+
+    assert args.route_dirs == [Path("routes/2-2"), Path("routes/7-2")]
+    assert args.action_set == "complex"

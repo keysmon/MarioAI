@@ -9,83 +9,33 @@ import torch.nn.functional as F
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 
-from marioai.curriculum import load_route
+from marioai.actions import resolve_action_set
+from marioai.demonstrations import (
+    _decision_actions,
+    collect_demonstration,
+    load_demonstrations,
+)
 from marioai.envs import make_mario_env
 
 
-def _make_vec_env(level, skip=4, shape=84, frame_stack=4):
+def _make_vec_env(
+    level,
+    skip=4,
+    shape=84,
+    frame_stack=4,
+    action_set="complex",
+):
     return VecFrameStack(
         DummyVecEnv([
-            lambda: make_mario_env(level=level, skip=skip, shape=shape)
+            lambda: make_mario_env(
+                level=level,
+                skip=skip,
+                shape=shape,
+                action_set=action_set,
+            )
         ]),
         n_stack=frame_stack,
         channels_order="last",
-    )
-
-
-def _decision_actions(actions, skip):
-    if len(actions) % skip:
-        raise ValueError(
-            f"route has {len(actions)} frames, not divisible by skip={skip}"
-        )
-    decisions = []
-    for frame in range(0, len(actions), skip):
-        block = actions[frame:frame + skip]
-        if len(set(block)) != 1:
-            raise ValueError(
-                f"route action block at frame {frame} is not constant: {block}"
-            )
-        decisions.append(block[0])
-    return decisions
-
-
-def collect_demonstration(route_dir, level, skip=4, shape=84, frame_stack=4,
-                          require_clear=True):
-    """Replay an aligned route through the exact policy observation pipeline."""
-    route = load_route(route_dir)
-    if route["level"] != level:
-        raise ValueError(
-            f"route is for level {route['level']!r}, requested {level!r}"
-        )
-    decisions = _decision_actions(route["actions"], skip)
-    env = _make_vec_env(level, skip=skip, shape=shape,
-                        frame_stack=frame_stack)
-    obs = env.reset()
-    observations = []
-    labels = []
-    cleared = False
-    max_x = 0
-    info = {}
-    try:
-        for action in decisions:
-            observations.append(np.asarray(obs[0]).copy())
-            labels.append(action)
-            obs, _, dones, infos = env.step(np.array([action]))
-            info = infos[0]
-            cleared = cleared or bool(info.get("flag_get", False))
-            max_x = max(max_x, int(info.get("x_pos", 0)))
-            if bool(dones[0]):
-                break
-    finally:
-        env.close()
-    result = {
-        "cleared": cleared,
-        "max_x": max_x,
-        "decisions": len(labels),
-    }
-    if require_clear and not cleared:
-        raise RuntimeError(
-            f"aligned route did not clear: decisions={len(labels)}/"
-            f"{len(decisions)} max_x={max_x}"
-        )
-    if len(labels) != len(decisions) and not cleared:
-        raise RuntimeError(
-            f"route terminated after {len(labels)}/{len(decisions)} decisions"
-        )
-    return (
-        np.asarray(observations, dtype=np.uint8),
-        np.asarray(labels, dtype=np.int64),
-        result,
     )
 
 
@@ -95,19 +45,24 @@ def _policy_logits(policy, observations):
     return policy.action_net(latent)
 
 
-def action_accuracy(policy, observations, actions):
+def action_accuracy(policy, observations, actions, sample_weights=None):
     policy.set_training_mode(False)
     with torch.no_grad():
         logits = _policy_logits(policy, observations)
-        correct = (logits.argmax(dim=1) == actions).sum().item()
-    return correct / len(actions)
+        correct = (logits.argmax(dim=1) == actions).float()
+        if sample_weights is None:
+            return float(correct.mean().item())
+        return float(
+            (correct * sample_weights).sum().item()
+            / sample_weights.sum().item()
+        )
 
 
 def rollout(model, level, skip=4, shape=84, frame_stack=4,
-            deterministic=True):
+            deterministic=True, action_set="complex"):
     """Run one true-start episode and return its terminal outcome."""
     env = _make_vec_env(level, skip=skip, shape=shape,
-                        frame_stack=frame_stack)
+                        frame_stack=frame_stack, action_set=action_set)
     obs = env.reset()
     cleared = False
     max_x = 0
@@ -127,30 +82,67 @@ def rollout(model, level, skip=4, shape=84, frame_stack=4,
     return {"cleared": cleared, "max_x": max_x, "decisions": decisions}
 
 
-def train(args):
-    observations, labels, route_result = collect_demonstration(
-        args.route_dir,
-        level=args.level,
-        skip=args.skip,
-        shape=args.shape,
-        frame_stack=args.frame_stack,
+def _rollouts(model, levels, args):
+    return {
+        level: rollout(
+            model,
+            level,
+            skip=args.skip,
+            deterministic=True,
+            action_set=args.action_set,
+        )
+        for level in levels
+    }
+
+
+def _print_rollouts(prefix, results):
+    summary = " ".join(
+        f"{level}:clear={result['cleared']},x={result['max_x']}"
+        for level, result in results.items()
     )
+    print(f"{prefix}: {summary}", flush=True)
+
+
+def train(args):
+    batch = load_demonstrations(
+        args.route_dirs,
+        action_set=args.action_set,
+        skip=args.skip,
+    )
+    levels = tuple(dict.fromkeys(batch.levels.tolist()))
     print(
-        f"dataset: {len(labels)} decisions, route clear="
-        f"{route_result['cleared']} x={route_result['max_x']}",
+        f"dataset: {len(batch.actions)} decisions across "
+        f"{len(levels)} levels; routes="
+        + ", ".join(
+            f"{result['level']}:{result['decisions']}"
+            for result in batch.route_results
+        ),
         flush=True,
     )
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     model = PPO.load(args.init_from, device=args.device)
+    expected_actions = len(resolve_action_set(args.action_set))
+    if model.action_space.n != expected_actions:
+        raise ValueError(
+            f"checkpoint action count {model.action_space.n} does not match "
+            f"{args.action_set!r} action set ({expected_actions})"
+        )
     policy = model.policy
-    obs_tensor, _ = policy.obs_to_tensor(observations)
+    obs_tensor, _ = policy.obs_to_tensor(batch.observations)
     action_tensor = torch.as_tensor(
-        labels, dtype=torch.long, device=policy.device
+        batch.actions, dtype=torch.long, device=policy.device
+    )
+    sample_weight_tensor = torch.as_tensor(
+        batch.sample_weights, dtype=torch.float32, device=policy.device
     )
 
-    counts = np.bincount(labels, minlength=model.action_space.n)
+    counts = np.bincount(
+        batch.actions,
+        weights=batch.sample_weights,
+        minlength=model.action_space.n,
+    )
     class_weights = np.ones(model.action_space.n, dtype=np.float32)
     present = counts > 0
     class_weights[present] = counts[present].max() / counts[present]
@@ -162,16 +154,16 @@ def train(args):
         + list(policy.action_net.parameters())
     )
     optimizer = torch.optim.Adam(parameters, lr=args.lr)
-    initial_accuracy = action_accuracy(policy, obs_tensor, action_tensor)
-    initial_rollout = rollout(model, args.level, args.skip, args.shape,
-                              args.frame_stack)
+    initial_accuracy = action_accuracy(
+        policy, obs_tensor, action_tensor, sample_weight_tensor
+    )
+    initial_rollouts = _rollouts(model, levels, args)
     print(
-        f"initial: accuracy={initial_accuracy:.4f} "
-        f"clear={initial_rollout['cleared']} "
-        f"x={initial_rollout['max_x']}",
+        f"initial: level-balanced accuracy={initial_accuracy:.4f}",
         flush=True,
     )
-    if initial_rollout["cleared"]:
+    _print_rollouts("initial greedy", initial_rollouts)
+    if all(result["cleared"] for result in initial_rollouts.values()):
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         model.save(args.out)
         return True
@@ -185,14 +177,23 @@ def train(args):
         for start in range(0, sample_count, args.batch_size):
             index = permutation[start:start + args.batch_size]
             logits = _policy_logits(policy, obs_tensor[index])
-            loss = F.cross_entropy(
-                logits, action_tensor[index], weight=weight_tensor
+            per_sample_loss = F.cross_entropy(
+                logits,
+                action_tensor[index],
+                weight=weight_tensor,
+                reduction="none",
             )
+            minibatch_weights = sample_weight_tensor[index]
+            loss = (
+                per_sample_loss * minibatch_weights
+            ).sum() / minibatch_weights.sum()
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0)
             optimizer.step()
-            total_loss += float(loss.detach()) * len(index)
+            total_loss += float(
+                (per_sample_loss.detach() * minibatch_weights).sum()
+            )
 
         should_measure = (
             epoch == 1
@@ -201,23 +202,21 @@ def train(args):
         )
         if not should_measure:
             continue
-        accuracy = action_accuracy(policy, obs_tensor, action_tensor)
+        accuracy = action_accuracy(
+            policy, obs_tensor, action_tensor, sample_weight_tensor
+        )
         best_accuracy = max(best_accuracy, accuracy)
         print(
-            f"epoch {epoch}: loss={total_loss / sample_count:.6f} "
+            f"epoch {epoch}: level-balanced loss="
+            f"{total_loss / sample_weight_tensor.sum().item():.6f} "
             f"accuracy={accuracy:.4f}",
             flush=True,
         )
         if accuracy < 1.0 and epoch % args.rollout_every:
             continue
-        result = rollout(model, args.level, args.skip, args.shape,
-                         args.frame_stack)
-        print(
-            f"  greedy: clear={result['cleared']} x={result['max_x']} "
-            f"decisions={result['decisions']}",
-            flush=True,
-        )
-        if result["cleared"]:
+        results = _rollouts(model, levels, args)
+        _print_rollouts("  greedy", results)
+        if all(result["cleared"] for result in results.values()):
             Path(args.out).parent.mkdir(parents=True, exist_ok=True)
             model.save(args.out)
             print(f"SAVED {args.out}", flush=True)
@@ -233,23 +232,32 @@ def train(args):
     return False
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--route-dir", required=True)
-    parser.add_argument("--level", default="1-3")
+    parser.add_argument(
+        "--route-dir",
+        dest="route_dirs",
+        action="append",
+        type=Path,
+        required=True,
+        help="solved route directory; repeat for shared multi-level cloning",
+    )
+    parser.add_argument("--action-set", default="complex")
     parser.add_argument("--init-from", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--skip", type=int, default=4)
-    parser.add_argument("--shape", type=int, default=84)
-    parser.add_argument("--frame-stack", type=int, default=4)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--rollout-every", type=int, default=50)
-    args = parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def main():
+    args = parse_args()
     raise SystemExit(0 if train(args) else 1)
 
 
