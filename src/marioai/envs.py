@@ -1,4 +1,6 @@
 """Mario env factory + multi-task vectorized env assembly."""
+from collections.abc import Mapping
+
 import gym_super_mario_bros
 from nes_py.wrappers import JoypadSpace
 from stable_baselines3.common.vec_env import (
@@ -14,7 +16,7 @@ from .wrappers import SkipFrame, GrayScaleResize, SnapshotStartWrapper
 
 def make_mario_env(level="1-1", skip=4, shape=84, render_mode="rgb_array",
                    capture_frames=False, snapshot_dir=None, snapshot_seed=0,
-                   curriculum_threshold=0.5, action_set="simple"):
+                   curriculum_threshold=0.5, action_set: str = "simple"):
     """Build a single fully-wrapped Mario env for one level (e.g. '1-1').
 
     capture_frames=True makes SkipFrame buffer every intra-skip native frame in
@@ -48,7 +50,8 @@ def make_mario_env(level="1-1", skip=4, shape=84, render_mode="rgb_array",
 
 def make_vec_env(levels, n_envs, frame_stack=4, skip=4, shape=84,
                  normalize_reward=False, monitor=True, snapshot_dir=None,
-                 curriculum_threshold=0.5, action_set="simple"):
+                 curriculum_threshold=0.5, action_set: str = "simple",
+                 level_weights: Mapping[str, float] | None = None):
     """SubprocVecEnv of n_envs Marios; worker i is fixed to levels[i % len(levels)].
 
     Fixing one level per worker (rather than recreating a random level on each

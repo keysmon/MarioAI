@@ -1,6 +1,6 @@
 import pytest
 from marioai.actions import action_set_size, resolve_action_set
-from marioai.envs import make_mario_env
+from marioai.envs import make_mario_env, make_vec_env
 from marioai.levels import ALL_LEVELS, WORLD_GROUPS, validate_levels
 
 
@@ -37,5 +37,13 @@ def test_complex_mario_env_has_12_discrete_actions():
     env = make_mario_env("1-1", action_set="complex")
     try:
         assert env.action_space.n == 12
+    finally:
+        env.close()
+
+
+def test_vec_env_accepts_level_weights_configuration():
+    env = make_vec_env(["1-1"], n_envs=1, level_weights={"1-1": 1.0})
+    try:
+        assert env.action_space.n == 7
     finally:
         env.close()
