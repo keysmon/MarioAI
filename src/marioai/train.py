@@ -10,6 +10,7 @@ import torch
 import yaml
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
+from stable_baselines3.common.torch_layers import NatureCNN
 from stable_baselines3.common.utils import LinearSchedule
 
 from marioai.actions import action_set_size
@@ -97,7 +98,10 @@ def validate_resume_model(
             f"configured action count {action_count}"
         )
 
-    extractors = {"impala": ImpalaCnnFeaturesExtractor}
+    extractors = {
+        "impala": ImpalaCnnFeaturesExtractor,
+        "nature": NatureCNN,
+    }
     try:
         expected_extractor = extractors[extractor_name]
     except KeyError as exc:
@@ -220,14 +224,14 @@ def build_training_env(cfg: Mapping, args: argparse.Namespace):
 def create_model(cfg: Mapping, args: argparse.Namespace, venv, device: str):
     """Create, resume, or initialize a PPO model for the configured run."""
     tensorboard_log = f"runs/{args.run_name}"
-    if args.resume:
+    if args.resume is not None:
         return PPO.load(
             args.resume,
             env=venv,
             device=device,
             tensorboard_log=tensorboard_log,
         )
-    if args.init_from:
+    if args.init_from is not None:
         print(f"FINE-TUNE from {args.init_from}")
         return PPO.load(
             args.init_from,
@@ -269,9 +273,12 @@ def main(argv=None):
     if args.start_snapshots and len(levels) != 1:
         raise SystemExit("--start-snapshots requires exactly one level")
 
-    # Inspect resume compatibility before constructing paid parallel workers.
-    if args.resume:
-        checkpoint = PPO.load(args.resume, device=device)
+    # Inspect checkpoint compatibility before constructing paid parallel workers.
+    checkpoint_source = (
+        args.resume if args.resume is not None else args.init_from
+    )
+    if checkpoint_source is not None:
+        checkpoint = PPO.load(checkpoint_source, device=device)
         validate_resume_model(
             checkpoint,
             action_count=action_set_size(cfg["env"].get("action_set", "simple")),
@@ -302,7 +309,7 @@ def main(argv=None):
         if args.start_snapshots:
             callbacks.append(CurriculumLogCallback())
 
-        reset_timesteps = not bool(args.resume) or args.reset_timesteps
+        reset_timesteps = args.resume is None or args.reset_timesteps
         model.learn(
             total_timesteps=cfg["train"]["total_timesteps"],
             callback=callbacks,
