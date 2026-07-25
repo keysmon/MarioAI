@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import string
 import tempfile
 from typing import Any
 
@@ -41,6 +43,49 @@ class RolloutResult:
         return cls(**value)
 
 
+def _is_integer(value: Any) -> bool:
+    return type(value) is int
+
+
+def _is_finite_number(value: Any) -> bool:
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def _is_valid_rollout(rollout: Any, stages: dict) -> bool:
+    return (
+        isinstance(rollout, RolloutResult)
+        and type(rollout.level) is str
+        and rollout.level in stages
+        and _is_integer(rollout.seed)
+        and type(rollout.cleared) is bool
+        and type(rollout.terminal_cause) is str
+        and rollout.terminal_cause in {"flag", "timeout", "time", "death"}
+        and _is_integer(rollout.max_x)
+        and rollout.max_x >= 0
+        and _is_finite_number(rollout.reward)
+        and _is_integer(rollout.steps)
+        and rollout.steps > 0
+        and _is_finite_number(rollout.wall_seconds)
+        and rollout.wall_seconds >= 0
+    )
+
+
+def _is_valid_stage_summary(stage: Any) -> bool:
+    if not isinstance(stage, dict):
+        return False
+    if (
+        type(stage.get("passed")) is not bool
+        or not _is_integer(stage.get("clears"))
+        or not _is_integer(stage.get("episodes"))
+    ):
+        return False
+    optional_numbers = ("clear_rate", "mean_max_x", "mean_reward")
+    return all(
+        field not in stage or _is_finite_number(stage[field])
+        for field in optional_numbers
+    )
+
+
 def summarize_stage(
     level: str, rollouts: list[RolloutResult]
 ) -> dict[str, bool | int | float]:
@@ -69,16 +114,39 @@ class EvaluationReport:
     stages: dict[str, dict[str, bool | int | float]]
     rollouts: list[RolloutResult]
 
+    def _has_valid_schema(self) -> bool:
+        return (
+            type(self.checkpoint_sha256) is str
+            and len(self.checkpoint_sha256) == 64
+            and all(
+                character in string.hexdigits
+                for character in self.checkpoint_sha256
+            )
+            and type(self.deterministic) is bool
+            and _is_integer(self.requested_episodes)
+            and isinstance(self.stages, dict)
+            and all(
+                type(level) is str and _is_valid_stage_summary(stage)
+                for level, stage in self.stages.items()
+            )
+            and type(self.rollouts) is list
+            and all(
+                _is_valid_rollout(rollout, self.stages)
+                for rollout in self.rollouts
+            )
+        )
+
     @property
     def passed(self) -> bool:
+        if not self._has_valid_schema():
+            return False
         if self.deterministic or self.requested_episodes != 15:
             return False
         if set(self.stages) != set(ALL_LEVELS):
             return False
         return all(
             stage.get("passed") is True
-            and stage.get("clears", 0) >= 1
-            and stage.get("episodes") == 15
+            and 1 <= stage["clears"] <= stage["episodes"] == 15
             for stage in self.stages.values()
         )
 
@@ -136,15 +204,21 @@ def checkpoint_score(report: EvaluationReport) -> tuple[int, int, float]:
     """Rank a checkpoint by stage coverage, then clears, then progress."""
     coverage = sum(stage.get("passed") is True for stage in report.stages.values())
     clears = sum(int(stage.get("clears", 0)) for stage in report.stages.values())
-    if report.rollouts:
-        progress = sum(rollout.max_x for rollout in report.rollouts) / len(
-            report.rollouts
+    progress_totals: dict[str, tuple[int, int]] = {}
+    for rollout in report.rollouts:
+        total, count = progress_totals.get(rollout.level, (0, 0))
+        progress_totals[rollout.level] = (
+            total + rollout.max_x,
+            count + 1,
         )
-    else:
-        progress = sum(
-            float(stage.get("mean_max_x", 0.0))
-            for stage in report.stages.values()
+    progress = sum(
+        (
+            progress_totals[level][0] / progress_totals[level][1]
+            if level in progress_totals
+            else float(stage.get("mean_max_x", 0.0))
         )
+        for level, stage in report.stages.items()
+    )
     return coverage, clears, progress
 
 

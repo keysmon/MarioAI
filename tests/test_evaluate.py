@@ -109,6 +109,61 @@ def test_acceptance_rejects_stage_without_15_episodes_or_a_clear():
     assert not replace(report, stages=no_clear).passed
 
 
+@pytest.mark.parametrize(
+    "checkpoint_sha256",
+    [
+        "a" * 63,
+        "a" * 65,
+        "g" * 64,
+        123,
+    ],
+)
+def test_acceptance_rejects_malformed_checkpoint_digest(checkpoint_sha256):
+    assert not replace(
+        _report(), checkpoint_sha256=checkpoint_sha256
+    ).passed
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("deterministic", 0),
+        ("requested_episodes", 15.0),
+        ("rollouts", ()),
+        ("rollouts", [object()]),
+    ],
+)
+def test_acceptance_rejects_malformed_top_level_field_types(field, value):
+    assert not replace(_report(), **{field: value}).passed
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("clears", True),
+        ("clears", 1.0),
+        ("clears", -1),
+        ("clears", 16),
+        ("episodes", 15.0),
+        ("episodes", True),
+    ],
+)
+def test_acceptance_requires_true_integer_stage_counts(field, value):
+    report = _report()
+    stages = dict(report.stages)
+    stages["8-4"] = {**stages["8-4"], field: value}
+
+    assert not replace(report, stages=stages).passed
+
+
+def test_acceptance_rejects_non_mapping_stage_summary():
+    report = _report()
+    stages = dict(report.stages)
+    stages["8-4"] = []
+
+    assert not replace(report, stages=stages).passed
+
+
 def test_checkpoint_selection_prefers_coverage_then_clears_then_progress():
     report_with_8_stages = _report(passed_stages=8, clears=8)
     report_with_7_stages = _report(passed_stages=7, clears=70, mean_max_x=999.0)
@@ -158,6 +213,30 @@ def test_checkpoint_progress_falls_back_to_rollout_evidence():
     )
 
     assert is_better_checkpoint(more_progress, less_progress)
+
+
+def test_checkpoint_progress_ordering_is_stable_across_representations():
+    summary_only = _report(passed_stages=8, clears=12, mean_max_x=100.0)
+    partially_rollout_backed = replace(
+        summary_only,
+        rollouts=[_rollout("1-1", seed=0, max_x=100)],
+    )
+    rollout_backed = replace(
+        summary_only,
+        rollouts=[
+            _rollout(level, seed=index, max_x=100)
+            for index, level in enumerate(ALL_LEVELS)
+        ],
+    )
+    improved_rollouts = list(rollout_backed.rollouts)
+    improved_rollouts[-1] = _rollout("8-4", seed=31, max_x=101)
+    improved = replace(rollout_backed, rollouts=improved_rollouts)
+
+    assert checkpoint_score(partially_rollout_backed) == checkpoint_score(
+        summary_only
+    )
+    assert checkpoint_score(rollout_backed) == checkpoint_score(summary_only)
+    assert is_better_checkpoint(improved, summary_only)
 
 
 def test_report_json_round_trip_preserves_stable_schema(tmp_path):
