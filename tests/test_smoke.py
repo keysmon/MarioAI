@@ -80,6 +80,7 @@ def _run_all32_pipeline_smoke(tmp_path):
         action_set=cfg["env"]["action_set"],
     )
     try:
+        assert venv.num_envs == 2
         model = PPO(
             "CnnPolicy",
             venv,
@@ -105,6 +106,7 @@ def _run_all32_pipeline_smoke(tmp_path):
         action_set=cfg["env"]["action_set"],
     )
     try:
+        assert resumed_venv.num_envs == 2
         resumed = PPO.load(model_path, env=resumed_venv, device="cpu")
         validate_resume_model(
             resumed,
