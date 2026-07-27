@@ -449,6 +449,7 @@ class AwsCommandAdapter:
         instance_id: str | None = None,
         client_token: str | None = None,
         active_only: bool = False,
+        timeout_seconds: int | float | None = None,
     ) -> tuple[dict[str, str | None], ...]:
         """Return strict project instance summaries through the read-only CLI."""
         if instance_id is not None and (
@@ -482,7 +483,7 @@ class AwsCommandAdapter:
                     "Name=instance-state-name,"
                     "Values=pending,running,stopping,stopped,shutting-down"
                 )
-        payload = self.readonly.run(args)
+        payload = self.readonly.run(args, timeout_seconds=timeout_seconds)
         summaries = _instance_summaries(payload)
         self._authorized_termination_ids.update(
             summary["instance_id"]
@@ -954,39 +955,42 @@ aws sts get-caller-identity --output json >/dev/null
             text=True,
         )
         pending_input = input_text
-        while True:
-            remaining = deadline - _monotonic_decimal(self._monotonic())
-            if remaining <= 0:
+        try:
+            while True:
+                remaining = deadline - _monotonic_decimal(self._monotonic())
+                if remaining <= 0:
+                    if on_tick is not None:
+                        on_tick()
+                    raise AwsLifecycleError(
+                        f"{command[0]} exceeded the absolute paid deadline"
+                    )
+                poll_timeout = float(min(Decimal("60"), remaining))
+                try:
+                    stdout, stderr = process.communicate(
+                        input=pending_input,
+                        timeout=poll_timeout,
+                    )
+                except subprocess.TimeoutExpired:
+                    pending_input = None
+                    if on_tick is not None:
+                        on_tick()
+                    continue
+                if on_tick is not None:
+                    on_tick()
+                if process.returncode != 0:
+                    detail_text = (stderr or "").strip()
+                    detail = f": {detail_text}" if detail_text else ""
+                    raise AwsLifecycleError(f"{command[0]} failed{detail}")
+                del stdout
+                return
+        finally:
+            if process.returncode is None:
                 process.terminate()
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=5)
-                if on_tick is not None:
-                    on_tick()
-                raise AwsLifecycleError(
-                    f"{command[0]} exceeded the absolute paid deadline"
-                )
-            poll_timeout = float(min(Decimal("60"), remaining))
-            try:
-                stdout, stderr = process.communicate(
-                    input=pending_input,
-                    timeout=poll_timeout,
-                )
-            except subprocess.TimeoutExpired:
-                pending_input = None
-                if on_tick is not None:
-                    on_tick()
-                continue
-            if on_tick is not None:
-                on_tick()
-            if process.returncode != 0:
-                detail_text = (stderr or "").strip()
-                detail = f": {detail_text}" if detail_text else ""
-                raise AwsLifecycleError(f"{command[0]} failed{detail}")
-            del stdout
-            return
 
 
 class AwsOrchestrator:
@@ -1410,8 +1414,15 @@ class AwsOrchestrator:
             deadline = self.final_deadline(instance)
             empty_confirmations = 0
             while True:
+                remaining = deadline - _monotonic_decimal(self._monotonic())
+                if remaining <= 0:
+                    raise AwsLifecycleError(
+                        "absolute paid deadline reached before EC2 terminal "
+                        "confirmation"
+                    )
                 summaries = self.aws.project_instances(
-                    instance_id=instance.instance_id
+                    instance_id=instance.instance_id,
+                    timeout_seconds=float(min(Decimal("60"), remaining)),
                 )
                 self.persist_elapsed(instance, ledger_path)
                 if not summaries:
@@ -1606,6 +1617,8 @@ def _launched_instance_payload(
         or instance.get("InstanceType") != request["InstanceType"]
         or instance.get("InstanceLifecycle") != "spot"
         or instance.get("KeyName") != request["KeyName"]
+        or instance.get("IamInstanceProfile")
+        != request["IamInstanceProfile"]
         or not isinstance(placement, dict)
         or placement.get("AvailabilityZone")
         != request["Placement"]["AvailabilityZone"]
@@ -1923,10 +1936,18 @@ def _settle_reservation(
     instance_id: str | None,
 ) -> BudgetLedger:
     """Consume the conservatively gated main runtime and global grace."""
+    if (
+        instance_id is not None
+        and reservation.instance_id is not None
+        and instance_id != reservation.instance_id
+    ):
+        raise AwsLifecycleError(
+            "settlement instance ID does not match durable reservation"
+        )
     pending_id = f"pending:{reservation.client_token}"
-    main_instance_id = instance_id or pending_id
+    main_instance_id = instance_id or reservation.instance_id or pending_id
     migrated_ids = {main_instance_id}
-    if instance_id is not None:
+    if main_instance_id != pending_id:
         migrated_ids.add(pending_id)
     prior_main_runs = tuple(
         run
@@ -2191,6 +2212,16 @@ def main(
                                 "stored instance lookup returned a different target"
                             )
                         instances_by_id[recovered_id] = exact[0]
+                if (
+                    recovered_id is not None
+                    and reservation.instance_id is None
+                ):
+                    reservation = replace(
+                        reservation,
+                        state="launched",
+                        instance_id=recovered_id,
+                    )
+                    reservation_store.save(reservation)
             terminated_ids = []
             for instance in instances_by_id.values():
                 instance_id = instance["instance_id"]

@@ -246,7 +246,12 @@ class AwsCli:
         self._preflight_config: AwsConfig | None = None
         self._subnet_by_az: dict[str, str] = {}
 
-    def run(self, args: Sequence[str]) -> dict | list | str:
+    def run(
+        self,
+        args: Sequence[str],
+        *,
+        timeout_seconds: int | float | None = None,
+    ) -> dict | list | str:
         """Run one explicitly allowed read-only operation and parse strict JSON."""
         if isinstance(args, (str, bytes)) or len(args) < 2:
             raise AwsCliError("AWS arguments must name a service and operation")
@@ -270,6 +275,21 @@ class AwsCli:
         )
         if fixed_override is not None:
             raise AwsCliError(f"{fixed_override} is controlled by AwsCli")
+        timeout = (
+            _AWS_CLI_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else timeout_seconds
+        )
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not Decimal(str(timeout)).is_finite()
+            or timeout <= 0
+            or timeout > _AWS_CLI_TIMEOUT_SECONDS
+        ):
+            raise AwsCliError(
+                "AWS timeout must be positive and no greater than 60 seconds"
+            )
 
         command = [
             "aws",
@@ -288,12 +308,12 @@ class AwsCli:
                 check=True,
                 text=True,
                 capture_output=True,
-                timeout=_AWS_CLI_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
         except subprocess.TimeoutExpired as error:
             raise AwsCliError(
                 f"AWS {operation_name} timed out after "
-                f"{_AWS_CLI_TIMEOUT_SECONDS} seconds"
+                f"{timeout} seconds"
             ) from error
         except subprocess.CalledProcessError as error:
             stderr = (error.stderr or "").strip()
