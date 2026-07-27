@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import json
 import os
 from pathlib import Path
@@ -29,6 +29,15 @@ def _nonnegative_decimal(value: Any, field_name: str) -> Decimal:
     if value < 0:
         raise ValueError(f"{field_name} cannot be negative")
     return value
+
+
+def _json_decimal(value: Any, field_name: str) -> Decimal:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be stored as a JSON string")
+    try:
+        return Decimal(value)
+    except (InvalidOperation, ValueError) as error:
+        raise ValueError(f"{field_name} is not a valid Decimal") from error
 
 
 @dataclass(frozen=True)
@@ -66,12 +75,18 @@ class CostedRun:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> CostedRun:
         try:
+            if not isinstance(value, Mapping):
+                raise ValueError("costed run must be a mapping")
             return cls(
                 phase=value["phase"],
                 instance_id=value["instance_id"],
-                hours=Decimal(value["hours"]),
-                instance_hourly_usd=Decimal(value["instance_hourly_usd"]),
-                volume_hourly_usd=Decimal(value["volume_hourly_usd"]),
+                hours=_json_decimal(value["hours"], "hours"),
+                instance_hourly_usd=_json_decimal(
+                    value["instance_hourly_usd"], "instance_hourly_usd"
+                ),
+                volume_hourly_usd=_json_decimal(
+                    value["volume_hourly_usd"], "volume_hourly_usd"
+                ),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError("invalid costed run") from error
@@ -97,6 +112,8 @@ class BudgetLedger:
             raise ValueError("runs must be a tuple of CostedRun values")
         if len({(run.phase, run.instance_id) for run in self.runs}) != len(self.runs):
             raise ValueError("runs must have unique phase/instance pairs")
+        if self.spent_usd < sum((run.cost_usd for run in self.runs), Decimal("0")):
+            raise ValueError("spent_usd cannot be below represented run costs")
         if not isinstance(self.allocations, Mapping):
             raise ValueError("allocations must be a mapping")
         normalized_allocations: dict[str, Decimal] = {}
@@ -138,6 +155,11 @@ class BudgetLedger:
         )
         if old_run is not None and run.hours < old_run.hours:
             raise ValueError("run hours cannot decrease")
+        if old_run is not None and (
+            run.instance_hourly_usd != old_run.instance_hourly_usd
+            or run.volume_hourly_usd != old_run.volume_hourly_usd
+        ):
+            raise ValueError("run rates cannot change")
         replacement_cost = old_run.cost_usd if old_run is not None else Decimal("0")
         projected_spent = self.spent_usd - replacement_cost + run.cost_usd
         if projected_spent > self.cap_usd:
@@ -216,13 +238,21 @@ class BudgetLedger:
             return cls(cap_usd=cap_usd)
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, Mapping):
+                raise ValueError("ledger payload must be a mapping")
+            runs = payload["runs"]
+            allocations = payload.get("allocations", {})
+            if not isinstance(runs, list):
+                raise ValueError("runs must be a list")
+            if not isinstance(allocations, Mapping):
+                raise ValueError("allocations must be a mapping")
             return cls(
-                cap_usd=Decimal(payload["cap_usd"]),
-                spent_usd=Decimal(payload["spent_usd"]),
-                runs=tuple(CostedRun.from_dict(run) for run in payload["runs"]),
+                cap_usd=_json_decimal(payload["cap_usd"], "cap_usd"),
+                spent_usd=_json_decimal(payload["spent_usd"], "spent_usd"),
+                runs=tuple(CostedRun.from_dict(run) for run in runs),
                 allocations={
-                    phase: Decimal(allocation)
-                    for phase, allocation in payload.get("allocations", {}).items()
+                    phase: _json_decimal(allocation, "allocation")
+                    for phase, allocation in allocations.items()
                 },
             )
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:

@@ -119,3 +119,58 @@ def test_run_rejects_negative_duration():
             instance_hourly_usd=Decimal("0.60"),
             volume_hourly_usd=Decimal("0.011"),
         )
+
+
+def test_progress_update_rejects_rate_change_without_restoring_spend(run):
+    """Catches an update that rewrites already accrued hours at a lower rate."""
+    first = BudgetLedger().update_run(run)
+
+    with pytest.raises(ValueError, match="rates cannot change"):
+        first.update_run(
+            replace(
+                run,
+                hours=Decimal("2.0"),
+                instance_hourly_usd=Decimal("0.01"),
+            )
+        )
+
+    assert first.spent_usd == Decimal("0.6110")
+
+
+def test_ledger_rejects_spend_below_represented_runs_and_allows_unattributed_spend(
+    run,
+):
+    """Catches durable state that underreports already represented run costs."""
+    with pytest.raises(ValueError, match="below represented run costs"):
+        BudgetLedger(spent_usd=Decimal("0.60"), runs=(run,))
+
+    ledger = BudgetLedger(spent_usd=Decimal("2.00"), runs=(run,))
+    assert ledger.remaining_usd == Decimal("48.00")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda payload: payload.__setitem__("cap_usd", 50.0),
+        lambda payload: payload.__setitem__("spent_usd", 0.0),
+        lambda payload: payload["runs"][0].__setitem__("hours", 1.0),
+        lambda payload: payload["runs"][0].__setitem__("instance_hourly_usd", 0.6),
+        lambda payload: payload["allocations"].__setitem__("benchmark", 4.0),
+        lambda payload: payload.__setitem__("allocations", []),
+        lambda payload: payload["runs"][0].__setitem__("hours", "not-a-decimal"),
+    ],
+)
+def test_load_rejects_non_string_or_malformed_persisted_schema(tmp_path, run, mutation):
+    """Catches accepting numeric or malformed data in string-backed JSON fields."""
+    path = tmp_path / "spend.json"
+    payload = {
+        "cap_usd": "50.00",
+        "spent_usd": "0.6110",
+        "runs": [run.to_dict()],
+        "allocations": {"benchmark": "4.00"},
+    }
+    mutation(payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid budget ledger"):
+        BudgetLedger.load(path)
