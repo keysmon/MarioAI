@@ -1,0 +1,31 @@
+profile: defectlens
+account_id: "002559670021"
+region: us-east-1
+ami_ssm_parameter: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+vpc_id: vpc-0ce3c6e06be6377df
+subnet_ids:
+  - subnet-0ba0242531d6615f3
+  - subnet-0870eed3fd2b7dfab
+  - subnet-02e9c5f8deb69ad62
+  - subnet-0e5d82120140b0b4e
+  - subnet-02ab8427ae66e6e36
+  - subnet-0fa9ec503414b2be9
+security_group_id: sg-03fc64395e32dea85
+key_name: mario-training-key
+instance_profile: defectlens-gpu-role
+s3_prefix: s3://defectlens-phase3-002559670021/marioai/all32/
+instance_types: [c7i.8xlarge, c7i.16xlarge]
+on_demand_ceiling_usd:
+  c7i.8xlarge: "1.428"
+  c7i.16xlarge: "2.856"
+root_volume_gb: 100
+gp3_monthly_usd_per_gb: "0.08"
+cap_usd: "50.00"
+shutdown_threshold_usd: "49.00"
+grace_minutes: 15
+allocations:
+  benchmark: "4.00"
+  phase_1: "16.00"
+  phase_2: "16.00"
+  recovery: "10.00"
+  evaluation: "4.00"
