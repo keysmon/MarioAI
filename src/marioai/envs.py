@@ -37,6 +37,21 @@ def make_mario_env(level="1-1", skip=4, shape=84, render_mode="rgb_array",
             raise ValueError(
                 f"route is for level {route['level']!r}, env is {level!r}"
             )
+        if route.get("action_set") != action_set:
+            raise ValueError(
+                f"snapshot route action set {route.get('action_set')!r} does "
+                f"not match environment action set {action_set!r}"
+            )
+        stored_skip = route.get("decision_skip")
+        if (
+            isinstance(stored_skip, bool)
+            or not isinstance(stored_skip, int)
+            or stored_skip != skip
+        ):
+            raise ValueError(
+                f"snapshot route decision skip {stored_skip!r} does not "
+                f"match environment skip {skip}"
+            )
     env = gym_super_mario_bros.make(
         f"SuperMarioBros-{level}-v0", render_mode=render_mode
     )
@@ -52,7 +67,8 @@ def make_mario_env(level="1-1", skip=4, shape=84, render_mode="rgb_array",
 def make_vec_env(levels, n_envs, frame_stack=4, skip=4, shape=84,
                  normalize_reward=False, monitor=True, snapshot_dir=None,
                  curriculum_threshold=0.5, action_set: str = "simple",
-                 level_weights: Mapping[str, float] | None = None):
+                 level_weights: Mapping[str, float] | None = None,
+                 vecnormalize_path=None):
     """SubprocVecEnv of n_envs Marios with each worker fixed to one stage.
 
     Fixing one level per worker (rather than recreating a random level on each
@@ -74,6 +90,30 @@ def make_vec_env(levels, n_envs, frame_stack=4, skip=4, shape=84,
     if monitor:
         venv = VecMonitor(venv)
     venv = VecFrameStack(venv, n_stack=frame_stack, channels_order="last")
+    if vecnormalize_path is not None and not normalize_reward:
+        venv.close()
+        raise ValueError(
+            "cannot restore VecNormalize when reward normalization is disabled"
+        )
     if normalize_reward:
-        venv = VecNormalize(venv, norm_obs=False, norm_reward=True, clip_reward=10.0)
+        if vecnormalize_path is None:
+            venv = VecNormalize(
+                venv,
+                norm_obs=False,
+                norm_reward=True,
+                clip_reward=10.0,
+            )
+        else:
+            try:
+                venv = VecNormalize.load(str(vecnormalize_path), venv)
+            except Exception:
+                venv.close()
+                raise
+            if venv.norm_obs or not venv.norm_reward:
+                venv.close()
+                raise ValueError(
+                    "VecNormalize state does not match reward-only "
+                    "normalization"
+                )
+            venv.training = True
     return venv

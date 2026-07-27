@@ -1,7 +1,11 @@
 from argparse import Namespace
+from pathlib import Path
 from types import SimpleNamespace
 
+import gymnasium as gym
+import numpy as np
 import pytest
+from torch import nn
 from stable_baselines3.common.torch_layers import NatureCNN
 
 import marioai.train as training
@@ -9,6 +13,7 @@ from marioai.features import ImpalaCnnFeaturesExtractor
 from marioai.train import (
     build_policy_kwargs,
     load_training_config,
+    matching_vecnormalize_path,
     validate_resume_model,
 )
 
@@ -70,46 +75,179 @@ def test_build_policy_kwargs_selects_configured_impala_architecture():
     }
 
 
+def _compatibility_kwargs(**changes):
+    values = {
+        "action_count": 12,
+        "observation_shape": (84, 84),
+        "frame_stack": 4,
+        "extractor_name": "impala",
+        "features_dim": 32,
+        "channels": (2, 3, 4),
+    }
+    values.update(changes)
+    return values
+
+
+def _impala_extractor(
+    *,
+    input_channels=4,
+    features_dim=32,
+    channels=(2, 3, 4),
+):
+    space = gym.spaces.Box(
+        0,
+        255,
+        shape=(input_channels, 84, 84),
+        dtype=np.uint8,
+    )
+    return ImpalaCnnFeaturesExtractor(
+        space,
+        features_dim=features_dim,
+        channels=channels,
+    )
+
+
+def _compatible_checkpoint(
+    *,
+    observation_shape=(4, 84, 84),
+    input_channels=4,
+    features_dim=32,
+    channels=(2, 3, 4),
+):
+    return SimpleNamespace(
+        action_space=gym.spaces.Discrete(12),
+        observation_space=gym.spaces.Box(
+            0,
+            255,
+            shape=observation_shape,
+            dtype=np.uint8,
+        ),
+        policy=SimpleNamespace(
+            features_extractor=_impala_extractor(
+                input_channels=input_channels,
+                features_dim=features_dim,
+                channels=channels,
+            )
+        ),
+    )
+
+
 def test_resume_rejects_seven_action_checkpoint():
     model = SimpleNamespace(
         action_space=SimpleNamespace(n=7),
+        observation_space=gym.spaces.Box(
+            0, 255, shape=(4, 84, 84), dtype=np.uint8
+        ),
         policy=SimpleNamespace(features_extractor=object()),
     )
 
     with pytest.raises(ValueError, match="checkpoint action count 7"):
-        validate_resume_model(model, action_count=12, extractor_name="impala")
+        validate_resume_model(model, **_compatibility_kwargs())
 
 
 def test_resume_rejects_incompatible_extractor():
     model = SimpleNamespace(
         action_space=SimpleNamespace(n=12),
+        observation_space=gym.spaces.Box(
+            0, 255, shape=(4, 84, 84), dtype=np.uint8
+        ),
         policy=SimpleNamespace(features_extractor=object()),
     )
 
     with pytest.raises(ValueError, match="checkpoint extractor object"):
-        validate_resume_model(model, action_count=12, extractor_name="impala")
+        validate_resume_model(model, **_compatibility_kwargs())
 
 
-def test_resume_accepts_matching_action_count_and_extractor():
-    extractor = object.__new__(ImpalaCnnFeaturesExtractor)
-    model = SimpleNamespace(
-        action_space=SimpleNamespace(n=12),
-        policy=SimpleNamespace(features_extractor=extractor),
+def test_resume_accepts_complete_matching_environment_and_policy_signature():
+    model = _compatible_checkpoint()
+
+    validate_resume_model(model, **_compatibility_kwargs())
+
+
+@pytest.mark.parametrize(
+    ("model", "match"),
+    [
+        (
+            _compatible_checkpoint(observation_shape=(4, 96, 96)),
+            "observation shape",
+        ),
+        (
+            _compatible_checkpoint(
+                observation_shape=(3, 84, 84),
+                input_channels=3,
+            ),
+            "frame stack",
+        ),
+        (
+            _compatible_checkpoint(features_dim=64),
+            "feature width",
+        ),
+        (
+            _compatible_checkpoint(channels=(2, 4, 4)),
+            "IMPALA channels",
+        ),
+    ],
+)
+def test_resume_rejects_incompatible_geometry_or_impala_configuration(
+    model, match
+):
+    with pytest.raises(ValueError, match=match):
+        validate_resume_model(model, **_compatibility_kwargs())
+
+
+def test_resume_rejects_pre_fix_impala_channel_geometry():
+    model = _compatible_checkpoint()
+    model.policy.features_extractor.cnn[0] = nn.Conv2d(
+        84, 2, kernel_size=3, padding=1
     )
 
-    validate_resume_model(model, action_count=12, extractor_name="impala")
+    with pytest.raises(ValueError, match="input channels 84"):
+        validate_resume_model(model, **_compatibility_kwargs())
 
 
 def test_legacy_init_compatibility_accepts_nature_cnn():
+    observation_space = gym.spaces.Box(
+        0, 255, shape=(4, 84, 84), dtype=np.uint8
+    )
     model = SimpleNamespace(
         action_space=SimpleNamespace(n=7),
-        policy=SimpleNamespace(features_extractor=object.__new__(NatureCNN)),
+        observation_space=observation_space,
+        policy=SimpleNamespace(
+            features_extractor=NatureCNN(observation_space)
+        ),
     )
 
-    validate_resume_model(model, action_count=7, extractor_name="nature")
+    validate_resume_model(
+        model,
+        action_count=7,
+        observation_shape=(84, 84),
+        frame_stack=4,
+        extractor_name="nature",
+        features_dim=None,
+        channels=None,
+    )
 
 
-def _orchestration_config():
+@pytest.mark.parametrize(
+    ("checkpoint", "expected"),
+    [
+        (
+            Path("models/run/final.zip"),
+            Path("models/run/vecnormalize.pkl"),
+        ),
+        (
+            Path("models/run/ckpt_250000_steps.zip"),
+            Path("models/run/ckpt_vecnormalize_250000_steps.pkl"),
+        ),
+    ],
+)
+def test_matching_vecnormalize_path_uses_model_checkpoint_identity(
+    checkpoint, expected
+):
+    assert matching_vecnormalize_path(checkpoint) == expected
+
+
+def _orchestration_config(*, normalize_reward=False):
     return {
         "levels": ["1-1"],
         "env": {
@@ -124,7 +262,7 @@ def _orchestration_config():
             "device": "cpu",
             "seed": 42,
             "checkpoint_freq": 64,
-            "normalize_reward": False,
+            "normalize_reward": normalize_reward,
             "level_weights": {},
         },
         "policy": {
@@ -152,18 +290,30 @@ def _run_orchestration(
     incompatible=False,
     events=None,
     reset_timesteps=False,
+    normalize_reward=False,
+    create_normalization=False,
 ):
     events = [] if events is None else events
     extractor = (
-        object() if incompatible else object.__new__(ImpalaCnnFeaturesExtractor)
+        object()
+        if incompatible
+        else _impala_extractor(
+            features_dim=512,
+            channels=(16, 32, 32),
+        )
     )
     checkpoint = SimpleNamespace(
         action_space=SimpleNamespace(n=12),
+        observation_space=gym.spaces.Box(
+            0, 255, shape=(4, 84, 84), dtype=np.uint8
+        ),
         policy=SimpleNamespace(features_extractor=extractor),
     )
 
     class FakeModel:
-        def learn(self, *, reset_num_timesteps, **_kwargs):
+        def learn(self, *, reset_num_timesteps, callback, **_kwargs):
+            if callback[0].save_vecnormalize:
+                events.append(("checkpoint-vecnormalize", True))
             events.append(("learn", reset_num_timesteps))
 
         def save(self, _path):
@@ -180,19 +330,31 @@ def _run_orchestration(
             return checkpoint if env is None else FakeModel()
 
     class FakeVecEnv:
+        def save(self, path):
+            events.append(("vecnormalize-save", path))
+
         def close(self):
             events.append(("close",))
 
-    def fake_build_training_env(_cfg, _args):
-        events.append(("env",))
+    def fake_build_training_env(_cfg, _args, vecnormalize_path=None):
+        if vecnormalize_path is None:
+            events.append(("env",))
+        else:
+            events.append(("env", Path(vecnormalize_path)))
         return FakeVecEnv()
 
     monkeypatch.chdir(tmp_path)
+    if create_normalization:
+        (tmp_path / "checkpoint.vecnormalize.pkl").write_bytes(
+            b"normalization state"
+        )
     monkeypatch.setattr(training, "PPO", FakePPO)
     monkeypatch.setattr(
         training,
         "load_training_config",
-        lambda _path, _phase, _overrides: _orchestration_config(),
+        lambda _path, _phase, _overrides: _orchestration_config(
+            normalize_reward=normalize_reward
+        ),
     )
     monkeypatch.setattr(training, "build_training_env", fake_build_training_env)
 
@@ -283,3 +445,46 @@ def test_incompatible_init_from_fails_before_vector_workers(
             events=events,
         )
     assert events == [("load", "checkpoint.zip", "no-env")]
+
+
+def test_normalized_resume_requires_matching_state_before_vector_workers(
+    monkeypatch, tmp_path
+):
+    events = []
+
+    with pytest.raises(FileNotFoundError, match="VecNormalize"):
+        _run_orchestration(
+            monkeypatch,
+            tmp_path,
+            "--resume",
+            normalize_reward=True,
+            events=events,
+        )
+
+    assert events == [("load", "checkpoint.zip", "no-env")]
+
+
+def test_normalized_resume_restores_and_saves_matching_state(
+    monkeypatch, tmp_path
+):
+    events = _run_orchestration(
+        monkeypatch,
+        tmp_path,
+        "--resume",
+        normalize_reward=True,
+        create_normalization=True,
+    )
+
+    assert events == [
+        ("load", "checkpoint.zip", "no-env"),
+        ("env", Path("checkpoint.vecnormalize.pkl")),
+        ("load", "checkpoint.zip", "env"),
+        ("checkpoint-vecnormalize", True),
+        ("learn", False),
+        ("save",),
+        (
+            "vecnormalize-save",
+            "models/orchestration/vecnormalize.pkl",
+        ),
+        ("close",),
+    ]

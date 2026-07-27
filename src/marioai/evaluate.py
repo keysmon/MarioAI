@@ -10,11 +10,14 @@ import time
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 
+from marioai.actions import action_set_size
 from marioai.envs import make_mario_env
 from marioai.levels import ALL_LEVELS, validate_levels
 from marioai.results import (
     EvaluationReport,
+    LEGACY_DIAGNOSTIC_POLICY_MODE,
     RolloutResult,
+    ACCEPTANCE_POLICY_MODE,
     sha256_file,
     summarize_stage,
 )
@@ -27,6 +30,7 @@ def _make_evaluation_env(
     frame_stack: int,
     skip: int,
     shape: int,
+    action_set: str = "complex",
 ):
     environment = DummyVecEnv(
         [
@@ -34,7 +38,7 @@ def _make_evaluation_env(
                 level=level,
                 skip=skip,
                 shape=shape,
-                action_set="complex",
+                action_set=action_set,
             )
         ]
     )
@@ -55,6 +59,7 @@ def evaluate_rollout(
     frame_stack: int = 4,
     skip: int = 4,
     shape: int = 84,
+    action_set: str = "complex",
 ) -> RolloutResult:
     """Run one independently seeded rollout on one Mario stage."""
     if max_steps <= 0:
@@ -65,6 +70,7 @@ def evaluate_rollout(
         frame_stack=frame_stack,
         skip=skip,
         shape=shape,
+        action_set=action_set,
     )
     started = time.monotonic()
     try:
@@ -119,6 +125,7 @@ def evaluate_checkpoint(
     episodes: int = 15,
     seed: int = 42000,
     deterministic: bool = False,
+    legacy_diagnostic: bool = False,
 ) -> EvaluationReport:
     """Evaluate the same compatible checkpoint over every requested stage."""
     selected_levels = validate_levels(levels)
@@ -127,10 +134,26 @@ def evaluate_checkpoint(
 
     checkpoint_sha256 = sha256_file(model_path)
     model = PPO.load(model_path, device="cpu")
+    if legacy_diagnostic:
+        action_set = "simple"
+        extractor_name = "nature"
+        features_dim = None
+        channels = None
+        policy_mode = LEGACY_DIAGNOSTIC_POLICY_MODE
+    else:
+        action_set = "complex"
+        extractor_name = "impala"
+        features_dim = 512
+        channels = (16, 32, 32)
+        policy_mode = ACCEPTANCE_POLICY_MODE
     validate_resume_model(
         model,
-        action_count=12,
-        extractor_name="impala",
+        action_count=action_set_size(action_set),
+        observation_shape=(84, 84),
+        frame_stack=4,
+        extractor_name=extractor_name,
+        features_dim=features_dim,
+        channels=channels,
     )
 
     rollouts = []
@@ -142,6 +165,7 @@ def evaluate_checkpoint(
                 level,
                 seed=seed + level_index * episodes + episode_index,
                 deterministic=deterministic,
+                action_set=action_set,
             )
             for episode_index in range(episodes)
         ]
@@ -154,6 +178,7 @@ def evaluate_checkpoint(
         requested_episodes=episodes,
         stages=stages,
         rollouts=rollouts,
+        policy_mode=policy_mode,
     )
 
 
@@ -164,6 +189,19 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=15)
     parser.add_argument("--seed", type=int, default=42000)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Explicitly replace an existing evaluation report.",
+    )
+    parser.add_argument(
+        "--legacy-diagnostic",
+        action="store_true",
+        help=(
+            "Evaluate a seven-action NatureCNN checkpoint as explicitly "
+            "non-acceptance legacy evidence."
+        ),
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--stochastic",
@@ -212,11 +250,12 @@ def main(argv=None) -> EvaluationReport:
             episodes=args.episodes,
             seed=args.seed,
             deterministic=args.deterministic,
+            legacy_diagnostic=args.legacy_diagnostic,
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
-    report.write(args.out)
+    report.write(args.out, overwrite=args.overwrite)
     _print_summary(report)
     return report
 

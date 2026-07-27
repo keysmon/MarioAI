@@ -2,8 +2,9 @@ import gymnasium as gym
 import numpy as np
 import torch
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 
-from marioai.envs import make_vec_env
+from marioai.envs import make_mario_env
 from marioai.features import ImpalaCnnFeaturesExtractor
 
 
@@ -18,9 +19,15 @@ def test_impala_extractor_maps_stacked_frames_to_feature_width():
     assert torch.isfinite(output).all()
 
 
-def test_impala_policy_trains_one_small_update():
-    """Catches an extractor that cannot consume PPO-preprocessed frames."""
-    venv = make_vec_env(["1-1"], n_envs=1, action_set="complex")
+def test_ppo_wrapped_impala_uses_four_input_channels_and_trains():
+    """Catches treating SB3's transposed (4, 84, 84) space as 84 channels."""
+    venv = VecFrameStack(
+        DummyVecEnv(
+            [lambda: make_mario_env("1-1", action_set="complex")]
+        ),
+        n_stack=4,
+        channels_order="last",
+    )
     try:
         model = PPO(
             "CnnPolicy",
@@ -34,6 +41,10 @@ def test_impala_policy_trains_one_small_update():
             },
             device="cpu",
         )
+
+        first_convolution = model.policy.features_extractor.cnn[0]
+        assert model.observation_space.shape == (4, 84, 84)
+        assert first_convolution.in_channels == 4
 
         model.learn(64)
 

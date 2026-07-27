@@ -1,8 +1,12 @@
+from collections import Counter
+import pickle
+
 import numpy as np
 import yaml
 from stable_baselines3 import PPO
 
-from marioai.actions import action_set_size
+import marioai.record_gif as recording
+import marioai.train as training
 from marioai.envs import make_vec_env
 from marioai.evaluate import evaluate_checkpoint
 from marioai.results import EvaluationReport, sha256_file
@@ -27,7 +31,7 @@ class _TemporaryConfigOverrides(_NoOverrides):
     n_envs = None
 
 
-def _run_all32_pipeline_smoke(tmp_path):
+def _run_all32_pipeline_smoke(tmp_path, monkeypatch):
     config_path = tmp_path / "all32-smoke.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -41,10 +45,11 @@ def _run_all32_pipeline_smoke(tmp_path):
                 },
                 "train": {
                     "n_envs": 2,
+                    "total_timesteps": 64,
                     "device": "cpu",
                     "seed": 42,
                     "checkpoint_freq": 64,
-                    "normalize_reward": False,
+                    "normalize_reward": True,
                 },
                 "policy": {
                     "extractor": "impala",
@@ -52,7 +57,7 @@ def _run_all32_pipeline_smoke(tmp_path):
                     "channels": [16, 32, 32],
                 },
                 "ppo": {
-                    "n_steps": 64,
+                    "n_steps": 32,
                     "batch_size": 64,
                     "n_epochs": 1,
                     "gamma": 0.9,
@@ -65,58 +70,48 @@ def _run_all32_pipeline_smoke(tmp_path):
         ),
         encoding="utf-8",
     )
-    cfg = load_training_config(
-        str(config_path), None, _TemporaryConfigOverrides()
-    )
+    cfg = load_training_config(str(config_path), None, _TemporaryConfigOverrides())
     assert cfg["train"]["n_envs"] == 2
-    model_path = tmp_path / "all32-smoke.zip"
-
-    venv = make_vec_env(
-        cfg["levels"],
-        n_envs=cfg["train"]["n_envs"],
-        frame_stack=cfg["env"]["frame_stack"],
-        skip=cfg["env"]["skip"],
-        shape=cfg["env"]["shape"],
-        action_set=cfg["env"]["action_set"],
+    monkeypatch.chdir(tmp_path)
+    training.main(
+        [
+            "--config",
+            str(config_path),
+            "--run-name",
+            "all32-smoke",
+        ]
     )
-    try:
-        assert venv.num_envs == 2
-        model = PPO(
-            "CnnPolicy",
-            venv,
-            n_steps=cfg["ppo"]["n_steps"],
-            batch_size=cfg["ppo"]["batch_size"],
-            n_epochs=cfg["ppo"]["n_epochs"],
-            policy_kwargs=build_policy_kwargs(cfg),
-            device="cpu",
-            seed=cfg["train"]["seed"],
-            verbose=0,
-        )
-        model.learn(total_timesteps=64)
-        model.save(model_path)
-    finally:
-        venv.close()
-
-    resumed_venv = make_vec_env(
-        cfg["levels"],
-        n_envs=cfg["train"]["n_envs"],
-        frame_stack=cfg["env"]["frame_stack"],
-        skip=cfg["env"]["skip"],
-        shape=cfg["env"]["shape"],
-        action_set=cfg["env"]["action_set"],
+    first_run = tmp_path / "models" / "all32-smoke"
+    first_model_path = first_run / "final.zip"
+    first_normalization_path = first_run / "vecnormalize.pkl"
+    checkpoint_normalization_path = (
+        first_run / "ckpt_vecnormalize_64_steps.pkl"
     )
-    try:
-        assert resumed_venv.num_envs == 2
-        resumed = PPO.load(model_path, env=resumed_venv, device="cpu")
-        validate_resume_model(
-            resumed,
-            action_count=action_set_size(cfg["env"]["action_set"]),
-            extractor_name=cfg["policy"]["extractor"],
-        )
-        resumed.learn(total_timesteps=64, reset_num_timesteps=False)
-        resumed.save(model_path)
-    finally:
-        resumed_venv.close()
+    assert first_model_path.is_file()
+    assert first_normalization_path.is_file()
+    assert checkpoint_normalization_path.is_file()
+    with first_normalization_path.open("rb") as source:
+        first_normalization = pickle.load(source)
+
+    training.main(
+        [
+            "--config",
+            str(config_path),
+            "--resume",
+            str(first_model_path),
+            "--run-name",
+            "all32-smoke-resumed",
+        ]
+    )
+    resumed_run = tmp_path / "models" / "all32-smoke-resumed"
+    model_path = resumed_run / "final.zip"
+    resumed_normalization_path = resumed_run / "vecnormalize.pkl"
+    with resumed_normalization_path.open("rb") as source:
+        resumed_normalization = pickle.load(source)
+    assert resumed_normalization.ret_rms.count > first_normalization.ret_rms.count
+
+    resumed = PPO.load(model_path, device="cpu")
+    validate_resume_model(resumed, **training.compatibility_kwargs(cfg))
 
     report_path = tmp_path / "all32-smoke.json"
     report = evaluate_checkpoint(
@@ -127,7 +122,20 @@ def _run_all32_pipeline_smoke(tmp_path):
         deterministic=False,
     )
     report.write(report_path)
-    return resumed, model_path, EvaluationReport.read(report_path)
+    gif_path = tmp_path / "all32-smoke.gif"
+    gif_metadata = recording.record(
+        resumed,
+        "1-1",
+        gif_path,
+        rollouts=1,
+        max_steps=2,
+    )
+    return (
+        resumed,
+        model_path,
+        EvaluationReport.read(report_path),
+        gif_metadata,
+    )
 
 
 def test_ppo_trains_briefly_with_finite_loss():
@@ -156,10 +164,28 @@ def test_ppo_trains_briefly_with_finite_loss():
         venv.close()
 
 
-def test_all32_pipeline_trains_resumes_and_evaluates(tmp_path):
-    resumed, model_path, report = _run_all32_pipeline_smoke(tmp_path)
+def test_all32_pipeline_trains_resumes_evaluates_and_records(
+    tmp_path, monkeypatch
+):
+    resumed, model_path, report, gif_metadata = _run_all32_pipeline_smoke(
+        tmp_path,
+        monkeypatch,
+    )
 
     assert resumed.num_timesteps >= 128
     assert report.checkpoint_sha256 == sha256_file(model_path)
+    assert report.deterministic is False
+    assert report.requested_episodes == 1
     assert set(report.stages) == {"1-1", "1-2"}
+    assert len(report.rollouts) == 2
+    assert Counter(result.level for result in report.rollouts) == {
+        "1-1": 1,
+        "1-2": 1,
+    }
     assert all(result.seed >= 42000 for result in report.rollouts)
+    assert gif_metadata["loop"] == 0
+    assert gif_metadata["semantic_frames"] >= 2
+    assert gif_metadata["total_duration_ms"] == (
+        gif_metadata["semantic_frames"]
+        * gif_metadata["frame_duration_ms"]
+    )

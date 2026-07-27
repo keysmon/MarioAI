@@ -14,6 +14,9 @@ from typing import Any
 
 from marioai.levels import ALL_LEVELS
 
+ACCEPTANCE_POLICY_MODE = "shared_complex_impala"
+LEGACY_DIAGNOSTIC_POLICY_MODE = "legacy_simple_nature_diagnostic"
+
 
 def sha256_file(path: Path) -> str:
     """Return the SHA-256 digest of a file's exact bytes."""
@@ -60,6 +63,7 @@ def _is_valid_rollout(rollout: Any, stages: dict) -> bool:
         and type(rollout.cleared) is bool
         and type(rollout.terminal_cause) is str
         and rollout.terminal_cause in {"flag", "timeout", "time", "death"}
+        and rollout.cleared == (rollout.terminal_cause == "flag")
         and _is_integer(rollout.max_x)
         and rollout.max_x >= 0
         and _is_finite_number(rollout.reward)
@@ -113,6 +117,7 @@ class EvaluationReport:
     requested_episodes: int
     stages: dict[str, dict[str, bool | int | float]]
     rollouts: list[RolloutResult]
+    policy_mode: str = ACCEPTANCE_POLICY_MODE
 
     def _has_valid_schema(self) -> bool:
         return (
@@ -124,6 +129,12 @@ class EvaluationReport:
             )
             and type(self.deterministic) is bool
             and _is_integer(self.requested_episodes)
+            and type(self.policy_mode) is str
+            and self.policy_mode
+            in {
+                ACCEPTANCE_POLICY_MODE,
+                LEGACY_DIAGNOSTIC_POLICY_MODE,
+            }
             and isinstance(self.stages, dict)
             and all(
                 type(level) is str and _is_valid_stage_summary(stage)
@@ -140,21 +151,38 @@ class EvaluationReport:
     def passed(self) -> bool:
         if not self._has_valid_schema():
             return False
+        if self.policy_mode != ACCEPTANCE_POLICY_MODE:
+            return False
         if self.deterministic or self.requested_episodes != 15:
             return False
         if set(self.stages) != set(ALL_LEVELS):
             return False
-        return all(
-            stage.get("passed") is True
-            and 1 <= stage["clears"] <= stage["episodes"] == 15
-            for stage in self.stages.values()
-        )
+        if len(self.rollouts) != len(ALL_LEVELS) * 15:
+            return False
+        seeds = [rollout.seed for rollout in self.rollouts]
+        if len(set(seeds)) != len(seeds):
+            return False
+
+        by_level = {level: [] for level in ALL_LEVELS}
+        for rollout in self.rollouts:
+            by_level[rollout.level].append(rollout)
+        for level in ALL_LEVELS:
+            stage_rollouts = by_level[level]
+            if len(stage_rollouts) != 15:
+                return False
+            recomputed = summarize_stage(level, stage_rollouts)
+            if self.stages[level] != recomputed:
+                return False
+            if recomputed["passed"] is not True:
+                return False
+        return True
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "checkpoint_sha256": self.checkpoint_sha256,
             "deterministic": self.deterministic,
             "requested_episodes": self.requested_episodes,
+            "policy_mode": self.policy_mode,
             "stages": self.stages,
             "rollouts": [rollout.to_dict() for rollout in self.rollouts],
         }
@@ -165,6 +193,10 @@ class EvaluationReport:
             checkpoint_sha256=value["checkpoint_sha256"],
             deterministic=value["deterministic"],
             requested_episodes=value["requested_episodes"],
+            policy_mode=value.get(
+                "policy_mode",
+                LEGACY_DIAGNOSTIC_POLICY_MODE,
+            ),
             stages=value["stages"],
             rollouts=[
                 RolloutResult.from_dict(rollout)
@@ -177,7 +209,14 @@ class EvaluationReport:
         with path.open(encoding="utf-8") as source:
             return cls.from_dict(json.load(source))
 
-    def write(self, path: Path) -> None:
+    def write(self, path: Path, *, overwrite: bool = False) -> None:
+        """Atomically write a report without clobbering evidence by default."""
+        path = Path(path)
+        if path.exists() and not overwrite:
+            raise FileExistsError(
+                f"evaluation report already exists at {path}; pass "
+                "overwrite=True to replace it explicitly"
+            )
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path: Path | None = None
         try:
@@ -194,7 +233,16 @@ class EvaluationReport:
                 destination.write("\n")
                 destination.flush()
                 os.fsync(destination.fileno())
-            temporary_path.replace(path)
+            if overwrite:
+                temporary_path.replace(path)
+            else:
+                try:
+                    os.link(temporary_path, path)
+                except FileExistsError as exc:
+                    raise FileExistsError(
+                        f"evaluation report already exists at {path}; pass "
+                        "overwrite=True to replace it explicitly"
+                    ) from exc
         finally:
             if temporary_path is not None and temporary_path.exists():
                 temporary_path.unlink()

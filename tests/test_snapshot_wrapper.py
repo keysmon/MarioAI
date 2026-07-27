@@ -43,6 +43,8 @@ def _make_route(level="1-1", frames=RUN_FRAMES):
     env.close()
     return {
         "level": level,
+        "action_set": "simple",
+        "decision_skip": 4,
         "actions": [RIGHT_B] * frames,
         "waypoints": [
             {"index": 0, "frame": 0, "x_pos": start_x},
@@ -204,6 +206,35 @@ def test_route_level_mismatch_rejected(tmp_path):
     save_route(_make_route(level="1-1"), tmp_path)
     with pytest.raises(ValueError, match="route is for level"):
         make_mario_env(level="1-2", snapshot_dir=str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    ("metadata", "match"),
+    [
+        ({"action_set": "complex"}, "action set"),
+        ({"decision_skip": 1}, "decision skip"),
+    ],
+)
+def test_snapshot_route_compatibility_rejected_before_emulator_creation(
+    tmp_path, monkeypatch, metadata, match
+):
+    route = {**_make_route(), **metadata}
+    save_route(route, tmp_path)
+    monkeypatch.setattr(
+        gym_super_mario_bros,
+        "make",
+        lambda *_args, **_kwargs: pytest.fail(
+            "incompatible route reached emulator creation"
+        ),
+    )
+
+    with pytest.raises(ValueError, match=match):
+        make_mario_env(
+            level="1-1",
+            action_set="simple",
+            skip=4,
+            snapshot_dir=str(tmp_path),
+        )
 
 
 def test_advance_threshold_reaches_schedule(tmp_path):

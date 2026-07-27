@@ -28,6 +28,17 @@ def test_weights_reject_unknown_or_nonpositive_values():
         assign_worker_levels(("1-1",), 1, {"1-1": 0.0})
 
 
+def test_assignment_rejects_fewer_workers_than_active_levels():
+    with pytest.raises(ValueError, match="at least"):
+        assign_worker_levels(("1-1", "1-2"), 1)
+
+
+def test_fractional_remainder_ties_follow_manifest_order():
+    assigned = assign_worker_levels(("1-1", "1-2", "1-3"), 5)
+
+    assert Counter(assigned) == {"1-1": 2, "1-2": 2, "1-3": 1}
+
+
 def test_regressed_stage_weight_doubles_for_next_worker_assignment():
     weights = regression_weights(
         ("1-1", "1-2"),

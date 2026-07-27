@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 import marioai.evaluate as evaluation
+import marioai.results as results
 from marioai.evaluate import evaluate_checkpoint, evaluate_rollout
 from marioai.levels import ALL_LEVELS
 from marioai.results import (
@@ -68,6 +69,29 @@ def _report(
     )
 
 
+def _acceptance_report() -> EvaluationReport:
+    rollouts = []
+    stages = {}
+    for level_index, level in enumerate(ALL_LEVELS):
+        stage_rollouts = [
+            _rollout(
+                level,
+                42000 + level_index * 15 + episode_index,
+                cleared=episode_index == 0,
+            )
+            for episode_index in range(15)
+        ]
+        rollouts.extend(stage_rollouts)
+        stages[level] = summarize_stage(level, stage_rollouts)
+    return EvaluationReport(
+        checkpoint_sha256="a" * 64,
+        deterministic=False,
+        requested_episodes=15,
+        stages=stages,
+        rollouts=rollouts,
+    )
+
+
 def test_stage_passes_with_one_of_15_clears():
     rollouts = [
         _rollout("1-1", index, cleared=index == 7)
@@ -82,9 +106,10 @@ def test_stage_passes_with_one_of_15_clears():
 
 
 def test_project_pass_requires_same_checkpoint_and_all_32_stages():
-    report = _report()
+    report = _acceptance_report()
 
     assert report.passed is True
+    assert len(report.rollouts) == 480
     assert not replace(
         report,
         stages={key: value for key, value in report.stages.items() if key != "8-4"},
@@ -92,14 +117,40 @@ def test_project_pass_requires_same_checkpoint_and_all_32_stages():
 
 
 def test_acceptance_rejects_deterministic_or_non_15_report():
-    report = _report()
+    report = _acceptance_report()
 
     assert not replace(report, deterministic=True).passed
     assert not replace(report, requested_episodes=14).passed
 
 
+def test_legacy_policy_report_is_explicitly_diagnostic_and_never_acceptance():
+    report = replace(
+        _acceptance_report(),
+        policy_mode="legacy_simple_nature_diagnostic",
+    )
+
+    assert report.policy_mode == "legacy_simple_nature_diagnostic"
+    assert not report.passed
+
+
+def test_unlabeled_legacy_json_defaults_to_non_acceptance_mode():
+    payload = _acceptance_report().to_dict()
+    payload.pop("policy_mode")
+
+    report = EvaluationReport.from_dict(payload)
+
+    assert report.policy_mode == "legacy_simple_nature_diagnostic"
+    assert not report.passed
+
+
+def test_acceptance_rejects_malformed_policy_mode_type():
+    report = replace(_acceptance_report(), policy_mode=[])
+
+    assert not report.passed
+
+
 def test_acceptance_rejects_stage_without_15_episodes_or_a_clear():
-    report = _report()
+    report = _acceptance_report()
     wrong_count = dict(report.stages)
     wrong_count["8-4"] = {**wrong_count["8-4"], "episodes": 14}
     no_clear = dict(report.stages)
@@ -107,6 +158,42 @@ def test_acceptance_rejects_stage_without_15_episodes_or_a_clear():
 
     assert not replace(report, stages=wrong_count).passed
     assert not replace(report, stages=no_clear).passed
+
+
+def test_acceptance_rejects_missing_or_duplicate_rollout_seeds():
+    report = _acceptance_report()
+    duplicate_seed = replace(
+        report.rollouts[-1],
+        seed=report.rollouts[0].seed,
+    )
+
+    assert not replace(report, rollouts=report.rollouts[:-1]).passed
+    assert not replace(
+        report,
+        rollouts=[*report.rollouts[:-1], duplicate_seed],
+    ).passed
+
+
+def test_acceptance_rejects_clear_terminal_cause_inconsistency():
+    report = _acceptance_report()
+    inconsistent = replace(report.rollouts[0], terminal_cause="death")
+
+    assert not replace(
+        report,
+        rollouts=[inconsistent, *report.rollouts[1:]],
+    ).passed
+
+
+def test_acceptance_rejects_stage_summary_not_recomputed_from_rollouts():
+    report = _acceptance_report()
+    stages = dict(report.stages)
+    stages["1-1"] = {
+        **stages["1-1"],
+        "clears": 2,
+        "clear_rate": 2 / 15,
+    }
+
+    assert not replace(report, stages=stages).passed
 
 
 @pytest.mark.parametrize(
@@ -120,7 +207,7 @@ def test_acceptance_rejects_stage_without_15_episodes_or_a_clear():
 )
 def test_acceptance_rejects_malformed_checkpoint_digest(checkpoint_sha256):
     assert not replace(
-        _report(), checkpoint_sha256=checkpoint_sha256
+        _acceptance_report(), checkpoint_sha256=checkpoint_sha256
     ).passed
 
 
@@ -134,7 +221,7 @@ def test_acceptance_rejects_malformed_checkpoint_digest(checkpoint_sha256):
     ],
 )
 def test_acceptance_rejects_malformed_top_level_field_types(field, value):
-    assert not replace(_report(), **{field: value}).passed
+    assert not replace(_acceptance_report(), **{field: value}).passed
 
 
 @pytest.mark.parametrize(
@@ -149,7 +236,7 @@ def test_acceptance_rejects_malformed_top_level_field_types(field, value):
     ],
 )
 def test_acceptance_requires_true_integer_stage_counts(field, value):
-    report = _report()
+    report = _acceptance_report()
     stages = dict(report.stages)
     stages["8-4"] = {**stages["8-4"], field: value}
 
@@ -157,7 +244,7 @@ def test_acceptance_requires_true_integer_stage_counts(field, value):
 
 
 def test_acceptance_rejects_non_mapping_stage_summary():
-    report = _report()
+    report = _acceptance_report()
     stages = dict(report.stages)
     stages["8-4"] = []
 
@@ -256,6 +343,7 @@ def test_report_json_round_trip_preserves_stable_schema(tmp_path):
         "checkpoint_sha256": "b" * 64,
         "deterministic": False,
         "requested_episodes": 15,
+        "policy_mode": "shared_complex_impala",
         "stages": {
             "1-1": {
                 "passed": False,
@@ -282,26 +370,50 @@ def test_report_json_round_trip_preserves_stable_schema(tmp_path):
     assert EvaluationReport.read(path) == report
 
 
-def test_report_write_replaces_destination_atomically(tmp_path, monkeypatch):
+def test_report_write_creates_destination_atomically(tmp_path, monkeypatch):
     report = _report()
     path = tmp_path / "evaluation.json"
-    replacements = []
-    original_replace = type(path).replace
+    links = []
+    original_link = results.os.link
 
-    def recording_replace(source, destination):
-        replacements.append((source, destination))
-        return original_replace(source, destination)
+    def recording_link(source, destination):
+        links.append((Path(source), Path(destination)))
+        return original_link(source, destination)
 
-    monkeypatch.setattr(type(path), "replace", recording_replace)
+    monkeypatch.setattr(results.os, "link", recording_link)
 
     report.write(path)
 
-    assert len(replacements) == 1
-    temporary, destination = replacements[0]
+    assert len(links) == 1
+    temporary, destination = links[0]
     assert temporary.parent == path.parent
     assert temporary != path
     assert destination == path
     assert not temporary.exists()
+
+
+def test_report_write_refuses_existing_path_without_explicit_overwrite(tmp_path):
+    path = tmp_path / "evaluation.json"
+    original = _report(passed_stages=1)
+    replacement = _report(passed_stages=2)
+    original.write(path)
+    original_bytes = path.read_bytes()
+
+    with pytest.raises(FileExistsError, match="overwrite"):
+        replacement.write(path)
+
+    assert path.read_bytes() == original_bytes
+
+
+def test_report_write_explicit_overwrite_replaces_atomically(tmp_path):
+    path = tmp_path / "evaluation.json"
+    original = _report(passed_stages=1)
+    replacement = _report(passed_stages=2)
+    original.write(path)
+
+    replacement.write(path, overwrite=True)
+
+    assert EvaluationReport.read(path) == replacement
 
 
 def test_sha256_file_hashes_exact_checkpoint_bytes(tmp_path):
@@ -379,6 +491,20 @@ def test_rollout_seed_controls_environment_reset_and_policy_sampling(monkeypatch
     assert all(environment.closed for environment in environments)
 
 
+def test_evaluation_factory_pins_complex_action_set():
+    environment = evaluation._make_evaluation_env(
+        level="1-1",
+        frame_stack=4,
+        skip=4,
+        shape=84,
+        action_set="complex",
+    )
+    try:
+        assert environment.action_space.n == 12
+    finally:
+        environment.close()
+
+
 @pytest.mark.parametrize(
     ("infos", "max_steps", "expected"),
     [
@@ -430,11 +556,12 @@ def test_evaluate_checkpoint_hashes_validates_and_runs_unique_seeded_rollouts(
             load_calls.append((path, device))
             return model
 
-    def fake_validate(actual_model, *, action_count, extractor_name):
-        validation_calls.append((actual_model, action_count, extractor_name))
+    def fake_validate(actual_model, **kwargs):
+        validation_calls.append((actual_model, kwargs))
 
-    def fake_rollout(actual_model, level, seed, deterministic, **_kwargs):
+    def fake_rollout(actual_model, level, seed, deterministic, **kwargs):
         assert actual_model is model
+        assert kwargs["action_set"] == "complex"
         return _rollout(level, seed, cleared=seed % 2 == 0, max_x=seed)
 
     monkeypatch.setattr(evaluation, "PPO", FakePPO)
@@ -450,7 +577,19 @@ def test_evaluate_checkpoint_hashes_validates_and_runs_unique_seeded_rollouts(
     )
 
     assert load_calls == [(checkpoint, "cpu")]
-    assert validation_calls == [(model, 12, "impala")]
+    assert validation_calls == [
+        (
+            model,
+            {
+                "action_count": 12,
+                "observation_shape": (84, 84),
+                "frame_stack": 4,
+                "extractor_name": "impala",
+                "features_dim": 512,
+                "channels": (16, 32, 32),
+            },
+        )
+    ]
     assert report.checkpoint_sha256 == hashlib.sha256(b"checkpoint").hexdigest()
     assert report.requested_episodes == 2
     assert report.deterministic is False
@@ -462,6 +601,58 @@ def test_evaluate_checkpoint_hashes_validates_and_runs_unique_seeded_rollouts(
     ]
     assert report.stages["1-1"]["episodes"] == 2
     assert report.stages["1-2"]["episodes"] == 2
+
+
+def test_legacy_checkpoint_evaluation_uses_simple_nature_diagnostic_mode(
+    tmp_path, monkeypatch
+):
+    checkpoint = tmp_path / "checkpoint.zip"
+    checkpoint.write_bytes(b"legacy checkpoint")
+    model = SimpleNamespace()
+    validation_calls = []
+    rollout_action_sets = []
+
+    class FakePPO:
+        @staticmethod
+        def load(_path, *, device):
+            assert device == "cpu"
+            return model
+
+    def fake_validate(actual_model, **kwargs):
+        validation_calls.append((actual_model, kwargs))
+
+    def fake_rollout(actual_model, level, seed, deterministic, **kwargs):
+        assert actual_model is model
+        rollout_action_sets.append(kwargs["action_set"])
+        return _rollout(level, seed)
+
+    monkeypatch.setattr(evaluation, "PPO", FakePPO)
+    monkeypatch.setattr(evaluation, "validate_resume_model", fake_validate)
+    monkeypatch.setattr(evaluation, "evaluate_rollout", fake_rollout)
+
+    report = evaluate_checkpoint(
+        checkpoint,
+        levels=["1-1"],
+        episodes=1,
+        legacy_diagnostic=True,
+    )
+
+    assert report.policy_mode == "legacy_simple_nature_diagnostic"
+    assert validation_calls == [
+        (
+            model,
+            {
+                "action_count": 7,
+                "observation_shape": (84, 84),
+                "frame_stack": 4,
+                "extractor_name": "nature",
+                "features_dim": None,
+                "channels": None,
+            },
+        )
+    ]
+    assert rollout_action_sets == ["simple"]
+    assert not report.passed
 
 
 def test_cli_resolves_all_writes_report_and_prints_32_rows(
@@ -476,6 +667,7 @@ def test_cli_resolves_all_writes_report_and_prints_32_rows(
         episodes=15,
         seed=42000,
         deterministic=False,
+        legacy_diagnostic=False,
     ):
         captured.update(
             model_path=model_path,
@@ -483,8 +675,9 @@ def test_cli_resolves_all_writes_report_and_prints_32_rows(
             episodes=episodes,
             seed=seed,
             deterministic=deterministic,
+            legacy_diagnostic=legacy_diagnostic,
         )
-        return _report()
+        return _acceptance_report()
 
     monkeypatch.setattr(
         evaluation, "evaluate_checkpoint", fake_evaluate_checkpoint
@@ -512,6 +705,7 @@ def test_cli_resolves_all_writes_report_and_prints_32_rows(
         "episodes": 15,
         "seed": 42000,
         "deterministic": False,
+        "legacy_diagnostic": False,
     }
     assert EvaluationReport.read(output_path) == report
     lines = capsys.readouterr().out.strip().splitlines()
@@ -544,6 +738,33 @@ def test_cli_deterministic_diagnostic_cannot_print_pass(
     assert capsys.readouterr().out.strip().splitlines()[-1] == "FAIL"
 
 
+def test_cli_requires_explicit_overwrite_for_existing_report(
+    tmp_path, monkeypatch
+):
+    output_path = tmp_path / "evaluation.json"
+    output_path.write_text("preserve me", encoding="utf-8")
+    monkeypatch.setattr(
+        evaluation,
+        "evaluate_checkpoint",
+        lambda *_args, **_kwargs: _acceptance_report(),
+    )
+    argv = [
+        "--model",
+        "checkpoint.zip",
+        "--levels",
+        "all",
+        "--out",
+        str(output_path),
+    ]
+
+    with pytest.raises(FileExistsError, match="overwrite"):
+        evaluation.main(argv)
+
+    report = evaluation.main([*argv, "--overwrite"])
+
+    assert EvaluationReport.read(output_path) == report
+
+
 def test_cli_defaults_to_stochastic_mode():
     args = evaluation.parse_args(
         [
@@ -557,3 +778,20 @@ def test_cli_defaults_to_stochastic_mode():
     )
 
     assert args.deterministic is False
+    assert args.legacy_diagnostic is False
+
+
+def test_cli_legacy_diagnostic_requires_an_explicit_flag():
+    args = evaluation.parse_args(
+        [
+            "--model",
+            "checkpoint.zip",
+            "--levels",
+            "1-1",
+            "--legacy-diagnostic",
+            "--out",
+            "evaluation.json",
+        ]
+    )
+
+    assert args.legacy_diagnostic is True

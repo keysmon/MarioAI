@@ -4,6 +4,8 @@ import argparse
 import copy
 import json
 import os
+from pathlib import Path
+import re
 from collections.abc import Mapping
 
 import torch
@@ -16,6 +18,21 @@ from stable_baselines3.common.utils import LinearSchedule
 from marioai.actions import action_set_size
 from marioai.envs import make_vec_env
 from marioai.features import ImpalaCnnFeaturesExtractor
+
+
+def matching_vecnormalize_path(checkpoint_path: str | Path) -> Path:
+    """Return the normalization sidecar written with one model checkpoint."""
+    checkpoint_path = Path(checkpoint_path)
+    match = re.fullmatch(r"(?P<prefix>.+)_(?P<steps>\d+)_steps", checkpoint_path.stem)
+    if match is not None:
+        name = (
+            f"{match.group('prefix')}_vecnormalize_"
+            f"{match.group('steps')}_steps.pkl"
+        )
+        return checkpoint_path.with_name(name)
+    if checkpoint_path.stem == "final":
+        return checkpoint_path.with_name("vecnormalize.pkl")
+    return checkpoint_path.with_suffix(".vecnormalize.pkl")
 
 
 def resolve_device(name):
@@ -87,8 +104,41 @@ def build_policy_kwargs(cfg: Mapping) -> dict:
     }
 
 
+def compatibility_kwargs(cfg: Mapping) -> dict:
+    """Return the complete checkpoint signature required by this config."""
+    policy = cfg.get("policy", {})
+    extractor_name = policy.get("extractor", "nature")
+    return {
+        "action_count": action_set_size(
+            cfg["env"].get("action_set", "simple")
+        ),
+        "observation_shape": (
+            cfg["env"]["shape"],
+            cfg["env"]["shape"],
+        ),
+        "frame_stack": cfg["env"]["frame_stack"],
+        "extractor_name": extractor_name,
+        "features_dim": (
+            policy.get("features_dim")
+            if extractor_name == "impala"
+            else None
+        ),
+        "channels": (
+            tuple(policy["channels"])
+            if extractor_name == "impala"
+            else None
+        ),
+    }
+
+
 def validate_resume_model(
-    model: PPO, action_count: int, extractor_name: str
+    model: PPO,
+    action_count: int,
+    observation_shape: tuple[int, int],
+    frame_stack: int,
+    extractor_name: str,
+    features_dim: int | None,
+    channels: tuple[int, ...] | None,
 ) -> None:
     """Reject a checkpoint that cannot continue the configured run."""
     checkpoint_action_count = model.action_space.n
@@ -96,6 +146,28 @@ def validate_resume_model(
         raise ValueError(
             f"checkpoint action count {checkpoint_action_count} does not match "
             f"configured action count {action_count}"
+        )
+
+    checkpoint_shape = tuple(model.observation_space.shape)
+    expected_spatial_shape = tuple(observation_shape)
+    if len(checkpoint_shape) != 3:
+        raise ValueError(
+            f"checkpoint observation shape {checkpoint_shape} is not a "
+            "three-dimensional frame stack"
+        )
+    if checkpoint_shape[1:] == expected_spatial_shape:
+        checkpoint_frame_stack = checkpoint_shape[0]
+    elif checkpoint_shape[:2] == expected_spatial_shape:
+        checkpoint_frame_stack = checkpoint_shape[2]
+    else:
+        raise ValueError(
+            f"checkpoint observation shape {checkpoint_shape} does not match "
+            f"configured observation shape {expected_spatial_shape}"
+        )
+    if checkpoint_frame_stack != frame_stack:
+        raise ValueError(
+            f"checkpoint frame stack {checkpoint_frame_stack} does not match "
+            f"configured frame stack {frame_stack}"
         )
 
     extractors = {
@@ -111,6 +183,46 @@ def validate_resume_model(
         raise ValueError(
             f"checkpoint extractor {type(actual_extractor).__name__} does not "
             f"match configured extractor {extractor_name}"
+        )
+    if extractor_name != "impala":
+        return
+    if features_dim is None or channels is None:
+        raise ValueError(
+            "IMPALA compatibility requires feature width and channel "
+            "configuration"
+        )
+
+    first_convolution = next(
+        (
+            module
+            for module in actual_extractor.cnn
+            if isinstance(module, torch.nn.Conv2d)
+        ),
+        None,
+    )
+    if first_convolution is None:
+        raise ValueError("checkpoint IMPALA extractor has no input convolution")
+    if first_convolution.in_channels != frame_stack:
+        raise ValueError(
+            f"checkpoint IMPALA input channels "
+            f"{first_convolution.in_channels} do not match configured frame "
+            f"stack {frame_stack}"
+        )
+    if actual_extractor.features_dim != features_dim:
+        raise ValueError(
+            f"checkpoint feature width {actual_extractor.features_dim} does "
+            f"not match configured feature width {features_dim}"
+        )
+    checkpoint_channels = tuple(
+        module.out_channels
+        for module in actual_extractor.cnn
+        if isinstance(module, torch.nn.Conv2d)
+    )
+    configured_channels = tuple(channels)
+    if checkpoint_channels != configured_channels:
+        raise ValueError(
+            f"checkpoint IMPALA channels {checkpoint_channels} do not match "
+            f"configured IMPALA channels {configured_channels}"
         )
 
 
@@ -160,6 +272,15 @@ def parse_args(argv=None):
         help="Resume a compatible checkpoint without resetting its timesteps.",
     )
     parser.add_argument(
+        "--resume-vecnormalize",
+        type=Path,
+        default=None,
+        help=(
+            "Matching VecNormalize state for --resume; inferred from standard "
+            "final/checkpoint names when omitted."
+        ),
+    )
+    parser.add_argument(
         "--reset-timesteps",
         action="store_true",
         help="Restart the timestep and learning-rate schedules when resuming.",
@@ -205,7 +326,11 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-def build_training_env(cfg: Mapping, args: argparse.Namespace):
+def build_training_env(
+    cfg: Mapping,
+    args: argparse.Namespace,
+    vecnormalize_path: Path | None = None,
+):
     """Construct the configured vector environment."""
     return make_vec_env(
         cfg["levels"],
@@ -218,6 +343,7 @@ def build_training_env(cfg: Mapping, args: argparse.Namespace):
         curriculum_threshold=args.curriculum_threshold,
         action_set=cfg["env"].get("action_set", "simple"),
         level_weights=cfg["train"].get("level_weights"),
+        vecnormalize_path=vecnormalize_path,
     )
 
 
@@ -277,16 +403,33 @@ def main(argv=None):
     checkpoint_source = (
         args.resume if args.resume is not None else args.init_from
     )
+    resume_vecnormalize_path = None
     if checkpoint_source is not None:
         checkpoint = PPO.load(checkpoint_source, device=device)
-        validate_resume_model(
-            checkpoint,
-            action_count=action_set_size(cfg["env"].get("action_set", "simple")),
-            extractor_name=cfg.get("policy", {}).get("extractor", "nature"),
-        )
+        validate_resume_model(checkpoint, **compatibility_kwargs(cfg))
         del checkpoint
+    if args.resume is not None and cfg["train"]["normalize_reward"]:
+        resume_vecnormalize_path = (
+            args.resume_vecnormalize
+            if args.resume_vecnormalize is not None
+            else matching_vecnormalize_path(args.resume)
+        )
+        if not resume_vecnormalize_path.is_file():
+            raise FileNotFoundError(
+                "matching VecNormalize state is required to resume normalized "
+                f"training: {resume_vecnormalize_path}"
+            )
+    elif args.resume_vecnormalize is not None:
+        raise ValueError(
+            "--resume-vecnormalize requires --resume with reward "
+            "normalization enabled"
+        )
 
-    venv = build_training_env(cfg, args)
+    venv = build_training_env(
+        cfg,
+        args,
+        vecnormalize_path=resume_vecnormalize_path,
+    )
     try:
         model = create_model(cfg, args, venv, device)
         if args.init_from and args.lr is not None:
@@ -304,6 +447,7 @@ def main(argv=None):
             save_freq=max(cfg["train"]["checkpoint_freq"] // n_envs, 1),
             save_path=out_dir,
             name_prefix="ckpt",
+            save_vecnormalize=cfg["train"]["normalize_reward"],
         )
         callbacks = [checkpoint_callback]
         if args.start_snapshots:
