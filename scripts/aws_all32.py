@@ -306,10 +306,12 @@ class AwsCommandAdapter:
         self._authorized_subnet_azs: set[tuple[str, str]] = set()
         self._resolved_ami_id: str | None = None
         self._authorized_termination_ids: set[str] = set()
+        self._authorized_instance_profile: dict[str, str] | None = None
 
     def preflight(self, config: AwsConfig) -> PreflightResult:
         """Delegate only to the public read-only boundary."""
         self._authorized_subnet_azs.clear()
+        self._authorized_instance_profile = None
         result = self.readonly.preflight(config)
         if not isinstance(result, PreflightResult):
             raise AwsLifecycleError("preflight returned an invalid result")
@@ -317,6 +319,7 @@ class AwsCommandAdapter:
             raise AwsLifecycleError(
                 "preflight configuration does not match lifecycle adapter"
             )
+        self._authorized_instance_profile = _preflight_profile_identity(result)
         self._authorized_subnet_azs.update(result.subnet_azs)
         return result
 
@@ -409,7 +412,11 @@ class AwsCommandAdapter:
                 "AWS ec2 run-instances returned a non-object response"
             )
         try:
-            instance = _launched_instance_payload(payload, request=request)
+            instance = _launched_instance_payload(
+                payload,
+                request=request,
+                expected_instance_profile=self._authorized_instance_profile,
+            )
         except AwsLifecycleError as error:
             raise AwsLifecycleError(
                 f"{error}; reconcile using ClientToken "
@@ -1207,7 +1214,13 @@ class AwsOrchestrator:
         launch_requested_at = _monotonic_decimal(self._monotonic())
         payload = self.aws.run_instances(request, max_hours=max_hours)
         try:
-            instance = _launched_instance_payload(payload, request=request)
+            instance = _launched_instance_payload(
+                payload,
+                request=request,
+                expected_instance_profile=_preflight_profile_identity(
+                    final_preflight
+                ),
+            )
         except AwsLifecycleError as error:
             raise AwsLifecycleError(
                 f"{error}; reconcile the ambiguous launch using "
@@ -1557,8 +1570,28 @@ def _validated_public_ip(value: Any) -> str:
     return value
 
 
+def _preflight_profile_identity(
+    preflight: PreflightResult,
+) -> dict[str, str]:
+    arn = preflight.instance_profile_arn
+    profile_id = preflight.instance_profile_id
+    if (
+        not isinstance(arn, str)
+        or not arn
+        or not isinstance(profile_id, str)
+        or not profile_id
+    ):
+        raise AwsLifecycleError(
+            "preflight returned an invalid instance-profile identity"
+        )
+    return {"Arn": arn, "Id": profile_id}
+
+
 def _launched_instance_payload(
-    payload: Any, *, request: dict[str, Any]
+    payload: Any,
+    *,
+    request: dict[str, Any],
+    expected_instance_profile: dict[str, str] | None,
 ) -> dict[str, str]:
     if not isinstance(payload, dict):
         raise AwsLifecycleError("run-instances response must be a JSON object")
@@ -1618,7 +1651,7 @@ def _launched_instance_payload(
         or instance.get("InstanceLifecycle") != "spot"
         or instance.get("KeyName") != request["KeyName"]
         or instance.get("IamInstanceProfile")
-        != request["IamInstanceProfile"]
+        != expected_instance_profile
         or not isinstance(placement, dict)
         or placement.get("AvailabilityZone")
         != request["Placement"]["AvailabilityZone"]

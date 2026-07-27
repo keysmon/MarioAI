@@ -194,6 +194,8 @@ class PreflightResult:
     s3_bucket: str
     s3_key_prefix: str
     running_project_instance_ids: tuple[str, ...]
+    instance_profile_arn: str
+    instance_profile_id: str
 
 
 @dataclass(frozen=True)
@@ -488,10 +490,28 @@ class AwsCli:
             "instance profile",
         )
         instance_profile = profile_payload.get("InstanceProfile")
+        profile_arn = (
+            instance_profile.get("Arn")
+            if isinstance(instance_profile, Mapping)
+            else None
+        )
+        profile_id = (
+            instance_profile.get("InstanceProfileId")
+            if isinstance(instance_profile, Mapping)
+            else None
+        )
+        expected_arn_prefix = (
+            f"arn:aws:iam::{config.account_id}:instance-profile/"
+        )
         if (
             not isinstance(instance_profile, Mapping)
             or instance_profile.get("InstanceProfileName")
             != config.instance_profile
+            or not isinstance(profile_arn, str)
+            or not profile_arn.startswith(expected_arn_prefix)
+            or profile_arn.rsplit("/", 1)[-1] != config.instance_profile
+            or not isinstance(profile_id, str)
+            or not profile_id
         ):
             raise AwsPreflightError(
                 f"expected instance profile {config.instance_profile}"
@@ -583,6 +603,8 @@ class AwsCli:
             s3_bucket=bucket,
             s3_key_prefix=key_prefix,
             running_project_instance_ids=(),
+            instance_profile_arn=profile_arn,
+            instance_profile_id=profile_id,
         )
 
     def latest_spot_prices(

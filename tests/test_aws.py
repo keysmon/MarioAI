@@ -30,6 +30,7 @@ CLOUD_TRAIN_PATH = Path(__file__).parents[1] / "scripts" / "cloud_train.sh"
 NOW = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
 SPOT_MAX_AGE = timedelta(days=7)
 SPOT_MAX_FUTURE_SKEW = timedelta(minutes=5)
+INSTANCE_PROFILE_ID = "AIPATESTMARIOALL32PROFILE"
 SUBNET_IDS = (
     "subnet-0ba0242531d6615f3",
     "subnet-0870eed3fd2b7dfab",
@@ -38,6 +39,13 @@ SUBNET_IDS = (
     "subnet-02ab8427ae66e6e36",
     "subnet-0fa9ec503414b2be9",
 )
+
+
+def _instance_profile_arn(config: AwsConfig) -> str:
+    return (
+        f"arn:aws:iam::{config.account_id}:instance-profile/"
+        f"{config.instance_profile}"
+    )
 
 
 class FakeRunner:
@@ -78,6 +86,8 @@ class FakeLifecycleAws:
         self.last_run_instances_request: dict[str, object] | None = None
         self.terminated_ids: list[str] = []
         self.ami_id = "ami-0123456789abcdef0"
+        self.instance_profile_arn = _instance_profile_arn(config)
+        self.instance_profile_id = INSTANCE_PROFILE_ID
         self.run_instances_response: object = {
             "Instances": [
                 {
@@ -88,7 +98,8 @@ class FakeLifecycleAws:
                     "InstanceLifecycle": "spot",
                     "KeyName": config.key_name,
                     "IamInstanceProfile": {
-                        "Name": config.instance_profile
+                        "Arn": self.instance_profile_arn,
+                        "Id": self.instance_profile_id,
                     },
                     "Placement": {"AvailabilityZone": "us-east-1a"},
                     "SubnetId": config.subnet_ids[0],
@@ -139,6 +150,8 @@ class FakeLifecycleAws:
             s3_bucket="defectlens-phase3-002559670021",
             s3_key_prefix="marioai/all32/",
             running_project_instance_ids=(),
+            instance_profile_arn=self.instance_profile_arn,
+            instance_profile_id=self.instance_profile_id,
         )
 
     def latest_spot_prices(self, instance_types) -> tuple[SpotOffer, ...]:
@@ -171,7 +184,10 @@ class FakeLifecycleAws:
                     "ImageId": request["ImageId"],
                     "InstanceType": request["InstanceType"],
                     "KeyName": request["KeyName"],
-                    "IamInstanceProfile": request["IamInstanceProfile"],
+                    "IamInstanceProfile": {
+                        "Arn": self.instance_profile_arn,
+                        "Id": self.instance_profile_id,
+                    },
                     "Placement": request["Placement"],
                     "SubnetId": request["NetworkInterfaces"][0]["SubnetId"],
                     "SecurityGroups": [
@@ -391,11 +407,13 @@ def _successful_runner(config: AwsConfig) -> FakeRunner:
         ],
         {
             "InstanceProfile": {
+                "Path": "/",
                 "InstanceProfileName": config.instance_profile,
-                "Arn": (
-                    f"arn:aws:iam::{config.account_id}:instance-profile/"
-                    f"{config.instance_profile}"
-                ),
+                "InstanceProfileId": INSTANCE_PROFILE_ID,
+                "Arn": _instance_profile_arn(config),
+                "CreateDate": "2026-07-24T12:00:00+00:00",
+                "Roles": [],
+                "Tags": [],
             }
         },
     )
@@ -587,6 +605,8 @@ def test_preflight_validates_every_read_only_prerequisite(config):
     assert result.s3_bucket == "defectlens-phase3-002559670021"
     assert result.s3_key_prefix == "marioai/all32/"
     assert result.running_project_instance_ids == ()
+    assert result.instance_profile_arn == _instance_profile_arn(config)
+    assert result.instance_profile_id == INSTANCE_PROFILE_ID
     assert [call[0][1:3] for call in runner.calls] == [
         ["sts", "get-caller-identity"],
         ["ec2", "describe-vpcs"],
@@ -1032,7 +1052,6 @@ def test_launch_rejects_partial_or_malformed_response(
         ("InstanceType", "c7i.16xlarge"),
         ("InstanceLifecycle", "scheduled"),
         ("KeyName", "different-key"),
-        ("IamInstanceProfile", {"Name": "different-profile"}),
         ("Placement", {"AvailabilityZone": "us-east-1b"}),
         ("SubnetId", "subnet-11111111111111111"),
         ("SecurityGroups", [{"GroupId": "sg-11111111111111111"}]),
@@ -1046,6 +1065,67 @@ def test_launch_response_must_correlate_to_exact_request(
         json.dumps(orchestrator.aws.run_instances_response)
     )
     response["Instances"][0][field] = value
+    orchestrator.aws.run_instances_response = response
+
+    with pytest.raises(
+        AwsLifecycleError,
+        match=r"response.*request.*reconcile.*ClientToken",
+    ):
+        orchestrator.launch_guarded_instance("benchmark", Decimal("1"))
+
+
+def test_launch_accepts_real_profile_shape_from_immediate_preflight(
+    orchestrator,
+):
+    final_profile_id = "AIPATESTFINALPREFLIGHT"
+    orchestrator.aws.instance_profile_id = final_profile_id
+
+    instance = orchestrator.launch_guarded_instance(
+        "benchmark", Decimal("1")
+    )
+
+    assert instance.instance_id == "i-0123456789abcdef0"
+    assert orchestrator.aws.run_instances_response["Instances"][0][
+        "IamInstanceProfile"
+    ] == {
+        "Arn": _instance_profile_arn(orchestrator.config),
+        "Id": final_profile_id,
+    }
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        {
+            "Arn": (
+                "arn:aws:iam::002559670021:instance-profile/"
+                "defectlens-gpu-role"
+            ),
+            "Id": "AIPAWRONGPROFILEID",
+        },
+        {
+            "Arn": (
+                "arn:aws:iam::002559670021:instance-profile/"
+                "other-profile"
+            ),
+            "Id": INSTANCE_PROFILE_ID,
+        },
+        {
+            "Arn": (
+                "arn:aws:iam::002559670021:instance-profile/"
+                "defectlens-gpu-role"
+            )
+        },
+        {"Id": INSTANCE_PROFILE_ID},
+    ],
+)
+def test_launch_rejects_real_profile_identity_mismatch(
+    orchestrator, profile
+):
+    response = json.loads(
+        json.dumps(orchestrator.aws.run_instances_response)
+    )
+    response["Instances"][0]["IamInstanceProfile"] = profile
     orchestrator.aws.run_instances_response = response
 
     with pytest.raises(
