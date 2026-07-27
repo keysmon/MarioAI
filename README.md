@@ -111,6 +111,14 @@ python -m marioai.train --init-from models/mario_multitask/final.zip --levels 2-
 # Evaluate per-level clear-rate + mean reward:
 python -m marioai.evaluate --model models/ft_2-1/final.zip --levels 2-1
 
+# Train and evaluate the all-32 shared policy locally:
+python -m marioai.train --config configs/all32.yaml --phase phase_1 --run-name all32-phase1
+python -m marioai.train --config configs/all32.yaml --phase phase_2 \
+  --resume models/all32-phase1/final.zip --run-name all32-phase2
+python -m marioai.evaluate --model models/all32-phase2/final.zip \
+  --levels all --episodes 15 --stochastic --seed 42000 \
+  --out reports/all32-phase2.json
+
 # Record a smooth GIF (records N rollouts, keeps the cleanest):
 python -m marioai.record_gif --model models/ft_2-1/final.zip --level 2-1 --out assets/gifs/2-1.gif --rollouts 15
 
