@@ -174,3 +174,22 @@ def test_load_rejects_non_string_or_malformed_persisted_schema(tmp_path, run, mu
 
     with pytest.raises(ValueError, match="invalid budget ledger"):
         BudgetLedger.load(path)
+
+
+def test_save_fsyncs_replaced_ledger_and_parent_directory(
+    tmp_path, monkeypatch, run
+):
+    import marioai.budget as budget_module
+
+    real_fsync = budget_module.os.fsync
+    fsynced_fds = []
+
+    def recording_fsync(file_descriptor):
+        fsynced_fds.append(file_descriptor)
+        return real_fsync(file_descriptor)
+
+    monkeypatch.setattr(budget_module.os, "fsync", recording_fsync)
+
+    BudgetLedger().update_run(run).save(tmp_path / "spend.json")
+
+    assert len(fsynced_fds) >= 2

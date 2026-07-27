@@ -224,6 +224,11 @@ class BudgetLedger:
             temporary_path = Path(temporary.name)
         try:
             os.replace(temporary_path, path)
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         except BaseException:
             temporary_path.unlink(missing_ok=True)
             raise

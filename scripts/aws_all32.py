@@ -37,6 +37,7 @@ _INSTANCE_READY_TIMEOUT_SECONDS = 600
 _INSTANCE_READY_POLL_SECONDS = 5
 _SSH_READY_TIMEOUT_SECONDS = 300
 _SSH_READY_POLL_SECONDS = 5
+_EC2_SETTLEMENT_RESERVE_SECONDS = Decimal("180")
 _LAUNCH_STATE_SCHEMA_VERSION = 1
 
 
@@ -366,13 +367,24 @@ class AwsCommandAdapter:
         self._resolved_ami_id = payload
         return payload
 
-    def run_instances(self, request: Any) -> dict[str, Any]:
+    def run_instances(
+        self, request: Any, *, max_hours: Decimal
+    ) -> dict[str, Any]:
         """Perform one validated, idempotent one-time Spot request."""
+        if (
+            not isinstance(max_hours, Decimal)
+            or not max_hours.is_finite()
+            or max_hours <= 0
+        ):
+            raise AwsLifecycleError(
+                "run-instances requires positive finite max_hours"
+            )
         _validate_launch_request(
             request,
             config=self.config,
             authorized_subnet_azs=self._authorized_subnet_azs,
             resolved_ami_id=self._resolved_ami_id,
+            max_hours=max_hours,
         )
         request_json = json.dumps(
             request, sort_keys=True, separators=(",", ":")
@@ -396,7 +408,13 @@ class AwsCommandAdapter:
             raise AwsLifecycleError(
                 "AWS ec2 run-instances returned a non-object response"
             )
-        instance = _launched_instance_payload(payload)
+        try:
+            instance = _launched_instance_payload(payload, request=request)
+        except AwsLifecycleError as error:
+            raise AwsLifecycleError(
+                f"{error}; reconcile using ClientToken "
+                f"{request['ClientToken']!r}"
+            ) from error
         self._authorized_termination_ids.add(instance["InstanceId"])
         return payload
 
@@ -547,11 +565,16 @@ class SshRemoteSupervisor:
         monotonic: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
         startup_confirmation_seconds: int = 10,
+        process_factory: Callable[..., Any] | None = None,
     ) -> None:
         self.aws = aws
         self.ssh_key = Path(ssh_key)
         self.local_repo = Path(local_repo)
         self._runner = runner
+        self._process_factory = process_factory or subprocess.Popen
+        self._poll_subprocess = (
+            process_factory is not None or runner is subprocess.run
+        )
         self._monotonic = monotonic
         self._sleeper = sleeper
         self._startup_confirmation_seconds = startup_confirmation_seconds
@@ -584,6 +607,8 @@ class SshRemoteSupervisor:
         phase: str,
         max_seconds: int,
         s3_prefix: str,
+        on_tick: Callable[[], None] | None = None,
+        absolute_deadline: Decimal | None = None,
     ) -> None:
         """Rsync source and launch cloud_train.sh under a recorded remote PID."""
         host = _validated_public_ip(instance.public_ip)
@@ -602,7 +627,11 @@ class SshRemoteSupervisor:
         ):
             raise AwsLifecycleError("S3 prefix is invalid")
         target = f"{self.user}@{host}"
-        self._wait_for_ssh(target)
+        self._wait_for_ssh(
+            target,
+            on_tick=on_tick,
+            absolute_deadline=absolute_deadline,
+        )
         os_bootstrap = """\
 set -eu
 . /etc/os-release
@@ -629,6 +658,8 @@ aws --version
             [*self._ssh_command(target), "bash", "-s"],
             timeout=900,
             input_text=os_bootstrap,
+            on_tick=on_tick,
+            absolute_deadline=absolute_deadline,
         )
         ssh_transport = (
             f"ssh -i {shlex.quote(str(self.ssh_key))} "
@@ -653,6 +684,8 @@ aws --version
                 f"{target}:{self.remote_repo}/",
             ],
             timeout=300,
+            on_tick=on_tick,
+            absolute_deadline=absolute_deadline,
         )
         dependency_bootstrap = """\
 set -eu
@@ -679,6 +712,8 @@ aws sts get-caller-identity --output json >/dev/null
             ],
             timeout=1800,
             input_text=dependency_bootstrap,
+            on_tick=on_tick,
+            absolute_deadline=absolute_deadline,
         )
         elapsed_seconds = int(
             max(
@@ -738,6 +773,8 @@ aws sts get-caller-identity --output json >/dev/null
             ],
             timeout=max(30, self._startup_confirmation_seconds + 20),
             input_text=startup_script,
+            on_tick=on_tick,
+            absolute_deadline=absolute_deadline,
         )
 
     def poll(self, instance: LaunchedInstance) -> RemotePoll:
@@ -752,7 +789,13 @@ aws sts get-caller-identity --output json >/dev/null
             exit_code=None if state in {"pending", "running"} else 0,
         )
 
-    def request_shutdown(self, instance: LaunchedInstance) -> None:
+    def request_shutdown(
+        self,
+        instance: LaunchedInstance,
+        *,
+        on_tick: Callable[[], None] | None = None,
+        absolute_deadline: Decimal | None = None,
+    ) -> None:
         host = self._hosts.get(instance.instance_id)
         if host is None:
             host = _validated_public_ip(instance.public_ip)
@@ -780,6 +823,8 @@ aws sts get-caller-identity --output json >/dev/null
             ],
             timeout=900,
             input_text=shutdown_script,
+            on_tick=on_tick,
+            absolute_deadline=absolute_deadline,
         )
 
     def _ssh_command(self, target: str) -> list[str]:
@@ -800,11 +845,19 @@ aws sts get-caller-identity --output json >/dev/null
             target,
         ]
 
-    def _wait_for_ssh(self, target: str) -> None:
+    def _wait_for_ssh(
+        self,
+        target: str,
+        *,
+        on_tick: Callable[[], None] | None = None,
+        absolute_deadline: Decimal | None = None,
+    ) -> None:
         deadline = (
             _monotonic_decimal(self._monotonic())
             + Decimal(_SSH_READY_TIMEOUT_SECONDS)
         )
+        if absolute_deadline is not None:
+            deadline = min(deadline, absolute_deadline)
         last_detail = ""
         while True:
             try:
@@ -816,6 +869,8 @@ aws sts get-caller-identity --output json >/dev/null
                     timeout=15,
                     input="exit 0\n",
                 )
+                if on_tick is not None:
+                    on_tick()
                 return
             except subprocess.CalledProcessError as error:
                 last_detail = (error.stderr or "").strip()
@@ -823,6 +878,8 @@ aws sts get-caller-identity --output json >/dev/null
                 last_detail = "SSH attempt timed out"
             except OSError as error:
                 last_detail = str(error)
+            if on_tick is not None:
+                on_tick()
             remaining = deadline - _monotonic_decimal(self._monotonic())
             if remaining <= 0:
                 suffix = f": {last_detail}" if last_detail else ""
@@ -839,7 +896,18 @@ aws sts get-caller-identity --output json >/dev/null
         *,
         timeout: int,
         input_text: str | None = None,
+        on_tick: Callable[[], None] | None = None,
+        absolute_deadline: Decimal | None = None,
     ) -> None:
+        if self._poll_subprocess:
+            self._run_polled_process(
+                command,
+                timeout=timeout,
+                input_text=input_text,
+                on_tick=on_tick,
+                absolute_deadline=absolute_deadline,
+            )
+            return
         kwargs: dict[str, Any] = {
             "check": True,
             "text": True,
@@ -862,6 +930,63 @@ aws sts get-caller-identity --output json >/dev/null
             raise AwsLifecycleError(
                 f"could not execute {command[0]}: {error}"
             ) from error
+        if on_tick is not None:
+            on_tick()
+
+    def _run_polled_process(
+        self,
+        command: list[str],
+        *,
+        timeout: int,
+        input_text: str | None,
+        on_tick: Callable[[], None] | None,
+        absolute_deadline: Decimal | None,
+    ) -> None:
+        started = _monotonic_decimal(self._monotonic())
+        deadline = started + Decimal(timeout)
+        if absolute_deadline is not None:
+            deadline = min(deadline, absolute_deadline)
+        process = self._process_factory(
+            command,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        pending_input = input_text
+        while True:
+            remaining = deadline - _monotonic_decimal(self._monotonic())
+            if remaining <= 0:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+                if on_tick is not None:
+                    on_tick()
+                raise AwsLifecycleError(
+                    f"{command[0]} exceeded the absolute paid deadline"
+                )
+            poll_timeout = float(min(Decimal("60"), remaining))
+            try:
+                stdout, stderr = process.communicate(
+                    input=pending_input,
+                    timeout=poll_timeout,
+                )
+            except subprocess.TimeoutExpired:
+                pending_input = None
+                if on_tick is not None:
+                    on_tick()
+                continue
+            if on_tick is not None:
+                on_tick()
+            if process.returncode != 0:
+                detail_text = (stderr or "").strip()
+                detail = f": {detail_text}" if detail_text else ""
+                raise AwsLifecycleError(f"{command[0]} failed{detail}")
+            del stdout
+            return
 
 
 class AwsOrchestrator:
@@ -1038,6 +1163,19 @@ class AwsOrchestrator:
                 {"ResourceType": "volume", "Tags": tags},
             ],
         }
+        final_preflight = self.preflight()
+        if (
+            offer.subnet_id,
+            offer.availability_zone,
+        ) not in set(final_preflight.subnet_azs):
+            raise AwsLifecycleError(
+                "selected Spot offer is outside the final preflight"
+            )
+        if self.aws.project_instances(active_only=True):
+            raise AwsLifecycleError(
+                "active MarioAI-All32 instance appeared before mutation"
+            )
+        self._require_fresh_preflight()
         reservation = LaunchReservation(
             client_token=client_token,
             state="reserved",
@@ -1063,23 +1201,15 @@ class AwsOrchestrator:
         self._preflight_result = None
         self._preflight_authorized_at = None
         launch_requested_at = _monotonic_decimal(self._monotonic())
-        payload = self.aws.run_instances(request)
+        payload = self.aws.run_instances(request, max_hours=max_hours)
         try:
-            instance = _launched_instance_payload(payload)
+            instance = _launched_instance_payload(payload, request=request)
         except AwsLifecycleError as error:
             raise AwsLifecycleError(
                 f"{error}; reconcile the ambiguous launch using "
                 f"ClientToken {client_token!r}"
             ) from error
-        if self.reservation_store is not None:
-            self.reservation_store.save(
-                replace(
-                    reservation,
-                    state="launched",
-                    instance_id=instance["InstanceId"],
-                )
-            )
-        return LaunchedInstance(
+        launched = LaunchedInstance(
             phase=phase,
             instance_id=instance["InstanceId"],
             instance_type=offer.instance_type,
@@ -1092,6 +1222,27 @@ class AwsOrchestrator:
             max_hours=max_hours,
             launched_monotonic=launch_requested_at,
         )
+        if self.reservation_store is not None:
+            try:
+                self.reservation_store.save(
+                    replace(
+                        reservation,
+                        state="launched",
+                        instance_id=instance["InstanceId"],
+                    )
+                )
+            except BaseException as state_error:
+                try:
+                    self.terminate_and_settle(
+                        launched, self.reservation_store.ledger_path
+                    )
+                except BaseException as cleanup_error:
+                    state_error.add_note(
+                        "post-launch cleanup also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                raise
+        return launched
 
     def _require_fresh_preflight(self) -> None:
         authorized_at = self._preflight_authorized_at
@@ -1109,17 +1260,27 @@ class AwsOrchestrator:
             )
 
     def wait_for_running_public_ip(
-        self, instance: LaunchedInstance
+        self,
+        instance: LaunchedInstance,
+        *,
+        ledger_path: Path | None = None,
     ) -> LaunchedInstance:
         """Wait boundedly for the launched instance and its public IPv4."""
         deadline = (
             _monotonic_decimal(self._monotonic())
             + Decimal(_INSTANCE_READY_TIMEOUT_SECONDS)
         )
+        deadline = min(deadline, self.training_deadline(instance))
         while True:
             summaries = self.aws.project_instances(
                 instance_id=instance.instance_id
             )
+            if ledger_path is not None:
+                self._paid_tick(
+                    instance,
+                    ledger_path,
+                    absolute_deadline=self.training_deadline(instance),
+                )
             if not isinstance(summaries, tuple) or len(summaries) > 1:
                 raise AwsLifecycleError(
                     "describe-instances returned duplicate launch targets"
@@ -1154,8 +1315,8 @@ class AwsOrchestrator:
             remaining = deadline - now
             if remaining <= 0:
                 raise AwsLifecycleError(
-                    "instance did not become running with a public IP "
-                    "within 600 seconds"
+                    "instance did not become running with a public IP before "
+                    "the readiness or absolute training deadline"
                 )
             self._sleeper(
                 float(
@@ -1194,11 +1355,48 @@ class AwsOrchestrator:
             phase=instance.phase,
             instance_id=instance.instance_id,
             hours=elapsed_hours,
-            instance_hourly_usd=instance.spot_hourly_usd,
+            instance_hourly_usd=self.config.on_demand_ceiling_usd[
+                instance.instance_type
+            ],
             volume_hourly_usd=instance.volume_hourly_usd,
         )
         self.ledger = self.ledger.update_run(run)
         self.ledger.save(ledger_path)
+        return run
+
+    def training_deadline(self, instance: LaunchedInstance) -> Decimal:
+        return (
+            instance.launched_monotonic
+            + instance.max_hours * _SECONDS_PER_HOUR
+        )
+
+    def final_deadline(self, instance: LaunchedInstance) -> Decimal:
+        return self.training_deadline(instance) + Decimal(
+            self.config.grace_minutes * 60
+        )
+
+    def remote_cleanup_deadline(
+        self, instance: LaunchedInstance
+    ) -> Decimal:
+        return (
+            self.final_deadline(instance)
+            - _EC2_SETTLEMENT_RESERVE_SECONDS
+        )
+
+    def _paid_tick(
+        self,
+        instance: LaunchedInstance,
+        ledger_path: Path,
+        *,
+        absolute_deadline: Decimal,
+    ) -> CostedRun:
+        run = self.persist_elapsed(instance, ledger_path)
+        if self.ledger.spent_usd >= self.config.shutdown_threshold_usd:
+            raise AwsLifecycleError(
+                "durable spend reached the configured shutdown threshold"
+            )
+        if _monotonic_decimal(self._monotonic()) >= absolute_deadline:
+            raise AwsLifecycleError("absolute paid deadline reached")
         return run
 
     def terminate_and_settle(
@@ -1209,16 +1407,21 @@ class AwsOrchestrator:
         terminal_confirmed = False
         try:
             self.aws.terminate_instance(instance.instance_id)
-            deadline = (
-                _monotonic_decimal(self._monotonic())
-                + Decimal(self.config.grace_minutes * 60)
-            )
+            deadline = self.final_deadline(instance)
+            empty_confirmations = 0
             while True:
                 summaries = self.aws.project_instances(
                     instance_id=instance.instance_id
                 )
                 self.persist_elapsed(instance, ledger_path)
-                if not summaries or summaries[0].get("state") == "terminated":
+                if not summaries:
+                    empty_confirmations += 1
+                    if empty_confirmations < 2:
+                        continue
+                    terminal_confirmed = True
+                    break
+                empty_confirmations = 0
+                if summaries[0].get("state") == "terminated":
                     terminal_confirmed = True
                     break
                 if len(summaries) != 1 or summaries[0].get(
@@ -1230,8 +1433,8 @@ class AwsOrchestrator:
                 remaining = deadline - _monotonic_decimal(self._monotonic())
                 if remaining <= 0:
                     raise AwsLifecycleError(
-                        "instance did not reach terminated state within "
-                        f"{self.config.grace_minutes} minutes"
+                        "absolute paid deadline reached before EC2 terminal "
+                        "confirmation"
                     )
                 self._sleeper(float(min(Decimal("60"), remaining)))
         except BaseException as error:
@@ -1286,7 +1489,19 @@ class AwsOrchestrator:
                     >= self.config.shutdown_threshold_usd
                     or run.hours >= instance.max_hours
                 ):
-                    self.remote.request_shutdown(instance)
+                    self.remote.request_shutdown(
+                        instance,
+                        on_tick=lambda: self._paid_tick(
+                            instance,
+                            ledger_path,
+                            absolute_deadline=self.remote_cleanup_deadline(
+                                instance
+                            ),
+                        ),
+                        absolute_deadline=self.remote_cleanup_deadline(
+                            instance
+                        ),
+                    )
                     break
                 self._sleeper(60)
         except BaseException as error:
@@ -1331,7 +1546,9 @@ def _validated_public_ip(value: Any) -> str:
     return value
 
 
-def _launched_instance_payload(payload: Any) -> dict[str, str]:
+def _launched_instance_payload(
+    payload: Any, *, request: dict[str, Any]
+) -> dict[str, str]:
     if not isinstance(payload, dict):
         raise AwsLifecycleError("run-instances response must be a JSON object")
     instances = payload.get("Instances")
@@ -1356,6 +1573,49 @@ def _launched_instance_payload(payload: Any) -> dict[str, str]:
     ):
         raise AwsLifecycleError(
             "run-instances response has an invalid public IP address"
+        )
+    placement = instance.get("Placement")
+    security_groups = instance.get("SecurityGroups")
+    actual_group_ids = (
+        {
+            group.get("GroupId")
+            for group in security_groups
+            if isinstance(group, dict)
+        }
+        if isinstance(security_groups, list)
+        else set()
+    )
+    expected_group_ids = set(request["NetworkInterfaces"][0]["Groups"])
+    actual_tags_payload = instance.get("Tags")
+    actual_tags = (
+        {
+            (tag.get("Key"), tag.get("Value"))
+            for tag in actual_tags_payload
+            if isinstance(tag, dict)
+        }
+        if isinstance(actual_tags_payload, list)
+        else set()
+    )
+    expected_tags = {
+        (tag["Key"], tag["Value"])
+        for tag in request["TagSpecifications"][0]["Tags"]
+    }
+    if (
+        instance.get("ClientToken") != request["ClientToken"]
+        or instance.get("ImageId") != request["ImageId"]
+        or instance.get("InstanceType") != request["InstanceType"]
+        or instance.get("InstanceLifecycle") != "spot"
+        or instance.get("KeyName") != request["KeyName"]
+        or not isinstance(placement, dict)
+        or placement.get("AvailabilityZone")
+        != request["Placement"]["AvailabilityZone"]
+        or instance.get("SubnetId")
+        != request["NetworkInterfaces"][0]["SubnetId"]
+        or actual_group_ids != expected_group_ids
+        or actual_tags != expected_tags
+    ):
+        raise AwsLifecycleError(
+            "run-instances response does not match the exact request"
         )
     return instance
 
@@ -1405,6 +1665,7 @@ def _validate_launch_request(
     config: AwsConfig,
     authorized_subnet_azs: set[tuple[str, str]],
     resolved_ami_id: str | None,
+    max_hours: Decimal,
 ) -> None:
     if not isinstance(request, dict):
         raise AwsLifecycleError("run-instances request must be a mapping")
@@ -1570,22 +1831,9 @@ def _validate_launch_request(
         raise AwsLifecycleError(
             "run-instances tags do not match the configured project phase"
         )
-    user_data = request.get("UserData")
-    try:
-        decoded_user_data = base64.b64decode(
-            user_data, validate=True
-        ).decode("utf-8")
-    except (TypeError, ValueError, UnicodeDecodeError) as error:
+    if request.get("UserData") != _shutdown_user_data(max_hours):
         raise AwsLifecycleError(
-            "run-instances UserData is not valid base64"
-        ) from error
-    if re.fullmatch(
-        r"#!/bin/sh\nshutdown -h \+[1-9][0-9]* "
-        r"'MarioAI maximum paid runtime reached'\n",
-        decoded_user_data,
-    ) is None:
-        raise AwsLifecycleError(
-            "run-instances UserData lacks the shutdown guard"
+            "run-instances shutdown delay does not match max_hours"
         )
 
 
@@ -1675,41 +1923,49 @@ def _settle_reservation(
     instance_id: str | None,
 ) -> BudgetLedger:
     """Consume the conservatively gated main runtime and global grace."""
-    main_instance_id = instance_id or f"pending:{reservation.client_token}"
-    prior_main = next(
-        (
-            run
-            for run in ledger.runs
-            if run.phase == reservation.phase
-            and run.instance_id == main_instance_id
-        ),
-        None,
+    pending_id = f"pending:{reservation.client_token}"
+    main_instance_id = instance_id or pending_id
+    migrated_ids = {main_instance_id}
+    if instance_id is not None:
+        migrated_ids.add(pending_id)
+    prior_main_runs = tuple(
+        run
+        for run in ledger.runs
+        if run.phase == reservation.phase
+        and run.instance_id in migrated_ids
     )
-    if prior_main is None:
-        main_run = CostedRun(
-            phase=reservation.phase,
-            instance_id=main_instance_id,
-            hours=reservation.max_hours,
-            instance_hourly_usd=reservation.on_demand_hourly_usd,
-            volume_hourly_usd=reservation.volume_hourly_usd,
+    filtered_runs = tuple(
+        run for run in ledger.runs if run not in prior_main_runs
+    )
+    removed_cost = sum(
+        (run.cost_usd for run in prior_main_runs), Decimal("0")
+    )
+    base = BudgetLedger(
+        cap_usd=ledger.cap_usd,
+        spent_usd=ledger.spent_usd - removed_cost,
+        runs=filtered_runs,
+        allocations=ledger.allocations,
+    )
+    main_run = CostedRun(
+        phase=reservation.phase,
+        instance_id=main_instance_id,
+        hours=max(
+            (run.hours for run in prior_main_runs),
+            default=reservation.max_hours,
         )
-    else:
-        reserved_main_cost = reservation.max_hours * (
-            reservation.on_demand_hourly_usd
-            + reservation.volume_hourly_usd
+        if prior_main_runs
+        else reservation.max_hours,
+        instance_hourly_usd=reservation.on_demand_hourly_usd,
+        volume_hourly_usd=reservation.volume_hourly_usd,
+    )
+    settled = base.update_run(main_run)
+    if settled.spent_usd < ledger.spent_usd:
+        settled = BudgetLedger(
+            cap_usd=settled.cap_usd,
+            spent_usd=ledger.spent_usd,
+            runs=settled.runs,
+            allocations=settled.allocations,
         )
-        rate = (
-            prior_main.instance_hourly_usd
-            + prior_main.volume_hourly_usd
-        )
-        required_hours = (
-            reserved_main_cost / rate if rate > 0 else reservation.max_hours
-        )
-        main_run = replace(
-            prior_main,
-            hours=max(prior_main.hours, required_hours),
-        )
-    settled = ledger.update_run(main_run)
     grace_run = CostedRun(
         phase="__launch_grace__",
         instance_id=f"pending:{reservation.client_token}",
@@ -1788,6 +2044,33 @@ def _write_json(stream: Any, payload: Any) -> None:
     stream.write("\n")
 
 
+def _terminal_target_confirmed(aws: Any, instance_id: str) -> bool:
+    """Require an explicit terminal state or two exact empty observations."""
+    first = aws.project_instances(instance_id=instance_id)
+    if len(first) > 1:
+        raise AwsLifecycleError(
+            "terminal confirmation returned duplicate instance targets"
+        )
+    if first:
+        if first[0].get("instance_id") != instance_id:
+            raise AwsLifecycleError(
+                "terminal confirmation returned a different instance"
+            )
+        return first[0].get("state") == "terminated"
+    second = aws.project_instances(instance_id=instance_id)
+    if len(second) > 1:
+        raise AwsLifecycleError(
+            "terminal confirmation returned duplicate instance targets"
+        )
+    if not second:
+        return True
+    if second[0].get("instance_id") != instance_id:
+        raise AwsLifecycleError(
+            "terminal confirmation returned a different instance"
+        )
+    return second[0].get("state") == "terminated"
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -1858,23 +2141,58 @@ def main(
             aws.verify_account(config)
             ledger = _configured_ledger(args.ledger, config)
             reservation = reservation_store.load()
-            instances = list(aws.project_instances(active_only=True))
+            instances_by_id: dict[str, dict[str, str | None]] = {}
+            for item in aws.project_instances(active_only=True):
+                item_id = item.get("instance_id")
+                if not isinstance(item_id, str):
+                    raise AwsLifecycleError(
+                        "active instance summary has no valid instance ID"
+                    )
+                instances_by_id[item_id] = item
+            recovered_id: str | None = None
             if reservation is not None:
                 recovered = aws.project_instances(
                     client_token=reservation.client_token
                 )
-                known_ids = {
-                    item["instance_id"]
-                    for item in instances
-                    if isinstance(item["instance_id"], str)
-                }
-                instances.extend(
-                    item
-                    for item in recovered
-                    if item["instance_id"] not in known_ids
-                )
+                if len(recovered) > 1:
+                    raise AwsLifecycleError(
+                        "ClientToken reconciliation returned multiple instances"
+                    )
+                recovered_id = reservation.instance_id
+                if recovered:
+                    token_id = recovered[0].get("instance_id")
+                    if not isinstance(token_id, str):
+                        raise AwsLifecycleError(
+                            "ClientToken reconciliation returned no instance ID"
+                        )
+                    if (
+                        recovered_id is not None
+                        and token_id != recovered_id
+                    ):
+                        raise AwsLifecycleError(
+                            "stored instance ID does not match ClientToken"
+                        )
+                    recovered_id = token_id
+                    instances_by_id[token_id] = recovered[0]
+                if (
+                    recovered_id is not None
+                    and recovered_id not in instances_by_id
+                ):
+                    exact = aws.project_instances(
+                        instance_id=recovered_id
+                    )
+                    if len(exact) > 1:
+                        raise AwsLifecycleError(
+                            "stored instance lookup returned duplicate targets"
+                        )
+                    if exact:
+                        if exact[0].get("instance_id") != recovered_id:
+                            raise AwsLifecycleError(
+                                "stored instance lookup returned a different target"
+                            )
+                        instances_by_id[recovered_id] = exact[0]
             terminated_ids = []
-            for instance in instances:
+            for instance in instances_by_id.values():
                 instance_id = instance["instance_id"]
                 if not isinstance(instance_id, str):
                     raise AwsLifecycleError(
@@ -1884,19 +2202,15 @@ def main(
                 terminated_ids.append(instance_id)
             reservation_cleared = reservation is None
             if reservation is not None:
-                recovered_id = reservation.instance_id
-                if recovered_id is None and instances:
-                    candidate = instances[0]["instance_id"]
-                    if isinstance(candidate, str):
-                        recovered_id = candidate
                 ledger = _settle_reservation(
                     ledger,
                     reservation,
                     instance_id=recovered_id,
                 )
                 ledger.save(args.ledger)
-                remaining = aws.project_instances(active_only=True)
-                if recovered_id is not None and not remaining:
+                if recovered_id is not None and _terminal_target_confirmed(
+                    aws, recovered_id
+                ):
                     reservation_store.clear()
                     reservation_cleared = True
             _write_json(
@@ -1960,12 +2274,24 @@ def main(
             )
             try:
                 orchestrator.persist_elapsed(instance, args.ledger)
-                instance = orchestrator.wait_for_running_public_ip(instance)
+                instance = orchestrator.wait_for_running_public_ip(
+                    instance, ledger_path=args.ledger
+                )
                 selected_remote.start(
                     instance,
                     phase=args.phase,
                     max_seconds=max_seconds,
                     s3_prefix=config.s3_prefix,
+                    on_tick=lambda: orchestrator._paid_tick(
+                        instance,
+                        args.ledger,
+                        absolute_deadline=orchestrator.training_deadline(
+                            instance
+                        ),
+                    ),
+                    absolute_deadline=orchestrator.training_deadline(
+                        instance
+                    ),
                 )
             except BaseException as start_error:
                 try:

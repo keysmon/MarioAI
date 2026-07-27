@@ -82,10 +82,25 @@ class FakeLifecycleAws:
             "Instances": [
                 {
                     "InstanceId": "i-0123456789abcdef0",
+                    "ClientToken": "task-3-idempotency-token",
+                    "ImageId": "ami-0123456789abcdef0",
+                    "InstanceType": "c7i.8xlarge",
+                    "InstanceLifecycle": "spot",
+                    "KeyName": config.key_name,
+                    "Placement": {"AvailabilityZone": "us-east-1a"},
+                    "SubnetId": config.subnet_ids[0],
+                    "SecurityGroups": [
+                        {"GroupId": config.security_group_id}
+                    ],
+                    "Tags": [
+                        {"Key": "Project", "Value": "MarioAI-All32"},
+                        {"Key": "Phase", "Value": "benchmark"},
+                    ],
                     "PublicIpAddress": "203.0.113.10",
                 }
             ]
         }
+        self._default_run_instances_response = self.run_instances_response
         self.offers: tuple[SpotOffer, ...] = (
             SpotOffer(
                 instance_type="c7i.8xlarge",
@@ -101,12 +116,14 @@ class FakeLifecycleAws:
         self.resolve_ami_hook = None
         self.terminate_hook = None
         self.project_results: list[tuple[dict[str, object], ...]] = []
+        self.preflight_calls = 0
 
     @property
     def run_instances_called(self) -> bool:
         return self.last_run_instances_request is not None
 
     def preflight(self, config: AwsConfig) -> PreflightResult:
+        self.preflight_calls += 1
         return PreflightResult(
             account_id=config.account_id,
             vpc_id=config.vpc_id,
@@ -131,12 +148,38 @@ class FakeLifecycleAws:
             self.resolve_ami_hook()
         return self.ami_id
 
-    def run_instances(self, request: dict[str, object]) -> object:
+    def run_instances(
+        self,
+        request: dict[str, object],
+        *,
+        max_hours: Decimal | None = None,
+    ) -> object:
+        del max_hours
         self.last_run_instances_request = request
         if self.run_instances_hook is not None:
             self.run_instances_hook()
         if self.run_instances_error is not None:
             raise self.run_instances_error
+        if self.run_instances_response is self._default_run_instances_response:
+            response_instance = self.run_instances_response["Instances"][0]
+            response_instance.update(
+                {
+                    "ClientToken": request["ClientToken"],
+                    "ImageId": request["ImageId"],
+                    "InstanceType": request["InstanceType"],
+                    "KeyName": request["KeyName"],
+                    "Placement": request["Placement"],
+                    "SubnetId": request["NetworkInterfaces"][0]["SubnetId"],
+                    "SecurityGroups": [
+                        {
+                            "GroupId": request["NetworkInterfaces"][0][
+                                "Groups"
+                            ][0]
+                        }
+                    ],
+                    "Tags": request["TagSpecifications"][0]["Tags"],
+                }
+            )
         return self.run_instances_response
 
     def terminate_instance(self, instance_id: str) -> None:
@@ -201,6 +244,7 @@ class FakeRemote:
     def __init__(self, clock: FakeMonotonic | None = None) -> None:
         self.exit_code = 0
         self.shutdown_requests: list[str] = []
+        self.shutdown_deadlines: list[Decimal | None] = []
         self.poll_results: list[SimpleNamespace] = []
         self.poll_error: BaseException | None = None
         self.poll_times: list[float] = []
@@ -215,7 +259,10 @@ class FakeRemote:
         phase: str,
         max_seconds: int,
         s3_prefix: str,
+        on_tick=None,
+        absolute_deadline=None,
     ) -> None:
+        del on_tick, absolute_deadline
         if self.start_error is not None:
             raise self.start_error
         self.started.append(
@@ -231,8 +278,12 @@ class FakeRemote:
             return self.poll_results.pop(0)
         return SimpleNamespace(running=False, exit_code=self.exit_code)
 
-    def request_shutdown(self, instance) -> None:
+    def request_shutdown(
+        self, instance, *, on_tick=None, absolute_deadline=None
+    ) -> None:
+        del on_tick
         self.shutdown_requests.append(instance.instance_id)
+        self.shutdown_deadlines.append(absolute_deadline)
 
 
 @pytest.fixture
@@ -968,6 +1019,36 @@ def test_launch_rejects_partial_or_malformed_response(
     )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ClientToken", "different-token"),
+        ("ImageId", "ami-11111111111111111"),
+        ("InstanceType", "c7i.16xlarge"),
+        ("InstanceLifecycle", "scheduled"),
+        ("KeyName", "different-key"),
+        ("Placement", {"AvailabilityZone": "us-east-1b"}),
+        ("SubnetId", "subnet-11111111111111111"),
+        ("SecurityGroups", [{"GroupId": "sg-11111111111111111"}]),
+        ("Tags", [{"Key": "Project", "Value": "Other"}]),
+    ],
+)
+def test_launch_response_must_correlate_to_exact_request(
+    orchestrator, field, value
+):
+    response = json.loads(
+        json.dumps(orchestrator.aws.run_instances_response)
+    )
+    response["Instances"][0][field] = value
+    orchestrator.aws.run_instances_response = response
+
+    with pytest.raises(
+        AwsLifecycleError,
+        match=r"response.*request.*reconcile.*ClientToken",
+    ):
+        orchestrator.launch_guarded_instance("benchmark", Decimal("1"))
+
+
 def test_launch_rejects_malformed_ami_before_run_instances(orchestrator):
     orchestrator.aws.ami_id = "not-an-ami"
 
@@ -1071,6 +1152,9 @@ def test_monitor_requests_remote_shutdown_at_safety_threshold(
     )
 
     assert orchestrator.remote.shutdown_requests == [instance.instance_id]
+    assert orchestrator.remote.shutdown_deadlines == [
+        orchestrator.final_deadline(instance) - Decimal("180")
+    ]
     assert orchestrator.aws.terminated_ids == [instance.instance_id]
 
 
@@ -1181,7 +1265,9 @@ def test_state_changing_adapter_is_specific_validated_and_argument_vector(
     assert adapter.resolve_ami(config.ami_ssm_parameter) == (
         "ami-0123456789abcdef0"
     )
-    assert adapter.run_instances(launch_request) == (
+    assert adapter.run_instances(
+        launch_request, max_hours=Decimal("1")
+    ) == (
         orchestrator.aws.run_instances_response
     )
     adapter.terminate_instance("i-0123456789abcdef0")
@@ -1219,7 +1305,10 @@ def test_state_changing_adapter_rejects_invalid_request_before_runner(config):
     )
 
     with pytest.raises(AwsLifecycleError, match="exact allowlist"):
-        adapter.run_instances({"MinCount": 1, "MaxCount": 1})
+        adapter.run_instances(
+            {"MinCount": 1, "MaxCount": 1},
+            max_hours=Decimal("1"),
+        )
     with pytest.raises(AwsLifecycleError, match="instance ID"):
         adapter.terminate_instance("i-good; aws ec2 run-instances")
 
@@ -1278,7 +1367,7 @@ def test_adapter_wraps_ambiguous_launch_timeout_without_retry(
         AwsLifecycleError,
         match=r"run-instances.*ambiguous.*ClientToken",
     ):
-        adapter.run_instances(request)
+        adapter.run_instances(request, max_hours=Decimal("1"))
 
     assert [
         call[0][1:3]
@@ -1360,7 +1449,7 @@ def test_mutation_adapter_rejects_every_non_allowlisted_launch_change(
         ).decode("ascii")
 
     with pytest.raises(AwsLifecycleError):
-        adapter.run_instances(request)
+        adapter.run_instances(request, max_hours=Decimal("1"))
     assert runner.calls == []
 
 
@@ -1390,7 +1479,7 @@ def test_mutation_adapter_rejects_ambiguous_termination_response(
     )
     runner.add(
         ["ec2", "run-instances", "--cli-input-json", request_json],
-        {"Instances": [{"InstanceId": instance_id}]},
+        orchestrator.aws.run_instances_response,
     )
     runner.add(
         ["ec2", "terminate-instances", "--instance-ids", instance_id],
@@ -1403,10 +1492,47 @@ def test_mutation_adapter_rejects_ambiguous_termination_response(
     )
     adapter.preflight(config)
     adapter.resolve_ami(config.ami_ssm_parameter)
-    adapter.run_instances(request)
+    adapter.run_instances(request, max_hours=Decimal("1"))
 
     with pytest.raises(AwsLifecycleError, match="ambiguous.*reconcile"):
         adapter.terminate_instance(instance_id)
+
+
+def test_mutation_adapter_requires_exact_budget_authorized_shutdown_delay(
+    config, orchestrator
+):
+    from scripts.aws_all32 import AwsCommandAdapter, _shutdown_user_data
+
+    orchestrator.preflight()
+    orchestrator.launch_guarded_instance("benchmark", Decimal("1"))
+    request = json.loads(
+        json.dumps(orchestrator.aws.last_run_instances_request)
+    )
+    request["UserData"] = _shutdown_user_data(Decimal("2"))
+    runner = FakeRunner()
+    runner.add(
+        [
+            "ssm",
+            "get-parameter",
+            "--name",
+            config.ami_ssm_parameter,
+            "--query",
+            "Parameter.Value",
+        ],
+        "ami-0123456789abcdef0",
+    )
+    adapter = AwsCommandAdapter(
+        config=config,
+        readonly=FakeLifecycleAws(config),
+        runner=runner,
+    )
+    adapter.preflight(config)
+    adapter.resolve_ami(config.ami_ssm_parameter)
+    runner.calls.clear()
+
+    with pytest.raises(AwsLifecycleError, match="shutdown.*max_hours"):
+        adapter.run_instances(request, max_hours=Decimal("1"))
+    assert runner.calls == []
 
 
 @pytest.mark.parametrize(
@@ -1751,7 +1877,7 @@ def test_cli_launch_preflights_starts_monitors_and_terminates(config, tmp_path):
     )
     payload = json.loads(stdout.getvalue())
     assert payload["instance_id"] == "i-0123456789abcdef0"
-    assert payload["costed_run"]["instance_hourly_usd"] == "0.5568"
+    assert payload["costed_run"]["instance_hourly_usd"] == "1.428"
 
 
 def test_cli_launch_terminates_when_remote_start_fails(config, tmp_path):
@@ -1871,6 +1997,61 @@ def test_reservation_write_failure_prevents_run_instances(
         )
 
     assert not aws.run_instances_called
+
+
+def test_post_launch_state_save_failure_still_accounts_and_terminates(
+    config, tmp_path, monkeypatch
+):
+    from scripts.aws_all32 import LaunchStateStore, main
+
+    aws = FakeLifecycleAws(config)
+    real_save = LaunchStateStore.save
+
+    def fail_launched_save(store, reservation):
+        if reservation.state == "launched":
+            raise OSError("launched state fsync failed")
+        real_save(store, reservation)
+
+    monkeypatch.setattr(LaunchStateStore, "save", fail_launched_save)
+    ledger_path = tmp_path / "aws-spend.json"
+
+    with pytest.raises(OSError, match="launched state fsync failed"):
+        main(
+            [
+                "launch",
+                "--config",
+                str(CONFIG_PATH),
+                "--ledger",
+                str(ledger_path),
+                "--phase",
+                "benchmark",
+                "--max-hours",
+                "1",
+            ],
+            stdout=io.StringIO(),
+            aws_override=aws,
+            remote=FakeRemote(),
+            monotonic=FakeMonotonic(),
+            client_token_factory=lambda: "post-launch-save-token",
+        )
+
+    assert aws.terminated_ids == ["i-0123456789abcdef0"]
+    ledger = BudgetLedger.load(ledger_path, cap_usd=config.cap_usd)
+    assert ledger.runs[0].instance_id == "i-0123456789abcdef0"
+    assert ledger.runs[0].instance_hourly_usd == Decimal("1.428")
+
+
+def test_launch_runs_fresh_full_preflight_immediately_before_mutation(
+    orchestrator,
+):
+    calls_at_mutation = []
+    orchestrator.aws.run_instances_hook = lambda: calls_at_mutation.append(
+        orchestrator.aws.preflight_calls
+    )
+
+    orchestrator.launch_guarded_instance("benchmark", Decimal("1"))
+
+    assert calls_at_mutation == [2]
 
 
 def test_ambiguous_launch_keeps_stable_reservation_and_blocks_retry(
@@ -2138,6 +2319,152 @@ def test_reconcile_keeps_ambiguous_unknown_reservation_fail_closed(
         )
 
 
+def test_reconcile_never_substitutes_unrelated_project_instance(
+    config, orchestrator, tmp_path
+):
+    from scripts.aws_all32 import LaunchReservation, LaunchStateStore, main
+
+    orchestrator.preflight()
+    orchestrator.launch_guarded_instance("benchmark", Decimal("1"))
+    ledger_path = tmp_path / "aws-spend.json"
+    reservation = LaunchReservation(
+        client_token="unknown-owned-token",
+        state="reserved",
+        phase="benchmark",
+        request=orchestrator.aws.last_run_instances_request,
+        instance_hourly_usd=Decimal("0.5568"),
+        on_demand_hourly_usd=Decimal("1.428"),
+        volume_hourly_usd=Decimal("8") / Decimal("720"),
+        max_hours=Decimal("1"),
+        grace_hours=Decimal("0.25"),
+        requested_epoch_seconds=Decimal("1000"),
+    )
+    with LaunchStateStore(ledger_path) as store:
+        store.save(reservation)
+    unrelated = {
+        "instance_id": "i-11111111111111111",
+        "instance_type": "c7i.8xlarge",
+        "public_ip": "203.0.113.111",
+        "state": "running",
+    }
+    aws = FakeLifecycleAws(config)
+    aws.project_results = [(unrelated,), (), ()]
+
+    assert (
+        main(
+            [
+                "reconcile",
+                "--config",
+                str(CONFIG_PATH),
+                "--ledger",
+                str(ledger_path),
+            ],
+            stdout=io.StringIO(),
+            aws_override=aws,
+        )
+        == 0
+    )
+
+    assert store.state_path.exists()
+    ledger = BudgetLedger.load(ledger_path, cap_usd=config.cap_usd)
+    main_runs = [run for run in ledger.runs if run.phase == "benchmark"]
+    assert [run.instance_id for run in main_runs] == [
+        "pending:unknown-owned-token"
+    ]
+    assert aws.terminated_ids == ["i-11111111111111111"]
+
+
+def test_pending_settlement_migrates_to_recovered_instance_without_reuse(
+    config, orchestrator
+):
+    from scripts.aws_all32 import LaunchReservation, _settle_reservation
+
+    orchestrator.preflight()
+    orchestrator.launch_guarded_instance("benchmark", Decimal("1"))
+    reservation = LaunchReservation(
+        client_token="migration-token",
+        state="reserved",
+        phase="benchmark",
+        request=orchestrator.aws.last_run_instances_request,
+        instance_hourly_usd=Decimal("0.5568"),
+        on_demand_hourly_usd=Decimal("1.428"),
+        volume_hourly_usd=Decimal("8") / Decimal("720"),
+        max_hours=Decimal("1"),
+        grace_hours=Decimal("0.25"),
+        requested_epoch_seconds=Decimal("1000"),
+    )
+    empty = BudgetLedger(
+        cap_usd=config.cap_usd, allocations=config.allocations
+    )
+    pending = _settle_reservation(
+        empty, reservation, instance_id=None
+    )
+
+    migrated = _settle_reservation(
+        pending,
+        reservation,
+        instance_id="i-0123456789abcdef0",
+    )
+
+    assert migrated.spent_usd == pending.spent_usd
+    assert [
+        run.instance_id
+        for run in migrated.runs
+        if run.phase == "benchmark"
+    ] == ["i-0123456789abcdef0"]
+
+
+def test_reconcile_requires_terminal_confirmation_before_sidecar_clear(
+    config, orchestrator, tmp_path
+):
+    from scripts.aws_all32 import LaunchReservation, LaunchStateStore, main
+
+    orchestrator.preflight()
+    orchestrator.launch_guarded_instance("benchmark", Decimal("1"))
+    ledger_path = tmp_path / "aws-spend.json"
+    instance_id = "i-0123456789abcdef0"
+    reservation = LaunchReservation(
+        client_token="terminal-confirmation-token",
+        state="launched",
+        phase="benchmark",
+        request=orchestrator.aws.last_run_instances_request,
+        instance_hourly_usd=Decimal("0.5568"),
+        on_demand_hourly_usd=Decimal("1.428"),
+        volume_hourly_usd=Decimal("8") / Decimal("720"),
+        max_hours=Decimal("1"),
+        grace_hours=Decimal("0.25"),
+        requested_epoch_seconds=Decimal("1000"),
+        instance_id=instance_id,
+    )
+    with LaunchStateStore(ledger_path) as store:
+        store.save(reservation)
+    running = {
+        "instance_id": instance_id,
+        "instance_type": "c7i.8xlarge",
+        "public_ip": "203.0.113.10",
+        "state": "running",
+    }
+    aws = FakeLifecycleAws(config)
+    aws.project_results = [(running,), (running,), (), (running,)]
+
+    assert (
+        main(
+            [
+                "reconcile",
+                "--config",
+                str(CONFIG_PATH),
+                "--ledger",
+                str(ledger_path),
+            ],
+            stdout=io.StringIO(),
+            aws_override=aws,
+        )
+        == 0
+    )
+
+    assert store.state_path.exists()
+
+
 def test_wait_for_running_public_ip_retries_eventual_consistency(
     orchestrator,
 ):
@@ -2186,6 +2513,151 @@ def test_final_accounting_includes_termination_latency(orchestrator, tmp_path):
     assert BudgetLedger.load(tmp_path / "aws-spend.json").runs[0].hours == (
         run.hours
     )
+
+
+def test_successful_run_accounts_at_conservative_on_demand_ceiling(
+    orchestrator, tmp_path
+):
+    instance = orchestrator.launch_guarded_instance(
+        "benchmark", Decimal("1")
+    )
+    orchestrator.test_clock.now = 60.0
+
+    run = orchestrator.monitor_and_terminate(
+        instance, tmp_path / "aws-spend.json"
+    )
+
+    assert instance.spot_hourly_usd == Decimal("0.5568")
+    assert run.instance_hourly_usd == Decimal("1.428")
+    assert BudgetLedger.load(
+        tmp_path / "aws-spend.json"
+    ).runs[0].instance_hourly_usd == Decimal("1.428")
+
+
+def test_ec2_settlement_uses_only_remaining_absolute_grace(
+    orchestrator, tmp_path
+):
+    instance = orchestrator.launch_guarded_instance(
+        "benchmark", Decimal("1")
+    )
+    orchestrator.test_clock.now = 4440.0
+    shutting_down = {
+        "instance_id": instance.instance_id,
+        "instance_type": instance.instance_type,
+        "public_ip": instance.public_ip,
+        "state": "shutting-down",
+    }
+    orchestrator.aws.project_results = [(shutting_down,)] * 100
+
+    with pytest.raises(AwsLifecycleError, match="absolute.*deadline"):
+        orchestrator.terminate_and_settle(
+            instance, tmp_path / "aws-spend.json"
+        )
+
+    assert orchestrator.test_clock.now == 4500.0
+
+
+def test_readiness_persists_paid_cost_during_waits(
+    orchestrator, tmp_path, monkeypatch
+):
+    instance = orchestrator.launch_guarded_instance(
+        "benchmark", Decimal("1")
+    )
+    pending = {
+        "instance_id": instance.instance_id,
+        "instance_type": instance.instance_type,
+        "public_ip": None,
+        "state": "pending",
+    }
+    ready = {
+        **pending,
+        "public_ip": "203.0.113.77",
+        "state": "running",
+    }
+    orchestrator.aws.project_results = [
+        (pending,),
+        (pending,),
+        (pending,),
+        (ready,),
+    ]
+    save_times = []
+    real_save = BudgetLedger.save
+
+    def recording_save(ledger, path):
+        save_times.append(orchestrator.test_clock.now)
+        real_save(ledger, path)
+
+    monkeypatch.setattr(BudgetLedger, "save", recording_save)
+
+    result = orchestrator.wait_for_running_public_ip(
+        instance, ledger_path=tmp_path / "aws-spend.json"
+    )
+
+    assert result.public_ip == "203.0.113.77"
+    assert save_times == [0.0, 5.0, 10.0, 15.0]
+    assert max(
+        later - earlier
+        for earlier, later in zip(save_times, save_times[1:])
+    ) <= 60
+
+
+def test_paid_subprocess_ticks_at_most_every_sixty_seconds(
+    orchestrator, tmp_path
+):
+    from scripts.aws_all32 import SshRemoteSupervisor
+
+    ssh_key = tmp_path / "mario-training-key.pem"
+    ssh_key.write_text("test-only", encoding="utf-8")
+    local_repo = tmp_path / "MarioAI"
+    local_repo.mkdir()
+    clock = FakeMonotonic()
+    communicate_timeouts = []
+    ticks = []
+
+    class SlowProcess:
+        returncode = 0
+
+        def __init__(self):
+            self.calls = 0
+
+        def communicate(self, input=None, timeout=None):
+            del input
+            communicate_timeouts.append(timeout)
+            self.calls += 1
+            if self.calls <= 2:
+                clock.now += timeout
+                raise subprocess.TimeoutExpired(["ssh"], timeout)
+            return ("complete", "")
+
+        def terminate(self):
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            del timeout
+            return self.returncode
+
+    remote = SshRemoteSupervisor(
+        aws=orchestrator.aws,
+        ssh_key=ssh_key,
+        local_repo=local_repo,
+        monotonic=clock,
+        sleeper=lambda _seconds: None,
+        process_factory=lambda *_args, **_kwargs: SlowProcess(),
+    )
+
+    remote._run_remote_command(
+        ["ssh", "example"],
+        timeout=300,
+        input_text="test\n",
+        on_tick=lambda: ticks.append(clock.now),
+        absolute_deadline=Decimal("180"),
+    )
+
+    assert communicate_timeouts == [60, 60, 60]
+    assert ticks == [60.0, 120.0, 120.0]
 
 
 def test_ssh_remote_start_uses_argument_vectors(orchestrator, tmp_path):
@@ -2403,7 +2875,9 @@ def test_instance_readiness_timeout_is_bounded(orchestrator):
     }
     orchestrator.aws.project_results = [(pending,)] * 121
 
-    with pytest.raises(AwsLifecycleError, match="within 600 seconds"):
+    with pytest.raises(
+        AwsLifecycleError, match="readiness or absolute training deadline"
+    ):
         orchestrator.wait_for_running_public_ip(instance)
 
     assert orchestrator.test_clock.now == 600.0
