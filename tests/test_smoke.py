@@ -68,6 +68,7 @@ def _run_all32_pipeline_smoke(tmp_path):
     cfg = load_training_config(
         str(config_path), None, _TemporaryConfigOverrides()
     )
+    assert cfg["train"]["n_envs"] == 2
     model_path = tmp_path / "all32-smoke.zip"
 
     venv = make_vec_env(
