@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
+import re
 import subprocess
 from types import MappingProxyType
 from typing import Any
@@ -222,6 +223,9 @@ _READ_ONLY_OPERATIONS = frozenset(
 _FIXED_GLOBAL_OPTIONS = frozenset(
     {"--profile", "--region", "--output", "--endpoint-url"}
 )
+_SPOT_MAX_AGE = timedelta(days=7)
+_SPOT_MAX_FUTURE_SKEW = timedelta(minutes=5)
+_AWS_CLI_TIMEOUT_SECONDS = 60
 
 
 class AwsCli:
@@ -233,12 +237,12 @@ class AwsCli:
         region: str,
         *,
         runner: Callable[..., Any] = subprocess.run,
-        timeout_seconds: int = 60,
+        clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self.profile = _required_string(profile, "profile")
         self.region = _required_string(region, "region")
         self._runner = runner
-        self._timeout_seconds = _required_int(timeout_seconds, "timeout_seconds")
+        self._clock = clock
         self._preflight_config: AwsConfig | None = None
         self._subnet_by_az: dict[str, str] = {}
 
@@ -284,12 +288,12 @@ class AwsCli:
                 check=True,
                 text=True,
                 capture_output=True,
-                timeout=self._timeout_seconds,
+                timeout=_AWS_CLI_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired as error:
             raise AwsCliError(
                 f"AWS {operation_name} timed out after "
-                f"{self._timeout_seconds} seconds"
+                f"{_AWS_CLI_TIMEOUT_SECONDS} seconds"
             ) from error
         except subprocess.CalledProcessError as error:
             stderr = (error.stderr or "").strip()
@@ -368,7 +372,15 @@ class AwsCli:
             "subnets",
         )
         expected_subnets = set(config.subnet_ids)
-        returned_subnets = {subnet.get("SubnetId") for subnet in subnets}
+        returned_subnet_ids: list[str] = []
+        for subnet in subnets:
+            subnet_id = subnet.get("SubnetId")
+            if not isinstance(subnet_id, str) or not subnet_id:
+                raise AwsPreflightError(
+                    "subnets response contains an invalid SubnetId"
+                )
+            returned_subnet_ids.append(subnet_id)
+        returned_subnets = set(returned_subnet_ids)
         if returned_subnets != expected_subnets or len(subnets) != len(
             config.subnet_ids
         ):
@@ -389,7 +401,10 @@ class AwsCli:
             availability_zone = subnet.get("AvailabilityZone")
             if (
                 not isinstance(availability_zone, str)
-                or not availability_zone.startswith(config.region)
+                or re.fullmatch(
+                    rf"{re.escape(config.region)}[a-z]", availability_zone
+                )
+                is None
             ):
                 raise AwsPreflightError(
                     f"subnet {subnet_id} has an invalid availability zone"
@@ -527,11 +542,20 @@ class AwsCli:
                 + ", ".join(sorted(running_instance_ids))
             )
 
-        self._preflight_config = config
-        self._subnet_by_az = {
+        subnet_by_az = {
             availability_zone: subnet_id
             for subnet_id, availability_zone in subnet_azs
         }
+        current_offers = self._latest_spot_prices(
+            config.instance_types, config, subnet_by_az
+        )
+        if not current_offers:
+            raise AwsPreflightError(
+                "at least one current allowed Spot offer is required"
+            )
+
+        self._preflight_config = config
+        self._subnet_by_az = subnet_by_az
         return PreflightResult(
             account_id=config.account_id,
             vpc_id=config.vpc_id,
@@ -550,6 +574,16 @@ class AwsCli:
             raise AwsPreflightError(
                 "successful preflight is required before Spot price lookup"
             )
+        return self._latest_spot_prices(
+            instance_types, config, self._subnet_by_az
+        )
+
+    def _latest_spot_prices(
+        self,
+        instance_types: Sequence[str],
+        config: AwsConfig,
+        subnet_by_az: Mapping[str, str],
+    ) -> tuple[SpotOffer, ...]:
         if isinstance(instance_types, (str, bytes)):
             raise AwsPreflightError("instance_types must be a sequence")
         raw_types = tuple(instance_types)
@@ -568,6 +602,12 @@ class AwsCli:
                 + ", ".join(sorted(disallowed))
             )
 
+        now = self._clock()
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise AwsPreflightError(
+                "Spot price clock must return a timezone-aware datetime"
+            )
+        now = now.astimezone(timezone.utc)
         history = _response_list(
             self._preflight_run(
                 "Spot price history",
@@ -578,18 +618,29 @@ class AwsCli:
                     *requested_types,
                     "--product-descriptions",
                     "Linux/UNIX",
+                    "--start-time",
+                    (now - _SPOT_MAX_AGE).isoformat(),
+                    "--end-time",
+                    now.isoformat(),
                 ],
             ),
             "SpotPriceHistory",
             "Spot price history",
         )
         latest: dict[tuple[str, str], SpotOffer] = {}
+        saw_out_of_window_offer = False
         for item in history:
             instance_type = item.get("InstanceType")
             availability_zone = item.get("AvailabilityZone")
+            if not isinstance(instance_type, str) or not isinstance(
+                availability_zone, str
+            ):
+                raise AwsPreflightError(
+                    "malformed Spot offer instance type or availability zone"
+                )
             if (
                 instance_type not in requested_types
-                or availability_zone not in self._subnet_by_az
+                or availability_zone not in subnet_by_az
             ):
                 continue
             try:
@@ -613,10 +664,16 @@ class AwsCli:
                 raise AwsPreflightError(
                     "malformed Spot offer for allowed instance type/AZ"
                 ) from error
+            if (
+                timestamp < now - _SPOT_MAX_AGE
+                or timestamp > now + _SPOT_MAX_FUTURE_SKEW
+            ):
+                saw_out_of_window_offer = True
+                continue
             offer = SpotOffer(
                 instance_type=instance_type,
                 availability_zone=availability_zone,
-                subnet_id=self._subnet_by_az[availability_zone],
+                subnet_id=subnet_by_az[availability_zone],
                 hourly_usd=hourly_usd,
                 timestamp=timestamp,
             )
@@ -628,6 +685,10 @@ class AwsCli:
             ):
                 latest[key] = offer
 
+        if not latest and saw_out_of_window_offer:
+            raise AwsPreflightError(
+                "allowed Spot offers fall outside the current freshness window"
+            )
         return tuple(
             sorted(
                 latest.values(),

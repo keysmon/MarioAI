@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -17,6 +18,9 @@ from marioai.aws import (
 
 
 CONFIG_PATH = Path(__file__).parents[1] / "configs" / "aws-all32.yaml"
+NOW = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+SPOT_MAX_AGE = timedelta(days=7)
+SPOT_MAX_FUTURE_SKEW = timedelta(minutes=5)
 SUBNET_IDS = (
     "subnet-0ba0242531d6615f3",
     "subnet-0870eed3fd2b7dfab",
@@ -145,12 +149,45 @@ def _successful_runner(config: AwsConfig) -> FakeRunner:
         ],
         {"Reservations": []},
     )
+    runner.add(
+        _spot_args(config.instance_types),
+        {
+            "SpotPriceHistory": [
+                {
+                    "InstanceType": "c7i.8xlarge",
+                    "AvailabilityZone": "us-east-1a",
+                    "SpotPrice": "0.5568",
+                    "Timestamp": NOW.isoformat(),
+                }
+            ]
+        },
+    )
     return runner
+
+
+def _spot_args(instance_types) -> list[str]:
+    return [
+        "ec2",
+        "describe-spot-price-history",
+        "--instance-types",
+        *sorted(instance_types),
+        "--product-descriptions",
+        "Linux/UNIX",
+        "--start-time",
+        (NOW - SPOT_MAX_AGE).isoformat(),
+        "--end-time",
+        NOW.isoformat(),
+    ]
 
 
 def _preflight_cli(config: AwsConfig) -> tuple[AwsCli, FakeRunner]:
     runner = _successful_runner(config)
-    cli = AwsCli(profile=config.profile, region=config.region, runner=runner)
+    cli = AwsCli(
+        profile=config.profile,
+        region=config.region,
+        runner=runner,
+        clock=lambda: NOW,
+    )
     return cli, runner
 
 
@@ -253,6 +290,16 @@ def test_run_wraps_timeout_with_actionable_operation(config):
         cli.run(["sts", "get-caller-identity"])
 
 
+def test_timeout_cannot_be_overridden(config):
+    with pytest.raises(TypeError, match="timeout_seconds"):
+        AwsCli(
+            profile=config.profile,
+            region=config.region,
+            runner=FakeRunner(),
+            timeout_seconds=1,
+        )
+
+
 def test_preflight_validates_every_read_only_prerequisite(config):
     cli, runner = _preflight_cli(config)
 
@@ -276,7 +323,22 @@ def test_preflight_validates_every_read_only_prerequisite(config):
         ["iam", "get-instance-profile"],
         ["s3api", "list-objects-v2"],
         ["ec2", "describe-instances"],
+        ["ec2", "describe-spot-price-history"],
     ]
+
+
+def test_preflight_rejects_when_no_current_allowed_spot_offer(config):
+    runner = _successful_runner(config)
+    runner.add(_spot_args(config.instance_types), {"SpotPriceHistory": []})
+    cli = AwsCli(
+        profile=config.profile,
+        region=config.region,
+        runner=runner,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(AwsPreflightError, match="current allowed Spot offer"):
+        cli.preflight(config)
 
 
 def test_preflight_rejects_wrong_account(config):
@@ -297,6 +359,35 @@ def test_preflight_rejects_missing_or_cross_vpc_subnet(config):
     )
 
     with pytest.raises(AwsPreflightError, match="subnets.*expected VPC"):
+        cli.preflight(config)
+
+
+@pytest.mark.parametrize("availability_zone", ["us-east-1", "us-east-1-invalid"])
+def test_preflight_rejects_malformed_region_availability_zone(
+    config, availability_zone
+):
+    cli, runner = _preflight_cli(config)
+    payload = _subnet_payload(config)
+    payload["Subnets"][0]["AvailabilityZone"] = availability_zone
+    runner.add(
+        ["ec2", "describe-subnets", "--subnet-ids", *config.subnet_ids],
+        payload,
+    )
+
+    with pytest.raises(AwsPreflightError, match="invalid availability zone"):
+        cli.preflight(config)
+
+
+def test_preflight_normalizes_unhashable_subnet_id(config):
+    cli, runner = _preflight_cli(config)
+    payload = _subnet_payload(config)
+    payload["Subnets"][0]["SubnetId"] = []
+    runner.add(
+        ["ec2", "describe-subnets", "--subnet-ids", *config.subnet_ids],
+        payload,
+    )
+
+    with pytest.raises(AwsPreflightError, match="invalid SubnetId"):
         cli.preflight(config)
 
 
@@ -372,15 +463,7 @@ def test_spot_selection_is_deterministic_and_restricted(config):
     cli, runner = _preflight_cli(config)
     cli.preflight(config)
     runner.add(
-        [
-            "ec2",
-            "describe-spot-price-history",
-            "--instance-types",
-            "c7i.16xlarge",
-            "c7i.8xlarge",
-            "--product-descriptions",
-            "Linux/UNIX",
-        ],
+        _spot_args(config.instance_types),
         {
             "SpotPriceHistory": [
                 {
@@ -427,6 +510,36 @@ def test_spot_selection_is_deterministic_and_restricted(config):
     assert offers[0].hourly_usd == Decimal("0.5568")
 
 
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        (NOW - SPOT_MAX_AGE - timedelta(seconds=1)).isoformat(),
+        (NOW + SPOT_MAX_FUTURE_SKEW + timedelta(seconds=1)).isoformat(),
+    ],
+)
+def test_spot_selection_rejects_stale_or_future_allowed_offer(
+    config, timestamp
+):
+    cli, runner = _preflight_cli(config)
+    cli.preflight(config)
+    runner.add(
+        _spot_args(["c7i.8xlarge"]),
+        {
+            "SpotPriceHistory": [
+                {
+                    "InstanceType": "c7i.8xlarge",
+                    "AvailabilityZone": "us-east-1a",
+                    "SpotPrice": "0.5568",
+                    "Timestamp": timestamp,
+                }
+            ]
+        },
+    )
+
+    with pytest.raises(AwsPreflightError, match="current freshness window"):
+        cli.latest_spot_prices(["c7i.8xlarge"])
+
+
 def test_spot_selection_rejects_type_not_allowed_by_preflight(config):
     cli, _ = _preflight_cli(config)
     cli.preflight(config)
@@ -443,18 +556,32 @@ def test_spot_selection_rejects_non_string_type_cleanly(config):
         cli.latest_spot_prices(["c7i.8xlarge", None])
 
 
+def test_spot_selection_normalizes_unhashable_availability_zone(config):
+    cli, runner = _preflight_cli(config)
+    cli.preflight(config)
+    runner.add(
+        _spot_args(["c7i.8xlarge"]),
+        {
+            "SpotPriceHistory": [
+                {
+                    "InstanceType": "c7i.8xlarge",
+                    "AvailabilityZone": [],
+                    "SpotPrice": "0.5568",
+                    "Timestamp": NOW.isoformat(),
+                }
+            ]
+        },
+    )
+
+    with pytest.raises(AwsPreflightError, match="malformed Spot offer"):
+        cli.latest_spot_prices(["c7i.8xlarge"])
+
+
 def test_spot_selection_rejects_malformed_allowed_offer(config):
     cli, runner = _preflight_cli(config)
     cli.preflight(config)
     runner.add(
-        [
-            "ec2",
-            "describe-spot-price-history",
-            "--instance-types",
-            "c7i.8xlarge",
-            "--product-descriptions",
-            "Linux/UNIX",
-        ],
+        _spot_args(["c7i.8xlarge"]),
         {
             "SpotPriceHistory": [
                 {
