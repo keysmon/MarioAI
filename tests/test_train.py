@@ -1,4 +1,6 @@
 from argparse import Namespace
+import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -292,6 +294,9 @@ def _run_orchestration(
     reset_timesteps=False,
     normalize_reward=False,
     create_normalization=False,
+    inspect_callback=False,
+    inspect_timesteps=False,
+    checkpoint_timesteps=0,
 ):
     events = [] if events is None else events
     extractor = (
@@ -303,6 +308,7 @@ def _run_orchestration(
         )
     )
     checkpoint = SimpleNamespace(
+        num_timesteps=checkpoint_timesteps,
         action_space=SimpleNamespace(n=12),
         observation_space=gym.spaces.Box(
             0, 255, shape=(4, 84, 84), dtype=np.uint8
@@ -311,7 +317,27 @@ def _run_orchestration(
     )
 
     class FakeModel:
-        def learn(self, *, reset_num_timesteps, callback, **_kwargs):
+        num_timesteps = checkpoint_timesteps
+        action_space = gym.spaces.Discrete(12)
+        observation_space = gym.spaces.Box(
+            0, 255, shape=(4, 84, 84), dtype=np.uint8
+        )
+        policy = SimpleNamespace(features_extractor=extractor)
+
+        def learn(
+            self,
+            *,
+            total_timesteps,
+            reset_num_timesteps,
+            callback,
+            **_kwargs,
+        ):
+            if inspect_callback:
+                events.append(
+                    ("callback", type(callback[0]).__name__)
+                )
+            if inspect_timesteps:
+                events.append(("timesteps", total_timesteps))
             if callback[0].save_vecnormalize:
                 events.append(("checkpoint-vecnormalize", True))
             events.append(("learn", reset_num_timesteps))
@@ -348,6 +374,8 @@ def _run_orchestration(
         (tmp_path / "checkpoint.vecnormalize.pkl").write_bytes(
             b"normalization state"
         )
+    ledger_path = tmp_path / "aws-spend.json"
+    ledger_path.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(training, "PPO", FakePPO)
     monkeypatch.setattr(
         training,
@@ -359,6 +387,8 @@ def _run_orchestration(
     monkeypatch.setattr(training, "build_training_env", fake_build_training_env)
 
     argv = ["--run-name", "orchestration"]
+    if inspect_callback:
+        argv.extend(["--budget-ledger-snapshot", str(ledger_path)])
     if source_flag is not None:
         argv.extend([source_flag, "checkpoint.zip"])
     if reset_timesteps:
@@ -488,3 +518,216 @@ def test_normalized_resume_restores_and_saves_matching_state(
         ),
         ("close",),
     ]
+
+
+def test_training_installs_durable_checkpoint_callback(monkeypatch, tmp_path):
+    """Catches wiring the old independently-written SB3 checkpoint callback."""
+    events = _run_orchestration(
+        monkeypatch,
+        tmp_path,
+        normalize_reward=True,
+        inspect_callback=True,
+    )
+
+    assert ("callback", "DurableCheckpointCallback") in events
+
+
+def test_resume_trains_only_remaining_phase_timesteps(monkeypatch, tmp_path):
+    """Catches SB3 adding a second full phase budget after interruption."""
+    events = _run_orchestration(
+        monkeypatch,
+        tmp_path,
+        source_flag="--resume",
+        checkpoint_timesteps=16,
+        inspect_timesteps=True,
+    )
+
+    assert ("timesteps", 48) in events
+
+
+def test_durable_checkpoint_writes_complete_resume_manifest(tmp_path):
+    """Catches publishing a checkpoint without every artifact needed to resume."""
+    cfg = _orchestration_config(normalize_reward=True)
+    ledger_path = tmp_path / "aws-spend.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "allocations": {"phase_1": "16.00"},
+                "cap_usd": "50.00",
+                "runs": [],
+                "spent_usd": "0",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeVecNormalize:
+        def save(self, path):
+            Path(path).write_bytes(b"paired normalization")
+
+    class FakeModel:
+        num_timesteps = 250000
+        action_space = gym.spaces.Discrete(12)
+        observation_space = gym.spaces.Box(
+            0, 255, shape=(4, 84, 84), dtype=np.uint8
+        )
+        policy = SimpleNamespace(
+            features_extractor=_impala_extractor(
+                features_dim=512,
+                channels=(16, 32, 32),
+            )
+        )
+
+        def save(self, path):
+            Path(path).write_bytes(b"durable model")
+
+        def get_vec_normalize_env(self):
+            return FakeVecNormalize()
+
+    callback = training.DurableCheckpointCallback(
+        save_path=tmp_path,
+        save_freq=1,
+        run_config=cfg,
+        budget_ledger_path=ledger_path,
+        phase="phase_1",
+        run_name="all32-phase_1",
+        save_vecnormalize=True,
+    )
+
+    callback.save_checkpoint(FakeModel())
+
+    manifest = json.loads(
+        (tmp_path / "latest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["num_timesteps"] == 250000
+    assert manifest["model"] == "ckpt_250000_steps.zip"
+    assert manifest["sha256"] == hashlib.sha256(
+        b"durable model"
+    ).hexdigest()
+    assert manifest["phase"] == "phase_1"
+    assert manifest["action_set"] == "complex"
+    assert manifest["extractor"] == "impala"
+    assert manifest["vecnormalize"] == (
+        "ckpt_vecnormalize_250000_steps.pkl"
+    )
+    assert manifest["signature"] == "ckpt_signature_250000_steps.json"
+    assert manifest["run_config"] == "ckpt_run_config_250000_steps.yaml"
+    assert manifest["budget_ledger"] == (
+        "ckpt_budget_ledger_250000_steps.json"
+    )
+    for field in (
+        "model",
+        "vecnormalize",
+        "signature",
+        "run_config",
+        "budget_ledger",
+    ):
+        artifact = tmp_path / manifest[field]
+        assert artifact.is_file()
+        hash_field = "sha256" if field == "model" else f"{field}_sha256"
+        assert manifest[hash_field] == hashlib.sha256(
+            artifact.read_bytes()
+        ).hexdigest()
+    signature = json.loads(
+        (tmp_path / manifest["signature"]).read_text(encoding="utf-8")
+    )
+    assert signature == {
+        "environment": {
+            "action_set_sha256": (
+                "84fc5c090e80b377473270d02377b5dcb"
+                "94c8c269d6144f3d868ce897f824e68"
+            ),
+            "actions": [
+                ["NOOP"],
+                ["right"],
+                ["right", "A"],
+                ["right", "B"],
+                ["right", "A", "B"],
+                ["A"],
+                ["left"],
+                ["left", "A"],
+                ["left", "B"],
+                ["left", "A", "B"],
+                ["down"],
+                ["up"],
+            ],
+            "action_count": 12,
+            "action_set": "complex",
+            "channels_order": "last",
+            "curriculum_threshold": 0.5,
+            "frame_stack": 4,
+            "level_weights": {},
+            "levels": ["1-1"],
+            "observation_shape": [4, 84, 84],
+            "shape": 84,
+            "skip": 4,
+            "start_snapshots": None,
+        },
+        "normalization": {
+            "clip_obs": 10.0,
+            "clip_reward": 10.0,
+            "epsilon": 1e-08,
+            "gamma": 0.99,
+            "norm_obs": False,
+            "norm_reward": True,
+            "normalize_reward": True,
+            "vecnormalize_required": True,
+        },
+        "phase": "phase_1",
+        "policy": {
+            "channels": [16, 32, 32],
+            "extractor": "impala",
+            "extractor_class": (
+                "marioai.features.ImpalaCnnFeaturesExtractor"
+            ),
+            "features_dim": 512,
+            "normalize_images": True,
+        },
+        "schema_version": 1,
+    }
+
+
+def test_durable_checkpoint_does_not_publish_partial_bundle(tmp_path):
+    """Catches latest.json pointing at a model whose paired state failed."""
+    previous_manifest = b'{"num_timesteps": 125000}\n'
+    (tmp_path / "latest.json").write_bytes(previous_manifest)
+    ledger_path = tmp_path / "aws-spend.json"
+    ledger_path.write_text("{}", encoding="utf-8")
+
+    class BrokenVecNormalize:
+        def save(self, _path):
+            raise OSError("interrupted normalization write")
+
+    class FakeModel:
+        num_timesteps = 250000
+        action_space = gym.spaces.Discrete(12)
+        observation_space = gym.spaces.Box(
+            0, 255, shape=(4, 84, 84), dtype=np.uint8
+        )
+        policy = SimpleNamespace(
+            features_extractor=_impala_extractor(
+                features_dim=512,
+                channels=(16, 32, 32),
+            )
+        )
+
+        def save(self, path):
+            Path(path).write_bytes(b"durable model")
+
+        def get_vec_normalize_env(self):
+            return BrokenVecNormalize()
+
+    callback = training.DurableCheckpointCallback(
+        save_path=tmp_path,
+        save_freq=1,
+        run_config=_orchestration_config(normalize_reward=True),
+        budget_ledger_path=ledger_path,
+        phase="phase_1",
+        run_name="all32-phase_1",
+        save_vecnormalize=True,
+    )
+
+    with pytest.raises(OSError, match="interrupted normalization"):
+        callback.save_checkpoint(FakeModel())
+
+    assert (tmp_path / "latest.json").read_bytes() == previous_manifest

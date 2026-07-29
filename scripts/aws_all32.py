@@ -14,14 +14,19 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import shlex
 import subprocess
 import sys
 import tempfile
 import time
 from typing import Any
+from urllib.parse import urlsplit
 import uuid
 
+import yaml
+
+import marioai.train as training
 from marioai.aws import AwsCli, AwsConfig, PreflightResult, SpotOffer
 from marioai.budget import BudgetLedger, CostedRun
 
@@ -39,10 +44,471 @@ _SSH_READY_TIMEOUT_SECONDS = 300
 _SSH_READY_POLL_SECONDS = 5
 _EC2_SETTLEMENT_RESERVE_SECONDS = Decimal("180")
 _LAUNCH_STATE_SCHEMA_VERSION = 1
+_CHECKPOINT_MANIFEST_SCHEMA_VERSION = 1
+_CHECKPOINT_HASH_PATTERN = re.compile(r"[0-9a-f]{64}")
+_CHECKPOINT_FILENAME_PATTERN = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]*"
+)
 
 
 class AwsLifecycleError(RuntimeError):
     """Raised when a paid-instance lifecycle cannot be handled safely."""
+
+
+@dataclass(frozen=True)
+class ResumeBundle:
+    """One locally staged and fully verified checkpoint generation."""
+
+    root: Path
+    manifest_path: Path
+    model_path: Path
+    run_config_path: Path
+    signature_path: Path
+    vecnormalize_path: Path | None
+    budget_ledger_path: Path
+    manifest: dict[str, Any]
+
+
+class S3CheckpointStore:
+    """Exact-object, read-only AWS CLI boundary for resume artifacts."""
+
+    def __init__(
+        self,
+        *,
+        profile: str,
+        region: str,
+        runner: Callable[..., Any] = subprocess.run,
+    ) -> None:
+        self.profile = profile
+        self.region = region
+        self._runner = runner
+
+    def download(self, uri: str, destination: Path) -> None:
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            dir=destination.parent,
+        )
+        os.close(descriptor)
+        temporary_path = Path(temporary_name)
+        try:
+            command = [
+                "aws",
+                "s3",
+                "cp",
+                uri,
+                str(temporary_path),
+                "--only-show-errors",
+                "--no-progress",
+                "--profile",
+                self.profile,
+                "--region",
+                self.region,
+            ]
+            self._runner(
+                command,
+                check=True,
+                text=True,
+                capture_output=True,
+                timeout=_AWS_COMMAND_TIMEOUT_SECONDS,
+            )
+            if not temporary_path.is_file():
+                raise AwsLifecycleError(
+                    f"S3 download did not create {destination.name}"
+                )
+            with temporary_path.open("rb") as artifact:
+                os.fsync(artifact.fileno())
+            os.replace(temporary_path, destination)
+            directory_fd = os.open(destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except subprocess.TimeoutExpired as error:
+            raise AwsLifecycleError(
+                f"S3 download timed out for {uri}"
+            ) from error
+        except subprocess.CalledProcessError as error:
+            stderr = (error.stderr or "").strip()
+            detail = f": {stderr}" if stderr else ""
+            raise AwsLifecycleError(
+                f"S3 download failed for {uri}{detail}"
+            ) from error
+        except OSError as error:
+            raise AwsLifecycleError(
+                f"could not download checkpoint object {uri}: {error}"
+            ) from error
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _s3_location(uri: str) -> tuple[str, str]:
+    if not isinstance(uri, str) or "%" in uri or "\\" in uri:
+        raise AwsLifecycleError("checkpoint S3 URI is invalid")
+    parsed = urlsplit(uri)
+    if (
+        parsed.scheme != "s3"
+        or not parsed.netloc
+        or parsed.query
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.port is not None
+    ):
+        raise AwsLifecycleError("checkpoint S3 URI is invalid")
+    key = parsed.path.removeprefix("/")
+    segments = key.split("/")
+    if (
+        not key
+        or any(
+            not segment or segment in {".", ".."} for segment in segments
+        )
+    ):
+        raise AwsLifecycleError("checkpoint S3 URI is invalid")
+    return parsed.netloc, key
+
+
+def _manifest_object_prefix(config: AwsConfig, uri: str) -> str:
+    root_bucket, root_key = _s3_location(config.s3_prefix.rstrip("/"))
+    manifest_bucket, manifest_key = _s3_location(uri)
+    configured_prefix = f"{root_key.rstrip('/')}/"
+    if (
+        manifest_bucket != root_bucket
+        or not manifest_key.startswith(configured_prefix)
+        or not manifest_key.endswith("/latest.json")
+    ):
+        raise AwsLifecycleError(
+            "checkpoint manifest is outside the configured S3 prefix"
+        )
+    return uri.removesuffix("latest.json")
+
+
+def _checkpoint_filename(
+    value: Any, *, field: str, suffix: str
+) -> str:
+    if (
+        not isinstance(value, str)
+        or _CHECKPOINT_FILENAME_PATTERN.fullmatch(value) is None
+        or Path(value).name != value
+        or not value.endswith(suffix)
+    ):
+        raise AwsLifecycleError(
+            f"checkpoint manifest has unsafe {field} filename"
+        )
+    return value
+
+
+def _checkpoint_hash(value: Any, *, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or _CHECKPOINT_HASH_PATTERN.fullmatch(value) is None
+    ):
+        raise AwsLifecycleError(
+            f"checkpoint manifest has invalid {field} hash"
+        )
+    return value
+
+
+def _resolved_all32_config(path: Path, phase: str) -> dict:
+    overrides = argparse.Namespace(
+        levels=None,
+        timesteps=None,
+        n_envs=None,
+        lr=None,
+        ent_coef=None,
+        level_weights_json=None,
+    )
+    try:
+        return training.load_training_config(
+            str(path), phase, overrides
+        )
+    except (OSError, TypeError, ValueError) as error:
+        raise AwsLifecycleError(
+            f"cannot resolve trusted all-32 training config {path}"
+        ) from error
+
+
+def _default_model_validator(path: Path, cfg: dict) -> None:
+    device = training.resolve_device(cfg["train"]["device"])
+    model = training.PPO.load(str(path), device=device)
+    training.validate_resume_model(
+        model, **training.compatibility_kwargs(cfg)
+    )
+
+
+def restore_checkpoint_bundle(
+    *,
+    config: AwsConfig,
+    phase: str,
+    checkpoint_s3_uri: str,
+    repo_dir: Path,
+    ledger_path: Path,
+    object_store: Any,
+    model_validator: Callable[[Path, dict], Any] = _default_model_validator,
+) -> ResumeBundle:
+    """Download and verify exactly one manifested generation before launch."""
+    if phase not in {"phase_1", "phase_2"}:
+        raise AwsLifecycleError(
+            "only phase_1 and phase_2 shared-policy checkpoints can resume"
+        )
+    object_prefix = _manifest_object_prefix(config, checkpoint_s3_uri)
+    staging_parent = Path(repo_dir) / ".resume"
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(prefix=f"{phase}-", dir=staging_parent)
+    )
+    try:
+        manifest_path = staging_root / "latest.json"
+        object_store.download(checkpoint_s3_uri, manifest_path)
+        if not manifest_path.is_file() or manifest_path.is_symlink():
+            raise AwsLifecycleError(
+                "checkpoint manifest download is not a regular file"
+            )
+        try:
+            manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise AwsLifecycleError(
+                "checkpoint manifest is not valid UTF-8 JSON"
+            ) from error
+        expected_fields = {
+            "schema_version",
+            "run_name",
+            "phase",
+            "num_timesteps",
+            "model",
+            "sha256",
+            "action_set",
+            "action_count",
+            "extractor",
+            "extractor_class",
+            "normalize_reward",
+            "vecnormalize",
+            "vecnormalize_sha256",
+            "signature",
+            "signature_sha256",
+            "run_config",
+            "run_config_sha256",
+            "budget_ledger",
+            "budget_ledger_sha256",
+        }
+        if not isinstance(manifest, dict) or set(manifest) != expected_fields:
+            raise AwsLifecycleError(
+                "checkpoint manifest has an invalid schema"
+            )
+        if (
+            manifest["schema_version"]
+            != _CHECKPOINT_MANIFEST_SCHEMA_VERSION
+            or manifest["phase"] != phase
+            or isinstance(manifest["num_timesteps"], bool)
+            or not isinstance(manifest["num_timesteps"], int)
+            or manifest["num_timesteps"] < 0
+            or not isinstance(manifest["run_name"], str)
+            or _CHECKPOINT_FILENAME_PATTERN.fullmatch(
+                manifest["run_name"]
+            )
+            is None
+        ):
+            raise AwsLifecycleError(
+                "checkpoint manifest identity does not match requested phase"
+            )
+        timestep = manifest["num_timesteps"]
+        model_name = _checkpoint_filename(
+            manifest["model"], field="model", suffix=".zip"
+        )
+        if model_name != f"ckpt_{timestep}_steps.zip":
+            raise AwsLifecycleError(
+                "checkpoint model filename does not match its timestep"
+            )
+        artifact_specs = [
+            ("model", "sha256", ".zip"),
+            ("run_config", "run_config_sha256", ".yaml"),
+            ("signature", "signature_sha256", ".json"),
+        ]
+        normalize_reward = manifest["normalize_reward"]
+        if not isinstance(normalize_reward, bool):
+            raise AwsLifecycleError(
+                "checkpoint normalization identity is invalid"
+            )
+        if normalize_reward:
+            artifact_specs.append(
+                ("vecnormalize", "vecnormalize_sha256", ".pkl")
+            )
+        elif (
+            manifest["vecnormalize"] is not None
+            or manifest["vecnormalize_sha256"] is not None
+        ):
+            raise AwsLifecycleError(
+                "unnormalized checkpoint names VecNormalize state"
+            )
+        artifact_specs.append(
+            ("budget_ledger", "budget_ledger_sha256", ".json")
+        )
+        expected_generation_names = {
+            "run_config": f"ckpt_run_config_{timestep}_steps.yaml",
+            "signature": f"ckpt_signature_{timestep}_steps.json",
+            "budget_ledger": (
+                f"ckpt_budget_ledger_{timestep}_steps.json"
+            ),
+        }
+        if normalize_reward:
+            expected_generation_names["vecnormalize"] = (
+                f"ckpt_vecnormalize_{timestep}_steps.pkl"
+            )
+        if any(
+            manifest[field] != expected_name
+            for field, expected_name in expected_generation_names.items()
+        ):
+            raise AwsLifecycleError(
+                "checkpoint sidecar filenames do not match the model timestep"
+            )
+        artifact_paths: dict[str, Path] = {}
+        seen_names: set[str] = set()
+        for field, hash_field, suffix in artifact_specs:
+            filename = _checkpoint_filename(
+                manifest[field], field=field, suffix=suffix
+            )
+            expected_hash = _checkpoint_hash(
+                manifest[hash_field], field=field
+            )
+            if filename in seen_names:
+                raise AwsLifecycleError(
+                    "checkpoint manifest reuses an artifact filename"
+                )
+            seen_names.add(filename)
+            destination = staging_root / filename
+            object_store.download(
+                f"{object_prefix}{filename}", destination
+            )
+            if not destination.is_file() or destination.is_symlink():
+                raise AwsLifecycleError(
+                    f"checkpoint {field} is not a regular file"
+                )
+            if training.sha256_file(destination) != expected_hash:
+                raise AwsLifecycleError(
+                    f"checkpoint {field} SHA-256 mismatch"
+                )
+            artifact_paths[field] = destination
+
+        try:
+            downloaded_config = yaml.safe_load(
+                artifact_paths["run_config"].read_text(encoding="utf-8")
+            )
+            signature = json.loads(
+                artifact_paths["signature"].read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, yaml.YAMLError, json.JSONDecodeError) as error:
+            raise AwsLifecycleError(
+                "checkpoint config or signature is malformed"
+            ) from error
+        if not isinstance(downloaded_config, dict) or not isinstance(
+            signature, dict
+        ):
+            raise AwsLifecycleError(
+                "checkpoint config and signature must be mappings"
+            )
+        trusted_config_path = (
+            Path(repo_dir) / "configs" / "all32.yaml"
+        )
+        if not trusted_config_path.is_file():
+            trusted_config_path = (
+                Path(__file__).resolve().parents[1]
+                / "configs"
+                / "all32.yaml"
+            )
+        trusted_config = _resolved_all32_config(
+            trusted_config_path, phase
+        )
+        expected_signature = training.checkpoint_resume_signature(
+            trusted_config, phase
+        )
+        if (
+            downloaded_config != trusted_config
+            or signature != expected_signature
+            or training.checkpoint_resume_signature(
+                downloaded_config, phase
+            )
+            != expected_signature
+            or manifest["action_set"]
+            != expected_signature["environment"]["action_set"]
+            or manifest["action_count"]
+            != expected_signature["environment"]["action_count"]
+            or manifest["extractor"]
+            != expected_signature["policy"]["extractor"]
+            or manifest["extractor_class"]
+            != expected_signature["policy"]["extractor_class"]
+            or normalize_reward
+            != expected_signature["normalization"]["normalize_reward"]
+        ):
+            raise AwsLifecycleError(
+                "checkpoint policy/environment/normalization signature "
+                "does not match the requested phase"
+            )
+        checkpoint_ledger = _configured_ledger(
+            artifact_paths["budget_ledger"], config
+        )
+        current_ledger = _configured_ledger(Path(ledger_path), config)
+        if checkpoint_ledger.spent_usd > current_ledger.spent_usd:
+            raise AwsLifecycleError(
+                "checkpoint budget snapshot is ahead of the authoritative "
+                "local ledger"
+            )
+        model_validator(artifact_paths["model"], trusted_config)
+        return ResumeBundle(
+            root=staging_root,
+            manifest_path=manifest_path,
+            model_path=artifact_paths["model"],
+            run_config_path=artifact_paths["run_config"],
+            signature_path=artifact_paths["signature"],
+            vecnormalize_path=artifact_paths.get("vecnormalize"),
+            budget_ledger_path=artifact_paths["budget_ledger"],
+            manifest=manifest,
+        )
+    except BaseException:
+        shutil.rmtree(staging_root)
+        raise
+
+
+def verify_resume_bundle(bundle: ResumeBundle) -> None:
+    """Re-authenticate staged bytes immediately before paid mutation."""
+    artifact_fields = [
+        ("model", "sha256", bundle.model_path),
+        (
+            "run_config",
+            "run_config_sha256",
+            bundle.run_config_path,
+        ),
+        (
+            "signature",
+            "signature_sha256",
+            bundle.signature_path,
+        ),
+        (
+            "budget_ledger",
+            "budget_ledger_sha256",
+            bundle.budget_ledger_path,
+        ),
+    ]
+    if bundle.vecnormalize_path is not None:
+        artifact_fields.append(
+            (
+                "vecnormalize",
+                "vecnormalize_sha256",
+                bundle.vecnormalize_path,
+            )
+        )
+    for name_field, hash_field, path in artifact_fields:
+        if (
+            bundle.manifest.get(name_field) != path.name
+            or not path.is_file()
+            or path.is_symlink()
+            or training.sha256_file(path)
+            != bundle.manifest.get(hash_field)
+        ):
+            raise AwsLifecycleError(
+                f"verified resume {name_field} changed before launch"
+            )
 
 
 @dataclass(frozen=True)
@@ -615,6 +1081,7 @@ class SshRemoteSupervisor:
         phase: str,
         max_seconds: int,
         s3_prefix: str,
+        train_args: tuple[str, ...] = (),
         on_tick: Callable[[], None] | None = None,
         absolute_deadline: Decimal | None = None,
     ) -> None:
@@ -634,6 +1101,18 @@ class SshRemoteSupervisor:
             or re.fullmatch(r"s3://[^/]+/.+/", s3_prefix) is None
         ):
             raise AwsLifecycleError("S3 prefix is invalid")
+        if (
+            not isinstance(train_args, tuple)
+            or not all(
+                isinstance(argument, str)
+                and argument
+                and "\0" not in argument
+                for argument in train_args
+            )
+        ):
+            raise AwsLifecycleError(
+                "training arguments must be a tuple of non-empty strings"
+            )
         target = f"{self.user}@{host}"
         self._wait_for_ssh(
             target,
@@ -770,6 +1249,7 @@ aws sts get-caller-identity --output json >/dev/null
             str(remaining_seconds),
             self.remote_repo,
             s3_prefix,
+            *train_args,
         ]
         self._run_remote_command(
             [
@@ -1051,7 +1531,11 @@ class AwsOrchestrator:
         )
 
     def launch_guarded_instance(
-        self, phase: str, max_hours: Decimal
+        self,
+        phase: str,
+        max_hours: Decimal,
+        *,
+        before_mutation: Callable[[], None] | None = None,
     ) -> LaunchedInstance:
         """Launch one allowed Spot instance after the conservative budget gate."""
         if (
@@ -1187,6 +1671,8 @@ class AwsOrchestrator:
                 "active MarioAI-All32 instance appeared before mutation"
             )
         self._require_fresh_preflight()
+        if before_mutation is not None:
+            before_mutation()
         reservation = LaunchReservation(
             client_token=client_token,
             state="reserved",
@@ -1922,6 +2408,25 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(__file__).resolve().parents[1],
     )
+    resume = subparsers.add_parser(
+        "resume",
+        help="verify one exact manifested checkpoint, then launch guarded Spot",
+    )
+    resume.add_argument("--config", required=True, type=Path)
+    resume.add_argument("--ledger", required=True, type=Path)
+    resume.add_argument(
+        "--phase", required=True, choices=("phase_1", "phase_2")
+    )
+    resume.add_argument(
+        "--max-hours", required=True, type=_positive_decimal_argument
+    )
+    resume.add_argument("--ssh-key", type=Path)
+    resume.add_argument(
+        "--repo-dir",
+        type=Path,
+        default=Path(__file__).resolve().parents[1],
+    )
+    resume.add_argument("--checkpoint-s3-uri", required=True)
 
     status = subparsers.add_parser(
         "status", help="show Project=MarioAI-All32 instance state"
@@ -2125,6 +2630,49 @@ def _terminal_target_confirmed(aws: Any, instance_id: str) -> bool:
     return second[0].get("state") == "terminated"
 
 
+def _resume_training_args(
+    bundle: ResumeBundle, repo_dir: Path
+) -> tuple[str, ...]:
+    repo_root = Path(repo_dir).resolve()
+
+    def relative(path: Path) -> str:
+        try:
+            return path.resolve(strict=True).relative_to(repo_root).as_posix()
+        except (OSError, ValueError) as error:
+            raise AwsLifecycleError(
+                "verified resume artifact escaped the repository"
+            ) from error
+
+    run_name = bundle.manifest.get("run_name")
+    if (
+        not isinstance(run_name, str)
+        or _CHECKPOINT_FILENAME_PATTERN.fullmatch(run_name) is None
+    ):
+        raise AwsLifecycleError("verified resume bundle has unsafe run name")
+    arguments = [
+        "--config",
+        "configs/all32.yaml",
+        "--run-name",
+        run_name,
+        "--resume",
+        relative(bundle.model_path),
+    ]
+    if bundle.vecnormalize_path is not None:
+        arguments.extend(
+            [
+                "--resume-vecnormalize",
+                relative(bundle.vecnormalize_path),
+            ]
+        )
+    arguments.extend(
+        [
+            "--budget-ledger-snapshot",
+            relative(bundle.budget_ledger_path),
+        ]
+    )
+    return tuple(arguments)
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -2137,6 +2685,7 @@ def main(
     sleeper: Callable[[float], None] = time.sleep,
     client_token_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
     wall_clock: Callable[[], float] = time.time,
+    checkpoint_store: Any = None,
 ) -> int:
     """Dispatch one explicit lifecycle command."""
     args = build_parser().parse_args(argv)
@@ -2156,6 +2705,24 @@ def main(
         )
     else:
         aws = aws_override
+
+    resume_bundle: ResumeBundle | None = None
+    if args.command == "resume":
+        selected_store = checkpoint_store
+        if selected_store is None:
+            selected_store = S3CheckpointStore(
+                profile=config.profile,
+                region=config.region,
+                runner=runner,
+            )
+        resume_bundle = restore_checkpoint_bundle(
+            config=config,
+            phase=args.phase,
+            checkpoint_s3_uri=args.checkpoint_s3_uri,
+            repo_dir=args.repo_dir,
+            ledger_path=args.ledger,
+            object_store=selected_store,
+        )
 
     if args.command == "preflight":
         _write_json(output, asdict(aws.preflight(config)))
@@ -2288,7 +2855,7 @@ def main(
                 },
             )
         return 0
-    if args.command == "launch":
+    if args.command in {"launch", "resume"}:
         with LaunchStateStore(
             args.ledger, wall_clock=wall_clock
         ) as reservation_store:
@@ -2329,7 +2896,15 @@ def main(
                     "active MarioAI-All32 instance exists; run reconcile"
                 )
             instance = orchestrator.launch_guarded_instance(
-                args.phase, args.max_hours
+                args.phase,
+                args.max_hours,
+                before_mutation=(
+                    (
+                        lambda: verify_resume_bundle(resume_bundle)
+                    )
+                    if resume_bundle is not None
+                    else None
+                ),
             )
             max_seconds = int(
                 (args.max_hours * _SECONDS_PER_HOUR).to_integral_value(
@@ -2341,22 +2916,26 @@ def main(
                 instance = orchestrator.wait_for_running_public_ip(
                     instance, ledger_path=args.ledger
                 )
-                selected_remote.start(
-                    instance,
-                    phase=args.phase,
-                    max_seconds=max_seconds,
-                    s3_prefix=config.s3_prefix,
-                    on_tick=lambda: orchestrator._paid_tick(
+                start_kwargs = {
+                    "phase": args.phase,
+                    "max_seconds": max_seconds,
+                    "s3_prefix": config.s3_prefix,
+                    "on_tick": lambda: orchestrator._paid_tick(
                         instance,
                         args.ledger,
                         absolute_deadline=orchestrator.training_deadline(
                             instance
                         ),
                     ),
-                    absolute_deadline=orchestrator.training_deadline(
+                    "absolute_deadline": orchestrator.training_deadline(
                         instance
                     ),
-                )
+                }
+                if resume_bundle is not None:
+                    start_kwargs["train_args"] = _resume_training_args(
+                        resume_bundle, args.repo_dir
+                    )
+                selected_remote.start(instance, **start_kwargs)
             except BaseException as start_error:
                 try:
                     orchestrator.terminate_and_settle(

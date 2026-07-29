@@ -99,6 +99,8 @@ def _run_all32_pipeline_smoke(tmp_path, monkeypatch):
             str(config_path),
             "--resume",
             str(first_model_path),
+            "--timesteps",
+            "128",
             "--run-name",
             "all32-smoke-resumed",
         ]

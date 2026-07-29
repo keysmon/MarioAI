@@ -4,6 +4,7 @@ import base64
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import hashlib
 import io
 import json
 import os
@@ -12,7 +13,9 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
+import marioai.train as training
 from marioai.aws import (
     AwsCli,
     AwsCliError,
@@ -271,6 +274,7 @@ class FakeRemote:
         self.poll_times: list[float] = []
         self.clock = clock
         self.started: list[tuple[str, str, int, str]] = []
+        self.training_args: list[tuple[str, ...]] = []
         self.start_error: BaseException | None = None
 
     def start(
@@ -280,6 +284,7 @@ class FakeRemote:
         phase: str,
         max_seconds: int,
         s3_prefix: str,
+        train_args=(),
         on_tick=None,
         absolute_deadline=None,
     ) -> None:
@@ -289,6 +294,7 @@ class FakeRemote:
         self.started.append(
             (instance.instance_id, phase, max_seconds, s3_prefix)
         )
+        self.training_args.append(tuple(train_args))
 
     def poll(self, instance) -> SimpleNamespace:
         if self.clock is not None:
@@ -1635,6 +1641,22 @@ def test_mutation_adapter_requires_exact_budget_authorized_shutdown_delay(
             "benchmark",
             "--max-hours",
             "1.0",
+        ],
+        [
+            "resume",
+            "--config",
+            str(CONFIG_PATH),
+            "--ledger",
+            "reports/aws-spend.json",
+            "--phase",
+            "phase_1",
+            "--max-hours",
+            "1.0",
+            "--checkpoint-s3-uri",
+            (
+                "s3://defectlens-phase3-002559670021/marioai/all32/"
+                "models/all32-phase_1/latest.json"
+            ),
         ],
         ["status", "--config", str(CONFIG_PATH)],
         [
@@ -3306,6 +3328,7 @@ def test_cloud_supervisor_syncs_and_shuts_down_after_training_and_sync_failures(
         (
             f"{command_dir / 'aws'}\ts3\tsync\t{repository}/models/"
             "\ts3://bucket/marioai/all32/models/"
+            "\t--exclude\t*/latest.json"
         ),
         (
             f"{command_dir / 'aws'}\ts3\tsync\t{repository}/reports/"
@@ -3341,3 +3364,599 @@ def test_cloud_supervisor_rejects_invalid_arguments_before_training(tmp_path):
     assert completed.returncode != 0
     assert "maximum seconds" in completed.stderr
     assert not command_log.exists()
+
+
+def test_cloud_supervisor_periodically_syncs_artifacts_then_manifest_and_final(
+    tmp_path,
+):
+    """Catches missing 15-minute cadence or publishing latest before artifacts."""
+    command_dir = tmp_path / "bin"
+    command_dir.mkdir()
+    command_log = tmp_path / "commands.log"
+    repository = tmp_path / "MarioAI"
+    checkpoint_dir = repository / "models" / "all32-phase_1"
+    checkpoint_dir.mkdir(parents=True)
+    (checkpoint_dir / "ckpt_250000_steps.zip").write_bytes(b"model")
+    (checkpoint_dir / "latest.json").write_text(
+        '{"model":"ckpt_250000_steps.zip"}\n', encoding="utf-8"
+    )
+    (repository / "reports").mkdir()
+    logger = (
+        'printf "%s" "$0" >> "$COMMAND_LOG"\n'
+        'for argument in "$@"; do '
+        'printf "\\t%s" "$argument" >> "$COMMAND_LOG"; done\n'
+        'printf "\\n" >> "$COMMAND_LOG"\n'
+    )
+    _fake_executable(
+        command_dir / "timeout",
+        logger + "sleep 2\nexit 7\n",
+    )
+    _fake_executable(command_dir / "aws", logger + "exit 0\n")
+    _fake_executable(command_dir / "sudo", logger + "exit 0\n")
+    environment = {
+        **os.environ,
+        "PATH": f"{command_dir}:{os.environ['PATH']}",
+        "COMMAND_LOG": str(command_log),
+        "MARIOAI_SYNC_INTERVAL_SECONDS": "1",
+    }
+
+    completed = subprocess.run(
+        [
+            "bash",
+            str(CLOUD_TRAIN_PATH),
+            "phase_1",
+            "120",
+            str(repository),
+            "s3://bucket/marioai/all32/",
+            "--run-name",
+            "all32-phase_1",
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        env=environment,
+    )
+
+    assert completed.returncode == 7
+    aws_calls = [
+        line
+        for line in command_log.read_text(encoding="utf-8").splitlines()
+        if line.startswith(str(command_dir / "aws"))
+    ]
+    model_sync_indexes = [
+        index
+        for index, line in enumerate(aws_calls)
+        if "\ts3\tsync\t" in line and "/models/" in line
+    ]
+    manifest_copy_indexes = [
+        index
+        for index, line in enumerate(aws_calls)
+        if "\ts3\tcp\t" in line and line.endswith(
+            "\ts3://bucket/marioai/all32/models/"
+            "all32-phase_1/latest.json\t--only-show-errors"
+        )
+    ]
+    assert len(model_sync_indexes) >= 2
+    assert len(manifest_copy_indexes) >= 2
+    assert all(
+        sync_index < copy_index
+        for sync_index, copy_index in zip(
+            model_sync_indexes, manifest_copy_indexes, strict=True
+        )
+    )
+
+
+def test_restore_downloads_only_exact_manifest_named_bundle(config, tmp_path):
+    """Catches wildcard/latest guessing or downloading unmanifested S3 objects."""
+    from scripts import aws_all32
+
+    phase = "phase_1"
+    run_name = "all32-phase_1"
+    manifest_uri = (
+        f"{config.s3_prefix}models/{run_name}/latest.json"
+    )
+    artifact_prefix = manifest_uri.removesuffix("latest.json")
+    overrides = SimpleNamespace(
+        levels=None,
+        timesteps=None,
+        n_envs=None,
+        lr=None,
+        ent_coef=None,
+        level_weights_json=None,
+    )
+    run_config = training.load_training_config(
+        "configs/all32.yaml", phase, overrides
+    )
+    signature = training.checkpoint_resume_signature(run_config, phase)
+    artifacts = {
+        "ckpt_250000_steps.zip": b"verified checkpoint",
+        "ckpt_vecnormalize_250000_steps.pkl": b"paired normalization",
+        "ckpt_signature_250000_steps.json": (
+            json.dumps(signature, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode(),
+        "ckpt_run_config_250000_steps.yaml": yaml.safe_dump(
+            run_config, sort_keys=False
+        ).encode(),
+        "ckpt_budget_ledger_250000_steps.json": (
+            json.dumps(
+                {
+                    "allocations": {
+                        name: str(amount)
+                        for name, amount in config.allocations.items()
+                    },
+                    "cap_usd": str(config.cap_usd),
+                    "runs": [],
+                    "spent_usd": "0",
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode(),
+    }
+    manifest = {
+        "schema_version": 1,
+        "run_name": run_name,
+        "phase": phase,
+        "num_timesteps": 250000,
+        "model": "ckpt_250000_steps.zip",
+        "sha256": hashlib.sha256(
+            artifacts["ckpt_250000_steps.zip"]
+        ).hexdigest(),
+        "action_set": "complex",
+        "action_count": 12,
+        "extractor": "impala",
+        "extractor_class": (
+            "marioai.features.ImpalaCnnFeaturesExtractor"
+        ),
+        "normalize_reward": True,
+        "vecnormalize": "ckpt_vecnormalize_250000_steps.pkl",
+        "vecnormalize_sha256": hashlib.sha256(
+            artifacts["ckpt_vecnormalize_250000_steps.pkl"]
+        ).hexdigest(),
+        "signature": "ckpt_signature_250000_steps.json",
+        "signature_sha256": hashlib.sha256(
+            artifacts["ckpt_signature_250000_steps.json"]
+        ).hexdigest(),
+        "run_config": "ckpt_run_config_250000_steps.yaml",
+        "run_config_sha256": hashlib.sha256(
+            artifacts["ckpt_run_config_250000_steps.yaml"]
+        ).hexdigest(),
+        "budget_ledger": "ckpt_budget_ledger_250000_steps.json",
+        "budget_ledger_sha256": hashlib.sha256(
+            artifacts["ckpt_budget_ledger_250000_steps.json"]
+        ).hexdigest(),
+    }
+    objects = {
+        manifest_uri: (
+            json.dumps(manifest, sort_keys=True) + "\n"
+        ).encode(),
+        **{
+            f"{artifact_prefix}{name}": content
+            for name, content in artifacts.items()
+        },
+        f"{artifact_prefix}untrusted.zip": b"must not download",
+    }
+
+    class FakeCheckpointStore:
+        def __init__(self):
+            self.downloads = []
+
+        def download(self, uri, destination):
+            self.downloads.append(uri)
+            Path(destination).write_bytes(objects[uri])
+
+    store = FakeCheckpointStore()
+    ledger_path = tmp_path / "aws-spend.json"
+    BudgetLedger(
+        cap_usd=config.cap_usd, allocations=config.allocations
+    ).save(ledger_path)
+
+    bundle = aws_all32.restore_checkpoint_bundle(
+        config=config,
+        phase=phase,
+        checkpoint_s3_uri=manifest_uri,
+        repo_dir=tmp_path,
+        ledger_path=ledger_path,
+        object_store=store,
+        model_validator=lambda path, cfg: (
+            path.name,
+            cfg["env"]["action_set"],
+        ),
+    )
+
+    assert bundle.model_path.name == manifest["model"]
+    assert training.sha256_file(bundle.model_path) == manifest["sha256"]
+    assert store.downloads == [
+        manifest_uri,
+        *[
+            f"{artifact_prefix}{manifest[field]}"
+            for field in (
+                "model",
+                "run_config",
+                "signature",
+                "vecnormalize",
+                "budget_ledger",
+            )
+        ],
+    ]
+
+
+def test_cli_resume_verifies_before_paid_launch_and_passes_exact_paths(
+    config, tmp_path, monkeypatch
+):
+    """Catches launching first or letting remote training guess resume files."""
+    from scripts import aws_all32
+
+    staging = tmp_path / ".resume" / "phase_1-test"
+    staging.mkdir(parents=True)
+    paths = {
+        name: staging / filename
+        for name, filename in {
+            "manifest": "latest.json",
+            "model": "ckpt_250000_steps.zip",
+            "run_config": "ckpt_run_config_250000_steps.yaml",
+            "signature": "ckpt_signature_250000_steps.json",
+            "vecnormalize": "ckpt_vecnormalize_250000_steps.pkl",
+            "budget_ledger": "ckpt_budget_ledger_250000_steps.json",
+        }.items()
+    }
+    for path in paths.values():
+        path.write_bytes(b"test")
+    bundle = aws_all32.ResumeBundle(
+        root=staging,
+        manifest_path=paths["manifest"],
+        model_path=paths["model"],
+        run_config_path=paths["run_config"],
+        signature_path=paths["signature"],
+        vecnormalize_path=paths["vecnormalize"],
+        budget_ledger_path=paths["budget_ledger"],
+        manifest={
+            "run_name": "all32-phase_1",
+            "model": paths["model"].name,
+            "sha256": hashlib.sha256(b"test").hexdigest(),
+            "run_config": paths["run_config"].name,
+            "run_config_sha256": hashlib.sha256(b"test").hexdigest(),
+            "signature": paths["signature"].name,
+            "signature_sha256": hashlib.sha256(b"test").hexdigest(),
+            "vecnormalize": paths["vecnormalize"].name,
+            "vecnormalize_sha256": hashlib.sha256(b"test").hexdigest(),
+            "budget_ledger": paths["budget_ledger"].name,
+            "budget_ledger_sha256": hashlib.sha256(b"test").hexdigest(),
+        },
+    )
+    clock = FakeMonotonic()
+    aws = FakeLifecycleAws(config)
+    remote = FakeRemote(clock)
+    restore_events = []
+
+    def fake_restore(**kwargs):
+        assert not aws.run_instances_called
+        restore_events.append(kwargs["checkpoint_s3_uri"])
+        return bundle
+
+    monkeypatch.setattr(
+        aws_all32, "restore_checkpoint_bundle", fake_restore
+    )
+    ledger_path = tmp_path / "aws-spend.json"
+
+    result = aws_all32.main(
+        [
+            "resume",
+            "--config",
+            str(CONFIG_PATH),
+            "--ledger",
+            str(ledger_path),
+            "--phase",
+            "phase_1",
+            "--max-hours",
+            "1",
+            "--repo-dir",
+            str(tmp_path),
+            "--checkpoint-s3-uri",
+            (
+                f"{config.s3_prefix}models/all32-phase_1/latest.json"
+            ),
+        ],
+        stdout=io.StringIO(),
+        aws_override=aws,
+        remote=remote,
+        checkpoint_store=object(),
+        monotonic=clock,
+        sleeper=lambda _seconds: None,
+        client_token_factory=lambda: "resume-idempotency-token",
+    )
+
+    assert result == 0
+    assert restore_events == [
+        f"{config.s3_prefix}models/all32-phase_1/latest.json"
+    ]
+    assert remote.training_args == [
+        (
+            "--config",
+            "configs/all32.yaml",
+            "--run-name",
+            "all32-phase_1",
+            "--resume",
+            ".resume/phase_1-test/ckpt_250000_steps.zip",
+            "--resume-vecnormalize",
+            (
+                ".resume/phase_1-test/"
+                "ckpt_vecnormalize_250000_steps.pkl"
+            ),
+            "--budget-ledger-snapshot",
+            (
+                ".resume/phase_1-test/"
+                "ckpt_budget_ledger_250000_steps.json"
+            ),
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "manifest_uri",
+    [
+        "s3://other-bucket/marioai/all32/run/latest.json",
+        (
+            "s3://defectlens-phase3-002559670021/"
+            "outside/all32/run/latest.json"
+        ),
+        (
+            "s3://defectlens-phase3-002559670021/marioai/all32/"
+            "%2e%2e/run/latest.json"
+        ),
+        (
+            "s3://defectlens-phase3-002559670021/marioai/all32/"
+            "run/not-latest.json"
+        ),
+    ],
+)
+def test_restore_rejects_unconfined_manifest_before_download(
+    config, tmp_path, manifest_uri
+):
+    """Catches reading attacker-selected objects outside the approved prefix."""
+    from scripts.aws_all32 import (
+        AwsLifecycleError,
+        restore_checkpoint_bundle,
+    )
+
+    class NoDownload:
+        def download(self, _uri, _destination):
+            raise AssertionError("unconfined URI reached the S3 boundary")
+
+    with pytest.raises(AwsLifecycleError, match="S3|prefix"):
+        restore_checkpoint_bundle(
+            config=config,
+            phase="phase_1",
+            checkpoint_s3_uri=manifest_uri,
+            repo_dir=tmp_path,
+            ledger_path=tmp_path / "ledger.json",
+            object_store=NoDownload(),
+            model_validator=lambda _path, _cfg: None,
+        )
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "../ckpt_250000_steps.zip",
+        "/tmp/ckpt_250000_steps.zip",
+        "nested/ckpt_250000_steps.zip",
+        r"..\ckpt_250000_steps.zip",
+        "%2e%2e.zip",
+    ],
+)
+def test_restore_rejects_untrusted_artifact_name_without_fetching_it(
+    config, tmp_path, model_name
+):
+    """Catches path traversal and S3-prefix escape through manifest filenames."""
+    from scripts.aws_all32 import (
+        AwsLifecycleError,
+        restore_checkpoint_bundle,
+    )
+
+    uri = f"{config.s3_prefix}models/run/latest.json"
+    manifest = {
+        "schema_version": 1,
+        "run_name": "run",
+        "phase": "phase_1",
+        "num_timesteps": 250000,
+        "model": model_name,
+        "sha256": "0" * 64,
+        "action_set": "complex",
+        "action_count": 12,
+        "extractor": "impala",
+        "extractor_class": (
+            "marioai.features.ImpalaCnnFeaturesExtractor"
+        ),
+        "normalize_reward": True,
+        "vecnormalize": "ckpt_vecnormalize_250000_steps.pkl",
+        "vecnormalize_sha256": "0" * 64,
+        "signature": "ckpt_signature_250000_steps.json",
+        "signature_sha256": "0" * 64,
+        "run_config": "ckpt_run_config_250000_steps.yaml",
+        "run_config_sha256": "0" * 64,
+        "budget_ledger": "ckpt_budget_ledger_250000_steps.json",
+        "budget_ledger_sha256": "0" * 64,
+    }
+
+    class ManifestOnlyStore:
+        def __init__(self):
+            self.downloads = []
+
+        def download(self, object_uri, destination):
+            self.downloads.append(object_uri)
+            if object_uri != uri:
+                raise AssertionError("unsafe artifact was fetched")
+            Path(destination).write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+
+    store = ManifestOnlyStore()
+    with pytest.raises(AwsLifecycleError, match="filename"):
+        restore_checkpoint_bundle(
+            config=config,
+            phase="phase_1",
+            checkpoint_s3_uri=uri,
+            repo_dir=tmp_path,
+            ledger_path=tmp_path / "ledger.json",
+            object_store=store,
+            model_validator=lambda _path, _cfg: None,
+        )
+    assert store.downloads == [uri]
+
+
+def test_restore_rejects_hash_mismatch_before_model_deserialization(
+    config, tmp_path
+):
+    """Catches trusting a manifest filename without authenticating its bytes."""
+    from scripts.aws_all32 import (
+        AwsLifecycleError,
+        restore_checkpoint_bundle,
+    )
+
+    uri = f"{config.s3_prefix}models/run/latest.json"
+    manifest = {
+        "schema_version": 1,
+        "run_name": "run",
+        "phase": "phase_1",
+        "num_timesteps": 250000,
+        "model": "ckpt_250000_steps.zip",
+        "sha256": "0" * 64,
+        "action_set": "complex",
+        "action_count": 12,
+        "extractor": "impala",
+        "extractor_class": (
+            "marioai.features.ImpalaCnnFeaturesExtractor"
+        ),
+        "normalize_reward": True,
+        "vecnormalize": "ckpt_vecnormalize_250000_steps.pkl",
+        "vecnormalize_sha256": "0" * 64,
+        "signature": "ckpt_signature_250000_steps.json",
+        "signature_sha256": "0" * 64,
+        "run_config": "ckpt_run_config_250000_steps.yaml",
+        "run_config_sha256": "0" * 64,
+        "budget_ledger": "ckpt_budget_ledger_250000_steps.json",
+        "budget_ledger_sha256": "0" * 64,
+    }
+    model_validator_called = False
+
+    class TamperedStore:
+        def download(self, object_uri, destination):
+            if object_uri == uri:
+                Path(destination).write_text(
+                    json.dumps(manifest), encoding="utf-8"
+                )
+            else:
+                Path(destination).write_bytes(b"tampered")
+
+    def validate_model(_path, _cfg):
+        nonlocal model_validator_called
+        model_validator_called = True
+
+    with pytest.raises(AwsLifecycleError, match="SHA-256"):
+        restore_checkpoint_bundle(
+            config=config,
+            phase="phase_1",
+            checkpoint_s3_uri=uri,
+            repo_dir=tmp_path,
+            ledger_path=tmp_path / "ledger.json",
+            object_store=TamperedStore(),
+            model_validator=validate_model,
+        )
+    assert not model_validator_called
+
+
+def test_resume_rehash_failure_at_mutation_boundary_prevents_launch(
+    orchestrator, tmp_path
+):
+    """Catches a verified checkpoint being swapped during final AWS preflight."""
+    from scripts.aws_all32 import (
+        AwsLifecycleError,
+        ResumeBundle,
+        verify_resume_bundle,
+    )
+
+    artifact_names = {
+        "model": "ckpt_250000_steps.zip",
+        "run_config": "ckpt_run_config_250000_steps.yaml",
+        "signature": "ckpt_signature_250000_steps.json",
+        "budget_ledger": "ckpt_budget_ledger_250000_steps.json",
+    }
+    paths = {}
+    manifest = {"run_name": "all32-phase_1"}
+    for field, filename in artifact_names.items():
+        path = tmp_path / filename
+        path.write_bytes(b"verified")
+        paths[field] = path
+        manifest[field] = filename
+        manifest[
+            "sha256" if field == "model" else f"{field}_sha256"
+        ] = hashlib.sha256(b"verified").hexdigest()
+    manifest_path = tmp_path / "latest.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+    bundle = ResumeBundle(
+        root=tmp_path,
+        manifest_path=manifest_path,
+        model_path=paths["model"],
+        run_config_path=paths["run_config"],
+        signature_path=paths["signature"],
+        vecnormalize_path=None,
+        budget_ledger_path=paths["budget_ledger"],
+        manifest=manifest,
+    )
+
+    def recheck_after_swap():
+        paths["model"].write_bytes(b"swapped")
+        verify_resume_bundle(bundle)
+
+    with pytest.raises(AwsLifecycleError, match="model changed"):
+        orchestrator.launch_guarded_instance(
+            "phase_1",
+            Decimal("1"),
+            before_mutation=recheck_after_swap,
+        )
+    assert not orchestrator.aws.run_instances_called
+
+
+def test_s3_checkpoint_store_uses_one_fixed_read_only_argument_vector(
+    config, tmp_path
+):
+    """Catches shell interpolation, wildcard sync, or profile/region override."""
+    from scripts.aws_all32 import S3CheckpointStore
+
+    calls = []
+
+    def runner(command, **kwargs):
+        calls.append((command, kwargs))
+        Path(command[4]).write_bytes(b"manifest")
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    store = S3CheckpointStore(
+        profile=config.profile,
+        region=config.region,
+        runner=runner,
+    )
+    destination = tmp_path / "latest.json"
+    uri = f"{config.s3_prefix}models/run/latest.json"
+
+    store.download(uri, destination)
+
+    assert destination.read_bytes() == b"manifest"
+    command, kwargs = calls[0]
+    assert command[:4] == ["aws", "s3", "cp", uri]
+    assert command[5:] == [
+        "--only-show-errors",
+        "--no-progress",
+        "--profile",
+        config.profile,
+        "--region",
+        config.region,
+    ]
+    assert kwargs == {
+        "check": True,
+        "text": True,
+        "capture_output": True,
+        "timeout": 60,
+    }

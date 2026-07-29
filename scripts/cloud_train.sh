@@ -28,18 +28,76 @@ if [[ ! "$S3_PREFIX" =~ ^s3://[^/]+/.+/$ ]]; then
   echo "S3 prefix must name a bucket prefix ending in /" >&2
   exit 64
 fi
+SYNC_INTERVAL_SECONDS=${MARIOAI_SYNC_INTERVAL_SECONDS:-900}
+if [[ ! "$SYNC_INTERVAL_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "sync interval must be a positive integer" >&2
+  exit 64
+fi
+
+sync_checkpoints() {
+  local snapshot_dir
+  local manifest
+  local relative
+  local status=0
+  snapshot_dir=$(mktemp -d)
+  while IFS= read -r -d '' manifest; do
+    relative=${manifest#"$REPO_DIR/models/"}
+    mkdir -p "$snapshot_dir/$(dirname "$relative")"
+    cp -- "$manifest" "$snapshot_dir/$relative"
+  done < <(find "$REPO_DIR/models" -type f -name latest.json -print0)
+
+  aws s3 sync "$REPO_DIR/models/" "${S3_PREFIX}models/" \
+    --exclude "*/latest.json" || status=$?
+  while IFS= read -r -d '' manifest; do
+    relative=${manifest#"$snapshot_dir/"}
+    aws s3 cp "$manifest" "${S3_PREFIX}models/${relative}" \
+      --only-show-errors || status=$?
+  done < <(find "$snapshot_dir" -type f -name latest.json -print0)
+  rm -rf "$snapshot_dir"
+  return "$status"
+}
+
+sync_all() {
+  local status=0
+  sync_checkpoints || status=$?
+  aws s3 sync "$REPO_DIR/reports/" "${S3_PREFIX}reports/" || status=$?
+  return "$status"
+}
+
+periodic_sync() {
+  local timer_pid=
+  trap '
+    if [[ -n "$timer_pid" ]]; then
+      kill "$timer_pid" 2>/dev/null
+      wait "$timer_pid" 2>/dev/null
+    fi
+    exit 0
+  ' INT TERM
+  while true; do
+    sleep "$SYNC_INTERVAL_SECONDS" &
+    timer_pid=$!
+    wait "$timer_pid" || exit 0
+    timer_pid=
+    sync_all || true
+  done
+}
 
 finish() {
   local status=$?
   trap - EXIT INT TERM
   set +e
-  aws s3 sync "$REPO_DIR/models/" "${S3_PREFIX}models/"
-  aws s3 sync "$REPO_DIR/reports/" "${S3_PREFIX}reports/"
+  if [[ -n "${SYNC_PID:-}" ]]; then
+    kill "$SYNC_PID" 2>/dev/null
+    wait "$SYNC_PID" 2>/dev/null
+  fi
+  sync_all
   sudo shutdown -h now
   exit "$status"
 }
 trap finish EXIT INT TERM
 
 cd "$REPO_DIR" || exit 1
+periodic_sync &
+SYNC_PID=$!
 timeout --signal=TERM --kill-after=300 "$MAX_SECONDS" \
   .venv/bin/python -m marioai.train --phase "$PHASE" "$@"
