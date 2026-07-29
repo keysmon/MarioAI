@@ -46,13 +46,16 @@ sync_checkpoints() {
     cp -- "$manifest" "$snapshot_dir/$relative"
   done < <(find "$REPO_DIR/models" -type f -name latest.json -print0)
 
-  aws s3 sync "$REPO_DIR/models/" "${S3_PREFIX}models/" \
-    --exclude "*/latest.json" || status=$?
-  while IFS= read -r -d '' manifest; do
-    relative=${manifest#"$snapshot_dir/"}
-    aws s3 cp "$manifest" "${S3_PREFIX}models/${relative}" \
-      --only-show-errors || status=$?
-  done < <(find "$snapshot_dir" -type f -name latest.json -print0)
+  if aws s3 sync "$REPO_DIR/models/" "${S3_PREFIX}models/" \
+    --exclude "*/latest.json"; then
+    while IFS= read -r -d '' manifest; do
+      relative=${manifest#"$snapshot_dir/"}
+      aws s3 cp "$manifest" "${S3_PREFIX}models/${relative}" \
+        --only-show-errors || status=$?
+    done < <(find "$snapshot_dir" -type f -name latest.json -print0)
+  else
+    status=$?
+  fi
   rm -rf "$snapshot_dir"
   return "$status"
 }

@@ -12,8 +12,11 @@ from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 
+import gymnasium as gym
+import numpy as np
 import pytest
 import yaml
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 import marioai.train as training
 from marioai.aws import (
@@ -24,7 +27,7 @@ from marioai.aws import (
     PreflightResult,
     SpotOffer,
 )
-from marioai.budget import BudgetExceeded, BudgetLedger
+from marioai.budget import BudgetExceeded, BudgetLedger, CostedRun
 from scripts.aws_all32 import AwsLifecycleError, AwsOrchestrator
 
 
@@ -3267,6 +3270,200 @@ def _fake_executable(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
+def _vecnormalize_bytes(
+    tmp_path: Path, *, clip_reward: float = 10.0
+) -> bytes:
+    """Return a real all-32 VecNormalize sidecar without creating Mario."""
+
+    class SpaceEnv(gym.Env):
+        observation_space = gym.spaces.Box(
+            0, 255, shape=(4, 84, 84), dtype=np.uint8
+        )
+        action_space = gym.spaces.Discrete(12)
+
+        def reset(self, *, seed=None, options=None):
+            super().reset(seed=seed)
+            return np.zeros(
+                self.observation_space.shape, dtype=np.uint8
+            ), {}
+
+        def step(self, _action):
+            return (
+                np.zeros(self.observation_space.shape, dtype=np.uint8),
+                0.0,
+                False,
+                False,
+                {},
+            )
+
+    sidecar_path = tmp_path / f"vec-{clip_reward}.pkl"
+    vecnormalize = VecNormalize(
+        DummyVecEnv([lambda: SpaceEnv()]),
+        norm_obs=False,
+        norm_reward=True,
+        clip_obs=10.0,
+        clip_reward=clip_reward,
+        gamma=0.99,
+        epsilon=1e-8,
+    )
+    try:
+        vecnormalize.save(sidecar_path)
+        return sidecar_path.read_bytes()
+    finally:
+        vecnormalize.close()
+
+
+def _checkpoint_objects(
+    config: AwsConfig,
+    tmp_path: Path,
+    *,
+    vecnormalize_bytes: bytes | None = None,
+) -> tuple[str, dict[str, bytes], dict[str, object]]:
+    phase = "phase_1"
+    manifest_uri = (
+        f"{config.s3_prefix}models/all32-phase_1/latest.json"
+    )
+    overrides = SimpleNamespace(
+        levels=None,
+        timesteps=None,
+        n_envs=None,
+        lr=None,
+        ent_coef=None,
+        level_weights_json=None,
+    )
+    run_config = training.load_training_config(
+        "configs/all32.yaml", phase, overrides
+    )
+    signature = training.checkpoint_resume_signature(run_config, phase)
+    artifacts = {
+        "ckpt_250000_steps.zip": b"verified checkpoint",
+        "ckpt_vecnormalize_250000_steps.pkl": (
+            vecnormalize_bytes
+            if vecnormalize_bytes is not None
+            else _vecnormalize_bytes(tmp_path)
+        ),
+        "ckpt_signature_250000_steps.json": (
+            json.dumps(signature, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode(),
+        "ckpt_run_config_250000_steps.yaml": yaml.safe_dump(
+            run_config, sort_keys=False
+        ).encode(),
+        "ckpt_budget_ledger_250000_steps.json": (
+            json.dumps(
+                {
+                    "allocations": {
+                        name: str(amount)
+                        for name, amount in config.allocations.items()
+                    },
+                    "cap_usd": str(config.cap_usd),
+                    "runs": [],
+                    "spent_usd": "0",
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode(),
+    }
+    manifest = {
+        "schema_version": 1,
+        "run_name": "all32-phase_1",
+        "phase": phase,
+        "num_timesteps": 250000,
+        "model": "ckpt_250000_steps.zip",
+        "sha256": hashlib.sha256(
+            artifacts["ckpt_250000_steps.zip"]
+        ).hexdigest(),
+        "action_set": "complex",
+        "action_count": 12,
+        "extractor": "impala",
+        "extractor_class": (
+            "marioai.features.ImpalaCnnFeaturesExtractor"
+        ),
+        "normalize_reward": True,
+        "vecnormalize": "ckpt_vecnormalize_250000_steps.pkl",
+        "vecnormalize_sha256": hashlib.sha256(
+            artifacts["ckpt_vecnormalize_250000_steps.pkl"]
+        ).hexdigest(),
+        "signature": "ckpt_signature_250000_steps.json",
+        "signature_sha256": hashlib.sha256(
+            artifacts["ckpt_signature_250000_steps.json"]
+        ).hexdigest(),
+        "run_config": "ckpt_run_config_250000_steps.yaml",
+        "run_config_sha256": hashlib.sha256(
+            artifacts["ckpt_run_config_250000_steps.yaml"]
+        ).hexdigest(),
+        "budget_ledger": "ckpt_budget_ledger_250000_steps.json",
+        "budget_ledger_sha256": hashlib.sha256(
+            artifacts["ckpt_budget_ledger_250000_steps.json"]
+        ).hexdigest(),
+    }
+    return manifest_uri, artifacts, manifest
+
+
+def _checkpoint_store(
+    manifest_uri: str,
+    artifacts: dict[str, bytes],
+    manifest: dict[str, object],
+):
+    artifact_prefix = manifest_uri.removesuffix("latest.json")
+    objects = {
+        manifest_uri: (
+            json.dumps(manifest, sort_keys=True) + "\n"
+        ).encode(),
+        **{
+            f"{artifact_prefix}{name}": content
+            for name, content in artifacts.items()
+        },
+    }
+
+    class ObjectStore:
+        def download(self, uri, destination):
+            Path(destination).write_bytes(objects[uri])
+
+    return ObjectStore()
+
+
+def _resume_bundle_with_ledger(
+    config: AwsConfig,
+    tmp_path: Path,
+    checkpoint_ledger: BudgetLedger,
+):
+    from scripts.aws_all32 import ResumeBundle
+
+    root = tmp_path / ".resume" / "phase_1-ledger-check"
+    root.mkdir(parents=True)
+    names = {
+        "model": "ckpt_250000_steps.zip",
+        "run_config": "ckpt_run_config_250000_steps.yaml",
+        "signature": "ckpt_signature_250000_steps.json",
+        "budget_ledger": "ckpt_budget_ledger_250000_steps.json",
+    }
+    paths = {field: root / name for field, name in names.items()}
+    paths["model"].write_bytes(b"model")
+    paths["run_config"].write_bytes(b"config")
+    paths["signature"].write_bytes(b"signature")
+    checkpoint_ledger.save(paths["budget_ledger"])
+    manifest = {"run_name": "all32-phase_1"}
+    for field, path in paths.items():
+        manifest[field] = path.name
+        manifest[
+            "sha256" if field == "model" else f"{field}_sha256"
+        ] = training.sha256_file(path)
+    manifest_path = root / "latest.json"
+    manifest_path.write_text("{}\n", encoding="utf-8")
+    return ResumeBundle(
+        root=root,
+        manifest_path=manifest_path,
+        model_path=paths["model"],
+        run_config_path=paths["run_config"],
+        signature_path=paths["signature"],
+        vecnormalize_path=None,
+        budget_ledger_path=paths["budget_ledger"],
+        manifest=manifest,
+    )
+
+
 def test_cloud_supervisor_syncs_and_shuts_down_after_training_and_sync_failures(
     tmp_path,
 ):
@@ -3447,87 +3644,76 @@ def test_cloud_supervisor_periodically_syncs_artifacts_then_manifest_and_final(
     )
 
 
+def test_cloud_supervisor_never_publishes_manifest_after_artifact_sync_failure(
+    tmp_path,
+):
+    """Catches latest.json publication after its generation upload failed."""
+    command_dir = tmp_path / "bin"
+    command_dir.mkdir()
+    command_log = tmp_path / "commands.log"
+    repository = tmp_path / "MarioAI"
+    checkpoint_dir = repository / "models" / "all32-phase_1"
+    checkpoint_dir.mkdir(parents=True)
+    (checkpoint_dir / "ckpt_250000_steps.zip").write_bytes(b"model")
+    (checkpoint_dir / "latest.json").write_text(
+        '{"model":"ckpt_250000_steps.zip"}\n', encoding="utf-8"
+    )
+    (repository / "reports").mkdir()
+    logger = (
+        'printf "%s" "$0" >> "$COMMAND_LOG"\n'
+        'for argument in "$@"; do '
+        'printf "\\t%s" "$argument" >> "$COMMAND_LOG"; done\n'
+        'printf "\\n" >> "$COMMAND_LOG"\n'
+    )
+    _fake_executable(command_dir / "timeout", logger + "exit 7\n")
+    _fake_executable(
+        command_dir / "aws",
+        logger
+        + 'if [[ "$*" == *"s3 sync"*"/models/"* ]]; then exit 9; fi\n'
+        + "exit 0\n",
+    )
+    _fake_executable(command_dir / "sudo", logger + "exit 0\n")
+    environment = {
+        **os.environ,
+        "PATH": f"{command_dir}:{os.environ['PATH']}",
+        "COMMAND_LOG": str(command_log),
+    }
+
+    completed = subprocess.run(
+        [
+            "bash",
+            str(CLOUD_TRAIN_PATH),
+            "phase_1",
+            "120",
+            str(repository),
+            "s3://bucket/marioai/all32/",
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        env=environment,
+    )
+
+    assert completed.returncode == 7
+    aws_calls = [
+        line
+        for line in command_log.read_text(encoding="utf-8").splitlines()
+        if line.startswith(str(command_dir / "aws"))
+    ]
+    assert any("\ts3\tsync\t" in line and "/models/" in line for line in aws_calls)
+    assert not any("\ts3\tcp\t" in line for line in aws_calls)
+
+
 def test_restore_downloads_only_exact_manifest_named_bundle(config, tmp_path):
     """Catches wildcard/latest guessing or downloading unmanifested S3 objects."""
     from scripts import aws_all32
 
     phase = "phase_1"
-    run_name = "all32-phase_1"
-    manifest_uri = (
-        f"{config.s3_prefix}models/{run_name}/latest.json"
+    manifest_uri, artifacts, manifest = _checkpoint_objects(
+        config, tmp_path
     )
     artifact_prefix = manifest_uri.removesuffix("latest.json")
-    overrides = SimpleNamespace(
-        levels=None,
-        timesteps=None,
-        n_envs=None,
-        lr=None,
-        ent_coef=None,
-        level_weights_json=None,
-    )
-    run_config = training.load_training_config(
-        "configs/all32.yaml", phase, overrides
-    )
-    signature = training.checkpoint_resume_signature(run_config, phase)
-    artifacts = {
-        "ckpt_250000_steps.zip": b"verified checkpoint",
-        "ckpt_vecnormalize_250000_steps.pkl": b"paired normalization",
-        "ckpt_signature_250000_steps.json": (
-            json.dumps(signature, sort_keys=True, separators=(",", ":"))
-            + "\n"
-        ).encode(),
-        "ckpt_run_config_250000_steps.yaml": yaml.safe_dump(
-            run_config, sort_keys=False
-        ).encode(),
-        "ckpt_budget_ledger_250000_steps.json": (
-            json.dumps(
-                {
-                    "allocations": {
-                        name: str(amount)
-                        for name, amount in config.allocations.items()
-                    },
-                    "cap_usd": str(config.cap_usd),
-                    "runs": [],
-                    "spent_usd": "0",
-                },
-                sort_keys=True,
-            )
-            + "\n"
-        ).encode(),
-    }
-    manifest = {
-        "schema_version": 1,
-        "run_name": run_name,
-        "phase": phase,
-        "num_timesteps": 250000,
-        "model": "ckpt_250000_steps.zip",
-        "sha256": hashlib.sha256(
-            artifacts["ckpt_250000_steps.zip"]
-        ).hexdigest(),
-        "action_set": "complex",
-        "action_count": 12,
-        "extractor": "impala",
-        "extractor_class": (
-            "marioai.features.ImpalaCnnFeaturesExtractor"
-        ),
-        "normalize_reward": True,
-        "vecnormalize": "ckpt_vecnormalize_250000_steps.pkl",
-        "vecnormalize_sha256": hashlib.sha256(
-            artifacts["ckpt_vecnormalize_250000_steps.pkl"]
-        ).hexdigest(),
-        "signature": "ckpt_signature_250000_steps.json",
-        "signature_sha256": hashlib.sha256(
-            artifacts["ckpt_signature_250000_steps.json"]
-        ).hexdigest(),
-        "run_config": "ckpt_run_config_250000_steps.yaml",
-        "run_config_sha256": hashlib.sha256(
-            artifacts["ckpt_run_config_250000_steps.yaml"]
-        ).hexdigest(),
-        "budget_ledger": "ckpt_budget_ledger_250000_steps.json",
-        "budget_ledger_sha256": hashlib.sha256(
-            artifacts["ckpt_budget_ledger_250000_steps.json"]
-        ).hexdigest(),
-    }
     objects = {
         manifest_uri: (
             json.dumps(manifest, sort_keys=True) + "\n"
@@ -3560,9 +3746,10 @@ def test_restore_downloads_only_exact_manifest_named_bundle(config, tmp_path):
         repo_dir=tmp_path,
         ledger_path=ledger_path,
         object_store=store,
-        model_validator=lambda path, cfg: (
-            path.name,
-            cfg["env"]["action_set"],
+        model_validator=lambda path, cfg: SimpleNamespace(
+            num_timesteps=250000,
+            path=path.name,
+            action_set=cfg["env"]["action_set"],
         ),
     )
 
@@ -3581,6 +3768,76 @@ def test_restore_downloads_only_exact_manifest_named_bundle(config, tmp_path):
             )
         ],
     ]
+
+
+def test_restore_rejects_model_timestep_that_disagrees_with_manifest(
+    config, tmp_path
+):
+    """Catches calculating remaining work from a differently aged PPO model."""
+    from scripts.aws_all32 import (
+        AwsLifecycleError,
+        restore_checkpoint_bundle,
+    )
+
+    manifest_uri, artifacts, manifest = _checkpoint_objects(
+        config, tmp_path
+    )
+    ledger_path = tmp_path / "aws-spend.json"
+    BudgetLedger(
+        cap_usd=config.cap_usd, allocations=config.allocations
+    ).save(ledger_path)
+
+    with pytest.raises(AwsLifecycleError, match="model timestep"):
+        restore_checkpoint_bundle(
+            config=config,
+            phase="phase_1",
+            checkpoint_s3_uri=manifest_uri,
+            repo_dir=tmp_path,
+            ledger_path=ledger_path,
+            object_store=_checkpoint_store(
+                manifest_uri, artifacts, manifest
+            ),
+            model_validator=lambda _path, _cfg: SimpleNamespace(
+                num_timesteps=249999
+            ),
+        )
+
+
+def test_restore_deserializes_and_rejects_vecnormalize_setting_mismatch(
+    config, tmp_path
+):
+    """Catches trusting VecNormalize filenames/hashes without actual settings."""
+    from scripts.aws_all32 import (
+        AwsLifecycleError,
+        restore_checkpoint_bundle,
+    )
+
+    manifest_uri, artifacts, manifest = _checkpoint_objects(
+        config,
+        tmp_path,
+        vecnormalize_bytes=_vecnormalize_bytes(
+            tmp_path, clip_reward=9.0
+        ),
+    )
+    ledger_path = tmp_path / "aws-spend.json"
+    BudgetLedger(
+        cap_usd=config.cap_usd, allocations=config.allocations
+    ).save(ledger_path)
+
+    with pytest.raises(AwsLifecycleError, match="VecNormalize"):
+        restore_checkpoint_bundle(
+            config=config,
+            phase="phase_1",
+            checkpoint_s3_uri=manifest_uri,
+            repo_dir=tmp_path,
+            ledger_path=ledger_path,
+            object_store=_checkpoint_store(
+                manifest_uri, artifacts, manifest
+            ),
+            model_validator=lambda _path, _cfg: SimpleNamespace(
+                num_timesteps=250000
+            ),
+        )
 
 
 def test_cli_resume_verifies_before_paid_launch_and_passes_exact_paths(
@@ -3604,6 +3861,9 @@ def test_cli_resume_verifies_before_paid_launch_and_passes_exact_paths(
     }
     for path in paths.values():
         path.write_bytes(b"test")
+    BudgetLedger(
+        cap_usd=config.cap_usd, allocations=config.allocations
+    ).save(paths["budget_ledger"])
     bundle = aws_all32.ResumeBundle(
         root=staging,
         manifest_path=paths["manifest"],
@@ -3615,15 +3875,19 @@ def test_cli_resume_verifies_before_paid_launch_and_passes_exact_paths(
         manifest={
             "run_name": "all32-phase_1",
             "model": paths["model"].name,
-            "sha256": hashlib.sha256(b"test").hexdigest(),
+            "sha256": training.sha256_file(paths["model"]),
             "run_config": paths["run_config"].name,
-            "run_config_sha256": hashlib.sha256(b"test").hexdigest(),
+            "run_config_sha256": training.sha256_file(paths["run_config"]),
             "signature": paths["signature"].name,
-            "signature_sha256": hashlib.sha256(b"test").hexdigest(),
+            "signature_sha256": training.sha256_file(paths["signature"]),
             "vecnormalize": paths["vecnormalize"].name,
-            "vecnormalize_sha256": hashlib.sha256(b"test").hexdigest(),
+            "vecnormalize_sha256": training.sha256_file(
+                paths["vecnormalize"]
+            ),
             "budget_ledger": paths["budget_ledger"].name,
-            "budget_ledger_sha256": hashlib.sha256(b"test").hexdigest(),
+            "budget_ledger_sha256": training.sha256_file(
+                paths["budget_ledger"]
+            ),
         },
     )
     clock = FakeMonotonic()
@@ -3675,7 +3939,10 @@ def test_cli_resume_verifies_before_paid_launch_and_passes_exact_paths(
     assert remote.training_args == [
         (
             "--config",
-            "configs/all32.yaml",
+            (
+                ".resume/phase_1-test/"
+                "ckpt_run_config_250000_steps.yaml"
+            ),
             "--run-name",
             "all32-phase_1",
             "--resume",
@@ -3688,10 +3955,140 @@ def test_cli_resume_verifies_before_paid_launch_and_passes_exact_paths(
             "--budget-ledger-snapshot",
             (
                 ".resume/phase_1-test/"
-                "ckpt_budget_ledger_250000_steps.json"
+                "authoritative-budget-ledger.json"
             ),
         )
     ]
+    resumed_ledger = BudgetLedger.load(
+        staging / "authoritative-budget-ledger.json",
+        cap_usd=config.cap_usd,
+    )
+    assert resumed_ledger.runs[0].instance_id == "i-0123456789abcdef0"
+
+
+def test_cli_resume_rejects_authoritative_ledger_missing_checkpoint_run_under_lock(
+    config, tmp_path, monkeypatch
+):
+    """Catches aggregate-spend checks accepting rolled-back run history."""
+    from scripts import aws_all32
+
+    checkpoint_ledger = BudgetLedger(
+        cap_usd=config.cap_usd, allocations=config.allocations
+    ).update_run(
+        CostedRun(
+            phase="phase_1",
+            instance_id="i-checkpoint",
+            hours=Decimal("1"),
+            instance_hourly_usd=Decimal("0.5"),
+            volume_hourly_usd=Decimal("0.1"),
+        )
+    )
+    bundle = _resume_bundle_with_ledger(
+        config, tmp_path, checkpoint_ledger
+    )
+    ledger_path = tmp_path / "aws-spend.json"
+    BudgetLedger(
+        cap_usd=config.cap_usd, allocations=config.allocations
+    ).save(ledger_path)
+    monkeypatch.setattr(
+        aws_all32,
+        "restore_checkpoint_bundle",
+        lambda **_kwargs: bundle,
+    )
+    aws = FakeLifecycleAws(config)
+
+    with pytest.raises(AwsLifecycleError, match="monotonic superset"):
+        aws_all32.main(
+            [
+                "resume",
+                "--config",
+                str(CONFIG_PATH),
+                "--ledger",
+                str(ledger_path),
+                "--phase",
+                "phase_1",
+                "--max-hours",
+                "1",
+                "--repo-dir",
+                str(tmp_path),
+                "--checkpoint-s3-uri",
+                (
+                    f"{config.s3_prefix}models/"
+                    "all32-phase_1/latest.json"
+                ),
+            ],
+            stdout=io.StringIO(),
+            aws_override=aws,
+            remote=FakeRemote(FakeMonotonic()),
+            checkpoint_store=object(),
+            sleeper=lambda _seconds: None,
+        )
+    assert not aws.run_instances_called
+
+
+def test_cli_resume_rechecks_authoritative_ledger_immediately_before_mutation(
+    config, tmp_path, monkeypatch
+):
+    """Catches a valid locked ledger being swapped for rollback pre-mutation."""
+    from scripts import aws_all32
+
+    checkpoint_ledger = BudgetLedger(
+        cap_usd=config.cap_usd, allocations=config.allocations
+    ).update_run(
+        CostedRun(
+            phase="phase_1",
+            instance_id="i-checkpoint",
+            hours=Decimal("1"),
+            instance_hourly_usd=Decimal("0.5"),
+            volume_hourly_usd=Decimal("0.1"),
+        )
+    )
+    bundle = _resume_bundle_with_ledger(
+        config, tmp_path, checkpoint_ledger
+    )
+    ledger_path = tmp_path / "aws-spend.json"
+    checkpoint_ledger.save(ledger_path)
+    monkeypatch.setattr(
+        aws_all32,
+        "restore_checkpoint_bundle",
+        lambda **_kwargs: bundle,
+    )
+    aws = FakeLifecycleAws(config)
+
+    def swap_to_rollback():
+        BudgetLedger(
+            cap_usd=config.cap_usd, allocations=config.allocations
+        ).save(ledger_path)
+
+    aws.resolve_ami_hook = swap_to_rollback
+
+    with pytest.raises(AwsLifecycleError, match="monotonic superset"):
+        aws_all32.main(
+            [
+                "resume",
+                "--config",
+                str(CONFIG_PATH),
+                "--ledger",
+                str(ledger_path),
+                "--phase",
+                "phase_1",
+                "--max-hours",
+                "1",
+                "--repo-dir",
+                str(tmp_path),
+                "--checkpoint-s3-uri",
+                (
+                    f"{config.s3_prefix}models/"
+                    "all32-phase_1/latest.json"
+                ),
+            ],
+            stdout=io.StringIO(),
+            aws_override=aws,
+            remote=FakeRemote(FakeMonotonic()),
+            checkpoint_store=object(),
+            sleeper=lambda _seconds: None,
+        )
+    assert not aws.run_instances_called
 
 
 @pytest.mark.parametrize(

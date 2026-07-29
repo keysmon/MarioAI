@@ -64,7 +64,7 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
 
 
 def _write_durable_artifact(path: Path, writer) -> None:
-    """Run an artifact writer off-path, then durably publish its result."""
+    """Publish an immutable artifact, accepting only identical prior bytes."""
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.stem}.",
@@ -79,11 +79,31 @@ def _write_durable_artifact(path: Path, writer) -> None:
             raise OSError(f"checkpoint writer did not create {temporary_path}")
         with temporary_path.open("rb") as artifact:
             os.fsync(artifact.fileno())
-        os.replace(temporary_path, path)
-        _fsync_directory(path.parent)
+        try:
+            os.link(temporary_path, path)
+        except FileExistsError:
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or path.stat().st_size != temporary_path.stat().st_size
+                or sha256_file(path) != sha256_file(temporary_path)
+            ):
+                raise FileExistsError(
+                    f"immutable checkpoint artifact differs: {path}"
+                ) from None
+        else:
+            _fsync_directory(path.parent)
     except BaseException:
-        temporary_path.unlink(missing_ok=True)
         raise
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _write_immutable_bytes(path: Path, payload: bytes) -> None:
+    """Durably publish bytes without ever replacing an existing generation."""
+    _write_durable_artifact(
+        path, lambda temporary: temporary.write_bytes(payload)
+    )
 
 
 def checkpoint_resume_signature(
@@ -466,7 +486,7 @@ class DurableCheckpointCallback(CheckpointCallback):
             )
 
         run_config_path = save_path / run_config_name
-        _atomic_write_bytes(
+        _write_immutable_bytes(
             run_config_path,
             yaml.safe_dump(
                 self.run_config, sort_keys=False
@@ -478,11 +498,11 @@ class DurableCheckpointCallback(CheckpointCallback):
                 f"{self.budget_ledger_path}"
             )
         budget_ledger_path = save_path / budget_ledger_name
-        _atomic_write_bytes(
+        _write_immutable_bytes(
             budget_ledger_path, self.budget_ledger_path.read_bytes()
         )
         signature_path = save_path / signature_name
-        _atomic_write_bytes(
+        _write_immutable_bytes(
             signature_path,
             (
                 json.dumps(

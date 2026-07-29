@@ -687,6 +687,64 @@ def test_durable_checkpoint_writes_complete_resume_manifest(tmp_path):
     }
 
 
+def test_durable_checkpoint_same_timestep_artifacts_are_immutable(tmp_path):
+    """Catches same-generation checkpoint bytes being silently replaced."""
+    cfg = _orchestration_config(normalize_reward=False)
+    ledger_path = tmp_path / "aws-spend.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "allocations": {"phase_1": "16.00"},
+                "cap_usd": "50.00",
+                "runs": [],
+                "spent_usd": "0",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeModel:
+        num_timesteps = 250000
+        action_space = gym.spaces.Discrete(12)
+        observation_space = gym.spaces.Box(
+            0, 255, shape=(4, 84, 84), dtype=np.uint8
+        )
+        policy = SimpleNamespace(
+            features_extractor=_impala_extractor(
+                features_dim=512,
+                channels=(16, 32, 32),
+            )
+        )
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def save(self, path):
+            Path(path).write_bytes(self.payload)
+
+    callback = training.DurableCheckpointCallback(
+        save_path=tmp_path,
+        save_freq=1,
+        run_config=cfg,
+        budget_ledger_path=ledger_path,
+        phase="phase_1",
+        run_name="all32-phase_1",
+    )
+    model_path = tmp_path / "ckpt_250000_steps.zip"
+
+    callback.save_checkpoint(FakeModel(b"original model"))
+    original_inode = model_path.stat().st_ino
+    original_manifest = (tmp_path / "latest.json").read_bytes()
+
+    callback.save_checkpoint(FakeModel(b"original model"))
+    assert model_path.stat().st_ino == original_inode
+
+    with pytest.raises(FileExistsError, match="immutable"):
+        callback.save_checkpoint(FakeModel(b"different model"))
+    assert model_path.read_bytes() == b"original model"
+    assert (tmp_path / "latest.json").read_bytes() == original_manifest
+
+
 def test_durable_checkpoint_does_not_publish_partial_bundle(tmp_path):
     """Catches latest.json pointing at a model whose paired state failed."""
     previous_manifest = b'{"num_timesteps": 125000}\n'

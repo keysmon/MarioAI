@@ -13,6 +13,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import pickle
 import re
 import shutil
 import shlex
@@ -25,6 +26,7 @@ from urllib.parse import urlsplit
 import uuid
 
 import yaml
+from stable_baselines3.common.vec_env import VecNormalize
 
 import marioai.train as training
 from marioai.aws import AwsCli, AwsConfig, PreflightResult, SpotOffer
@@ -228,12 +230,63 @@ def _resolved_all32_config(path: Path, phase: str) -> dict:
         ) from error
 
 
-def _default_model_validator(path: Path, cfg: dict) -> None:
+def _default_model_validator(path: Path, cfg: dict) -> Any:
     device = training.resolve_device(cfg["train"]["device"])
     model = training.PPO.load(str(path), device=device)
     training.validate_resume_model(
         model, **training.compatibility_kwargs(cfg)
     )
+    return model
+
+
+def _validate_vecnormalize_checkpoint(
+    path: Path, signature: dict[str, Any]
+) -> None:
+    """Deserialize and verify the actual normalization state and spaces."""
+    try:
+        with Path(path).open("rb") as sidecar:
+            vecnormalize = pickle.load(sidecar)
+    except Exception as error:
+        raise AwsLifecycleError(
+            "checkpoint VecNormalize state cannot be deserialized"
+        ) from error
+    if not isinstance(vecnormalize, VecNormalize):
+        raise AwsLifecycleError(
+            "checkpoint VecNormalize sidecar has the wrong type"
+        )
+    environment = signature["environment"]
+    normalization = signature["normalization"]
+    action_count = getattr(
+        getattr(vecnormalize, "action_space", None), "n", None
+    )
+    observation_shape = tuple(
+        getattr(
+            getattr(vecnormalize, "observation_space", None),
+            "shape",
+            (),
+        )
+    )
+    expected_settings = {
+        "norm_obs": normalization["norm_obs"],
+        "norm_reward": normalization["norm_reward"],
+        "clip_obs": normalization["clip_obs"],
+        "clip_reward": normalization["clip_reward"],
+        "gamma": normalization["gamma"],
+        "epsilon": normalization["epsilon"],
+    }
+    if (
+        action_count != environment["action_count"]
+        or observation_shape
+        != tuple(environment["observation_shape"])
+        or any(
+            getattr(vecnormalize, field, object()) != expected
+            for field, expected in expected_settings.items()
+        )
+    ):
+        raise AwsLifecycleError(
+            "checkpoint VecNormalize spaces/settings do not match "
+            "the trusted signature"
+        )
 
 
 def restore_checkpoint_bundle(
@@ -449,12 +502,25 @@ def restore_checkpoint_bundle(
             artifact_paths["budget_ledger"], config
         )
         current_ledger = _configured_ledger(Path(ledger_path), config)
-        if checkpoint_ledger.spent_usd > current_ledger.spent_usd:
-            raise AwsLifecycleError(
-                "checkpoint budget snapshot is ahead of the authoritative "
-                "local ledger"
+        _require_authoritative_ledger_superset(
+            checkpoint_ledger, current_ledger
+        )
+        if normalize_reward:
+            _validate_vecnormalize_checkpoint(
+                artifact_paths["vecnormalize"], signature
             )
-        model_validator(artifact_paths["model"], trusted_config)
+        model = model_validator(
+            artifact_paths["model"], trusted_config
+        )
+        model_timesteps = getattr(model, "num_timesteps", None)
+        if (
+            isinstance(model_timesteps, bool)
+            or not isinstance(model_timesteps, int)
+            or model_timesteps != timestep
+        ):
+            raise AwsLifecycleError(
+                "checkpoint model timestep does not match the manifest"
+            )
         return ResumeBundle(
             root=staging_root,
             manifest_path=manifest_path,
@@ -2467,6 +2533,40 @@ def _configured_ledger(path: Path, config: AwsConfig) -> BudgetLedger:
     return ledger
 
 
+def _require_authoritative_ledger_superset(
+    checkpoint: BudgetLedger, authoritative: BudgetLedger
+) -> None:
+    """Reject rollback of any checkpoint accounting identity or progress."""
+    if (
+        checkpoint.cap_usd != authoritative.cap_usd
+        or dict(checkpoint.allocations) != dict(authoritative.allocations)
+        or authoritative.spent_usd < checkpoint.spent_usd
+    ):
+        raise AwsLifecycleError(
+            "authoritative ledger is not a monotonic superset of checkpoint "
+            "accounting"
+        )
+    authoritative_runs = {
+        (run.phase, run.instance_id): run for run in authoritative.runs
+    }
+    for checkpoint_run in checkpoint.runs:
+        current_run = authoritative_runs.get(
+            (checkpoint_run.phase, checkpoint_run.instance_id)
+        )
+        if (
+            current_run is None
+            or current_run.hours < checkpoint_run.hours
+            or current_run.instance_hourly_usd
+            != checkpoint_run.instance_hourly_usd
+            or current_run.volume_hourly_usd
+            != checkpoint_run.volume_hourly_usd
+        ):
+            raise AwsLifecycleError(
+                "authoritative ledger is not a monotonic superset of "
+                "checkpoint run history"
+            )
+
+
 def _settle_reservation(
     ledger: BudgetLedger,
     reservation: LaunchReservation,
@@ -2631,7 +2731,10 @@ def _terminal_target_confirmed(aws: Any, instance_id: str) -> bool:
 
 
 def _resume_training_args(
-    bundle: ResumeBundle, repo_dir: Path
+    bundle: ResumeBundle,
+    repo_dir: Path,
+    *,
+    authoritative_ledger_path: Path,
 ) -> tuple[str, ...]:
     repo_root = Path(repo_dir).resolve()
 
@@ -2651,7 +2754,7 @@ def _resume_training_args(
         raise AwsLifecycleError("verified resume bundle has unsafe run name")
     arguments = [
         "--config",
-        "configs/all32.yaml",
+        relative(bundle.run_config_path),
         "--run-name",
         run_name,
         "--resume",
@@ -2667,10 +2770,21 @@ def _resume_training_args(
     arguments.extend(
         [
             "--budget-ledger-snapshot",
-            relative(bundle.budget_ledger_path),
+            relative(authoritative_ledger_path),
         ]
     )
     return tuple(arguments)
+
+
+def _snapshot_authoritative_ledger(
+    bundle: ResumeBundle,
+    ledger_path: Path,
+    config: AwsConfig,
+) -> Path:
+    """Copy current locked accounting into the staged remote resume bundle."""
+    snapshot_path = bundle.root / "authoritative-budget-ledger.json"
+    _configured_ledger(ledger_path, config).save(snapshot_path)
+    return snapshot_path
 
 
 def main(
@@ -2864,6 +2978,13 @@ def main(
                     "an unresolved launch reservation exists; run reconcile"
                 )
             ledger = _configured_ledger(args.ledger, config)
+            if resume_bundle is not None:
+                checkpoint_ledger = _configured_ledger(
+                    resume_bundle.budget_ledger_path, config
+                )
+                _require_authoritative_ledger_superset(
+                    checkpoint_ledger, ledger
+                )
             selected_remote = remote
             if selected_remote is None:
                 ssh_key = args.ssh_key
@@ -2895,13 +3016,30 @@ def main(
                 raise AwsLifecycleError(
                     "active MarioAI-All32 instance exists; run reconcile"
                 )
+
+            def verify_resume_before_mutation() -> None:
+                if resume_bundle is None:
+                    return
+                verify_resume_bundle(resume_bundle)
+                current_ledger = _configured_ledger(
+                    args.ledger, config
+                )
+                _require_authoritative_ledger_superset(
+                    _configured_ledger(
+                        resume_bundle.budget_ledger_path, config
+                    ),
+                    current_ledger,
+                )
+                if current_ledger != ledger:
+                    raise AwsLifecycleError(
+                        "authoritative ledger changed before mutation"
+                    )
+
             instance = orchestrator.launch_guarded_instance(
                 args.phase,
                 args.max_hours,
                 before_mutation=(
-                    (
-                        lambda: verify_resume_bundle(resume_bundle)
-                    )
+                    verify_resume_before_mutation
                     if resume_bundle is not None
                     else None
                 ),
@@ -2916,6 +3054,13 @@ def main(
                 instance = orchestrator.wait_for_running_public_ip(
                     instance, ledger_path=args.ledger
                 )
+                authoritative_ledger_snapshot = None
+                if resume_bundle is not None:
+                    authoritative_ledger_snapshot = (
+                        _snapshot_authoritative_ledger(
+                            resume_bundle, args.ledger, config
+                        )
+                    )
                 start_kwargs = {
                     "phase": args.phase,
                     "max_seconds": max_seconds,
@@ -2933,7 +3078,11 @@ def main(
                 }
                 if resume_bundle is not None:
                     start_kwargs["train_args"] = _resume_training_args(
-                        resume_bundle, args.repo_dir
+                        resume_bundle,
+                        args.repo_dir,
+                        authoritative_ledger_path=(
+                            authoritative_ledger_snapshot
+                        ),
                     )
                 selected_remote.start(instance, **start_kwargs)
             except BaseException as start_error:
