@@ -11,6 +11,7 @@ from decimal import Decimal, ROUND_CEILING
 import fcntl
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import pickle
@@ -30,7 +31,7 @@ from stable_baselines3.common.vec_env import VecNormalize
 
 import marioai.train as training
 from marioai.aws import AwsCli, AwsConfig, PreflightResult, SpotOffer
-from marioai.budget import BudgetLedger, CostedRun
+from marioai.budget import BudgetExceeded, BudgetLedger, CostedRun
 
 
 _SECONDS_PER_HOUR = Decimal("3600")
@@ -51,10 +52,190 @@ _CHECKPOINT_HASH_PATTERN = re.compile(r"[0-9a-f]{64}")
 _CHECKPOINT_FILENAME_PATTERN = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]*"
 )
+_BENCHMARK_ENVIRONMENT_STEPS = 250_000
+_BENCHMARK_MAX_HOURS = Decimal("0.25")
 
 
 class AwsLifecycleError(RuntimeError):
     """Raised when a paid-instance lifecycle cannot be handled safely."""
+
+
+@dataclass(frozen=True)
+class BenchmarkObservation:
+    """Exact remote duration and memory observation for one fixed workload."""
+
+    environment_steps: int
+    elapsed_seconds: Decimal
+    peak_rss_gb: float
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.environment_steps, bool)
+            or not isinstance(self.environment_steps, int)
+            or self.environment_steps <= 0
+        ):
+            raise ValueError("environment_steps must be a positive integer")
+        if (
+            not isinstance(self.elapsed_seconds, Decimal)
+            or not self.elapsed_seconds.is_finite()
+            or self.elapsed_seconds <= 0
+        ):
+            raise ValueError(
+                "elapsed_seconds must be a positive finite Decimal"
+            )
+        if (
+            isinstance(self.peak_rss_gb, bool)
+            or not isinstance(self.peak_rss_gb, (int, float))
+            or not math.isfinite(self.peak_rss_gb)
+            or self.peak_rss_gb < 0
+        ):
+            raise ValueError("peak_rss_gb must be finite and non-negative")
+
+
+@dataclass(frozen=True)
+class Benchmark:
+    """One measured candidate's environment-step throughput and hourly rate."""
+
+    instance_type: str
+    env_steps_per_second: float
+    instance_hourly_usd: Decimal
+    volume_hourly_usd: Decimal = Decimal("0")
+    peak_rss_gb: float = 0.0
+    environment_steps: int = 250_000
+    elapsed_seconds: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.instance_type, str) or not self.instance_type:
+            raise ValueError("instance_type must be a non-empty string")
+        if (
+            isinstance(self.env_steps_per_second, bool)
+            or not isinstance(self.env_steps_per_second, (int, float))
+            or not math.isfinite(self.env_steps_per_second)
+            or self.env_steps_per_second <= 0
+        ):
+            raise ValueError(
+                "env_steps_per_second must be positive and finite"
+            )
+        for field, value in (
+            ("instance_hourly_usd", self.instance_hourly_usd),
+            ("volume_hourly_usd", self.volume_hourly_usd),
+        ):
+            if (
+                not isinstance(value, Decimal)
+                or not value.is_finite()
+                or value < 0
+            ):
+                raise ValueError(
+                    f"{field} must be a finite non-negative Decimal"
+                )
+        if (
+            isinstance(self.environment_steps, bool)
+            or not isinstance(self.environment_steps, int)
+            or self.environment_steps <= 0
+        ):
+            raise ValueError("environment_steps must be a positive integer")
+        if self.elapsed_seconds is not None and (
+            not isinstance(self.elapsed_seconds, Decimal)
+            or not self.elapsed_seconds.is_finite()
+            or self.elapsed_seconds <= 0
+        ):
+            raise ValueError(
+                "elapsed_seconds must be a positive finite Decimal"
+            )
+        if (
+            isinstance(self.peak_rss_gb, bool)
+            or not isinstance(self.peak_rss_gb, (int, float))
+            or not math.isfinite(self.peak_rss_gb)
+            or self.peak_rss_gb < 0
+        ):
+            raise ValueError("peak_rss_gb must be finite and non-negative")
+
+    @classmethod
+    def from_observation(
+        cls,
+        *,
+        instance_type: str,
+        observation: BenchmarkObservation,
+        instance_hourly_usd: Decimal,
+        volume_hourly_usd: Decimal,
+    ) -> Benchmark:
+        if not isinstance(observation, BenchmarkObservation):
+            raise ValueError(
+                "observation must be a BenchmarkObservation"
+            )
+        return cls(
+            instance_type=instance_type,
+            env_steps_per_second=float(
+                Decimal(observation.environment_steps)
+                / observation.elapsed_seconds
+            ),
+            instance_hourly_usd=instance_hourly_usd,
+            volume_hourly_usd=volume_hourly_usd,
+            peak_rss_gb=float(observation.peak_rss_gb),
+            environment_steps=observation.environment_steps,
+            elapsed_seconds=observation.elapsed_seconds,
+        )
+
+    @property
+    def cost_per_million_steps(self) -> Decimal:
+        return (
+            (self.instance_hourly_usd + self.volume_hourly_usd)
+            * Decimal("1000000")
+            / Decimal(str(self.env_steps_per_second))
+            / _SECONDS_PER_HOUR
+        )
+
+    @property
+    def observed_cost_usd(self) -> Decimal:
+        elapsed_seconds = self.elapsed_seconds
+        if elapsed_seconds is None:
+            elapsed_seconds = (
+                Decimal(self.environment_steps)
+                / Decimal(str(self.env_steps_per_second))
+            )
+        return (
+            elapsed_seconds
+            / _SECONDS_PER_HOUR
+            * (self.instance_hourly_usd + self.volume_hourly_usd)
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        elapsed_seconds = self.elapsed_seconds
+        if elapsed_seconds is None:
+            elapsed_seconds = (
+                Decimal(self.environment_steps)
+                / Decimal(str(self.env_steps_per_second))
+            )
+        return {
+            "instance_type": self.instance_type,
+            "environment_steps": self.environment_steps,
+            "elapsed_seconds": str(elapsed_seconds),
+            "env_steps_per_second": float(self.env_steps_per_second),
+            "instance_hourly_usd": str(self.instance_hourly_usd),
+            "volume_hourly_usd": str(self.volume_hourly_usd),
+            "cost_per_million_steps": str(
+                self.cost_per_million_steps
+            ),
+            "peak_rss_gb": float(self.peak_rss_gb),
+            "observed_cost_usd": format(
+                self.observed_cost_usd.normalize(), "f"
+            ),
+        }
+
+
+def select_benchmark(offers: list[Benchmark]) -> Benchmark:
+    """Select the measured candidate with the lowest cost per million steps."""
+    if not offers:
+        raise ValueError("at least one benchmark measurement is required")
+    if not all(isinstance(offer, Benchmark) for offer in offers):
+        raise ValueError("benchmark measurements must be Benchmark values")
+    return min(
+        offers,
+        key=lambda offer: (
+            offer.cost_per_million_steps,
+            offer.instance_type,
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -1152,8 +1333,6 @@ class SshRemoteSupervisor:
         absolute_deadline: Decimal | None = None,
     ) -> None:
         """Rsync source and launch cloud_train.sh under a recorded remote PID."""
-        host = _validated_public_ip(instance.public_ip)
-        self._hosts[instance.instance_id] = host
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", phase) is None:
             raise AwsLifecycleError("phase is unsafe for remote execution")
         if (
@@ -1179,6 +1358,182 @@ class SshRemoteSupervisor:
             raise AwsLifecycleError(
                 "training arguments must be a tuple of non-empty strings"
             )
+        target = self._prepare_repository(
+            instance,
+            on_tick=on_tick,
+            absolute_deadline=absolute_deadline,
+        )
+        elapsed_seconds = int(
+            max(
+                Decimal("0"),
+                _monotonic_decimal(self._monotonic())
+                - instance.launched_monotonic,
+            ).to_integral_value(rounding=ROUND_CEILING)
+        )
+        remaining_seconds = max_seconds - elapsed_seconds
+        if remaining_seconds <= 0:
+            raise AwsLifecycleError(
+                "maximum paid runtime expired during remote bootstrap"
+            )
+        startup_script = (
+            "set -eu\n"
+            "repo=$1\n"
+            "shift\n"
+            'cd "$repo"\n'
+            "pidfile=/tmp/marioai-cloud-train.pid\n"
+            "logfile=/tmp/marioai-cloud-train.log\n"
+            'rm -f "$pidfile"\n'
+            "nohup ./scripts/cloud_train.sh \"$@\" "
+            "</dev/null >\"$logfile\" 2>&1 &\n"
+            "pid=$!\n"
+            'tmp_pidfile="${pidfile}.$$"\n'
+            "printf '%s\\n' \"$pid\" >\"$tmp_pidfile\"\n"
+            'mv "$tmp_pidfile" "$pidfile"\n'
+            f"remaining={self._startup_confirmation_seconds}\n"
+            'while [ "$remaining" -gt 0 ]; do\n'
+            "  sleep 1\n"
+            '  if ! kill -0 "$pid" 2>/dev/null; then\n'
+            "    set +e\n"
+            '    wait "$pid"\n'
+            "    status=$?\n"
+            "    set -e\n"
+            '    tail -n 40 "$logfile" >&2 || true\n'
+            '    if [ "$status" -eq 0 ]; then exit 70; fi\n'
+            '    exit "$status"\n'
+            "  fi\n"
+            '  remaining=$((remaining - 1))\n'
+            "done\n"
+        )
+        remote_args = [
+            self.remote_repo,
+            phase,
+            str(remaining_seconds),
+            self.remote_repo,
+            s3_prefix,
+            *train_args,
+        ]
+        self._run_remote_command(
+            [
+                *self._ssh_command(target),
+                "bash",
+                "-s",
+                "--",
+                *[shlex.quote(argument) for argument in remote_args],
+            ],
+            timeout=max(30, self._startup_confirmation_seconds + 20),
+            input_text=startup_script,
+            on_tick=on_tick,
+            absolute_deadline=absolute_deadline,
+        )
+
+    def benchmark(
+        self,
+        instance: LaunchedInstance,
+        *,
+        environment_steps: int,
+        max_seconds: int,
+        on_tick: Callable[[], None] | None = None,
+        absolute_deadline: Decimal | None = None,
+    ) -> BenchmarkObservation:
+        """Prepare a fresh host and parse one exact fixed-step measurement."""
+        if (
+            isinstance(environment_steps, bool)
+            or not isinstance(environment_steps, int)
+            or environment_steps <= 0
+        ):
+            raise AwsLifecycleError(
+                "benchmark environment_steps must be a positive integer"
+            )
+        if (
+            isinstance(max_seconds, bool)
+            or not isinstance(max_seconds, int)
+            or max_seconds <= 0
+        ):
+            raise AwsLifecycleError(
+                "benchmark max_seconds must be a positive integer"
+            )
+        target = self._prepare_repository(
+            instance,
+            on_tick=on_tick,
+            absolute_deadline=absolute_deadline,
+        )
+        elapsed_seconds = int(
+            max(
+                Decimal("0"),
+                _monotonic_decimal(self._monotonic())
+                - instance.launched_monotonic,
+            ).to_integral_value(rounding=ROUND_CEILING)
+        )
+        remaining_seconds = max_seconds - elapsed_seconds
+        if remaining_seconds <= 0:
+            raise AwsLifecycleError(
+                "maximum paid runtime expired during benchmark bootstrap"
+            )
+        benchmark_script = """\
+set -eu
+repo=$1
+steps=$2
+cd "$repo"
+exec .venv/bin/python scripts/train_phase.py benchmark \
+  --environment-steps "$steps"
+"""
+        stdout = self._run_remote_command(
+            [
+                *self._ssh_command(target),
+                "bash",
+                "-s",
+                "--",
+                shlex.quote(self.remote_repo),
+                str(environment_steps),
+            ],
+            timeout=remaining_seconds,
+            input_text=benchmark_script,
+            on_tick=on_tick,
+            absolute_deadline=absolute_deadline,
+        )
+        try:
+            payload = json.loads(stdout)
+            if not isinstance(payload, dict) or set(payload) != {
+                "environment_steps",
+                "elapsed_seconds",
+                "peak_rss_gb",
+            }:
+                raise ValueError("invalid benchmark schema")
+            elapsed = payload["elapsed_seconds"]
+            if not isinstance(elapsed, str):
+                raise ValueError(
+                    "benchmark elapsed_seconds must be a JSON string"
+                )
+            observation = BenchmarkObservation(
+                environment_steps=payload["environment_steps"],
+                elapsed_seconds=Decimal(elapsed),
+                peak_rss_gb=payload["peak_rss_gb"],
+            )
+        except (
+            ArithmeticError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise AwsLifecycleError(
+                "remote benchmark returned invalid JSON evidence"
+            ) from error
+        if observation.environment_steps != environment_steps:
+            raise AwsLifecycleError(
+                "remote benchmark did not run the requested environment steps"
+            )
+        return observation
+
+    def _prepare_repository(
+        self,
+        instance: LaunchedInstance,
+        *,
+        on_tick: Callable[[], None] | None,
+        absolute_deadline: Decimal | None,
+    ) -> str:
+        host = _validated_public_ip(instance.public_ip)
+        self._hosts[instance.instance_id] = host
         target = f"{self.user}@{host}"
         self._wait_for_ssh(
             target,
@@ -1252,7 +1607,9 @@ python3 -m venv "$bootstrap"
 "$bootstrap/bin/uv" pip install --python "$repo/.venv/bin/python" \
   -r "$repo/requirements.txt" --editable "$repo"
 mkdir -p "$repo/models" "$repo/reports"
-"$repo/.venv/bin/python" -c 'import marioai, torch'
+cd "$repo"
+"$repo/.venv/bin/python" -c \
+  'import marioai, torch; import scripts.train_phase'
 aws sts get-caller-identity --output json >/dev/null
 """
         self._run_remote_command(
@@ -1268,68 +1625,7 @@ aws sts get-caller-identity --output json >/dev/null
             on_tick=on_tick,
             absolute_deadline=absolute_deadline,
         )
-        elapsed_seconds = int(
-            max(
-                Decimal("0"),
-                _monotonic_decimal(self._monotonic())
-                - instance.launched_monotonic,
-            ).to_integral_value(rounding=ROUND_CEILING)
-        )
-        remaining_seconds = max_seconds - elapsed_seconds
-        if remaining_seconds <= 0:
-            raise AwsLifecycleError(
-                "maximum paid runtime expired during remote bootstrap"
-            )
-        startup_script = (
-            "set -eu\n"
-            "repo=$1\n"
-            "shift\n"
-            'cd "$repo"\n'
-            "pidfile=/tmp/marioai-cloud-train.pid\n"
-            "logfile=/tmp/marioai-cloud-train.log\n"
-            'rm -f "$pidfile"\n'
-            "nohup ./scripts/cloud_train.sh \"$@\" "
-            "</dev/null >\"$logfile\" 2>&1 &\n"
-            "pid=$!\n"
-            'tmp_pidfile="${pidfile}.$$"\n'
-            "printf '%s\\n' \"$pid\" >\"$tmp_pidfile\"\n"
-            'mv "$tmp_pidfile" "$pidfile"\n'
-            f"remaining={self._startup_confirmation_seconds}\n"
-            'while [ "$remaining" -gt 0 ]; do\n'
-            "  sleep 1\n"
-            '  if ! kill -0 "$pid" 2>/dev/null; then\n'
-            "    set +e\n"
-            '    wait "$pid"\n'
-            "    status=$?\n"
-            "    set -e\n"
-            '    tail -n 40 "$logfile" >&2 || true\n'
-            '    if [ "$status" -eq 0 ]; then exit 70; fi\n'
-            '    exit "$status"\n'
-            "  fi\n"
-            '  remaining=$((remaining - 1))\n'
-            "done\n"
-        )
-        remote_args = [
-            self.remote_repo,
-            phase,
-            str(remaining_seconds),
-            self.remote_repo,
-            s3_prefix,
-            *train_args,
-        ]
-        self._run_remote_command(
-            [
-                *self._ssh_command(target),
-                "bash",
-                "-s",
-                "--",
-                *[shlex.quote(argument) for argument in remote_args],
-            ],
-            timeout=max(30, self._startup_confirmation_seconds + 20),
-            input_text=startup_script,
-            on_tick=on_tick,
-            absolute_deadline=absolute_deadline,
-        )
+        return target
 
     def poll(self, instance: LaunchedInstance) -> RemotePoll:
         summaries = self.aws.project_instances(
@@ -1452,16 +1748,15 @@ aws sts get-caller-identity --output json >/dev/null
         input_text: str | None = None,
         on_tick: Callable[[], None] | None = None,
         absolute_deadline: Decimal | None = None,
-    ) -> None:
+    ) -> str:
         if self._poll_subprocess:
-            self._run_polled_process(
+            return self._run_polled_process(
                 command,
                 timeout=timeout,
                 input_text=input_text,
                 on_tick=on_tick,
                 absolute_deadline=absolute_deadline,
             )
-            return
         kwargs: dict[str, Any] = {
             "check": True,
             "text": True,
@@ -1471,7 +1766,7 @@ aws sts get-caller-identity --output json >/dev/null
         if input_text is not None:
             kwargs["input"] = input_text
         try:
-            self._runner(command, **kwargs)
+            completed = self._runner(command, **kwargs)
         except subprocess.TimeoutExpired as error:
             raise AwsLifecycleError(
                 f"{command[0]} timed out after {timeout} seconds"
@@ -1486,6 +1781,12 @@ aws sts get-caller-identity --output json >/dev/null
             ) from error
         if on_tick is not None:
             on_tick()
+        stdout = completed.stdout
+        if not isinstance(stdout, str):
+            raise AwsLifecycleError(
+                f"{command[0]} returned non-text output"
+            )
+        return stdout
 
     def _run_polled_process(
         self,
@@ -1495,7 +1796,7 @@ aws sts get-caller-identity --output json >/dev/null
         input_text: str | None,
         on_tick: Callable[[], None] | None,
         absolute_deadline: Decimal | None,
-    ) -> None:
+    ) -> str:
         started = _monotonic_decimal(self._monotonic())
         deadline = started + Decimal(timeout)
         if absolute_deadline is not None:
@@ -1534,8 +1835,11 @@ aws sts get-caller-identity --output json >/dev/null
                     detail_text = (stderr or "").strip()
                     detail = f": {detail_text}" if detail_text else ""
                     raise AwsLifecycleError(f"{command[0]} failed{detail}")
-                del stdout
-                return
+                if not isinstance(stdout, str):
+                    raise AwsLifecycleError(
+                        f"{command[0]} returned non-text output"
+                    )
+                return stdout
         finally:
             if process.returncode is None:
                 process.terminate()
@@ -1602,6 +1906,7 @@ class AwsOrchestrator:
         max_hours: Decimal,
         *,
         before_mutation: Callable[[], None] | None = None,
+        instance_type: str | None = None,
     ) -> LaunchedInstance:
         """Launch one allowed Spot instance after the conservative budget gate."""
         if (
@@ -1614,6 +1919,13 @@ class AwsOrchestrator:
         self._require_fresh_preflight()
         if phase not in self.config.allocations:
             raise ValueError(f"phase {phase!r} is not configured")
+        if (
+            instance_type is not None
+            and instance_type not in self.config.instance_types
+        ):
+            raise AwsLifecycleError(
+                "benchmark instance type is not a configured candidate"
+            )
         if (
             not isinstance(max_hours, Decimal)
             or not max_hours.is_finite()
@@ -1628,8 +1940,19 @@ class AwsOrchestrator:
             or not all(isinstance(offer, SpotOffer) for offer in offers)
         ):
             raise AwsLifecycleError("no valid allowed Spot offer is available")
+        candidate_offers = tuple(
+            offer
+            for offer in offers
+            if instance_type is None
+            or offer.instance_type == instance_type
+        )
+        if not candidate_offers:
+            raise AwsLifecycleError(
+                "no valid allowed Spot offer is available for the "
+                "configured candidate"
+            )
         offer = min(
-            offers,
+            candidate_offers,
             key=lambda item: (
                 item.hourly_usd,
                 item.instance_type,
@@ -2448,7 +2771,7 @@ def _positive_decimal_argument(value: str) -> Decimal:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the five explicit lifecycle subcommands."""
+    """Build the explicit guarded lifecycle subcommands."""
     parser = argparse.ArgumentParser(
         description="Guarded AWS lifecycle for MarioAI all-32 training"
     )
@@ -2459,6 +2782,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     preflight.add_argument("--config", required=True, type=Path)
 
+    benchmark = subparsers.add_parser(
+        "benchmark",
+        help="measure configured Spot candidates within the benchmark cap",
+    )
+    benchmark.add_argument("--config", required=True, type=Path)
+    benchmark.add_argument("--ledger", required=True, type=Path)
+    benchmark.add_argument(
+        "--max-spend",
+        required=True,
+        type=_positive_decimal_argument,
+    )
+    benchmark.add_argument("--ssh-key", type=Path)
+    benchmark.add_argument(
+        "--repo-dir",
+        type=Path,
+        default=Path(__file__).resolve().parents[1],
+    )
+
     launch = subparsers.add_parser(
         "launch", help="preflight and launch one guarded Spot instance"
     )
@@ -2468,6 +2809,7 @@ def build_parser() -> argparse.ArgumentParser:
     launch.add_argument(
         "--max-hours", required=True, type=_positive_decimal_argument
     )
+    launch.add_argument("--instance-type")
     launch.add_argument("--ssh-key", type=Path)
     launch.add_argument(
         "--repo-dir",
@@ -2486,6 +2828,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument(
         "--max-hours", required=True, type=_positive_decimal_argument
     )
+    resume.add_argument("--instance-type")
     resume.add_argument("--ssh-key", type=Path)
     resume.add_argument(
         "--repo-dir",
@@ -2788,6 +3131,179 @@ def _snapshot_authoritative_ledger(
     return snapshot_path
 
 
+def _phase_spent_usd(ledger: BudgetLedger, phase: str) -> Decimal:
+    return sum(
+        (run.cost_usd for run in ledger.runs if run.phase == phase),
+        Decimal("0"),
+    )
+
+
+def _run_benchmark_command(
+    *,
+    args: argparse.Namespace,
+    config: AwsConfig,
+    aws: Any,
+    output: Any,
+    remote: Any,
+    runner: Callable[..., Any],
+    monotonic: Callable[[], float],
+    sleeper: Callable[[float], None],
+    client_token_factory: Callable[[], str],
+    wall_clock: Callable[[], float],
+) -> int:
+    allocation = config.allocations["benchmark"]
+    if args.max_spend > allocation:
+        raise ValueError(
+            "--max-spend exceeds the configured benchmark allocation"
+        )
+    with LaunchStateStore(
+        args.ledger, wall_clock=wall_clock
+    ) as reservation_store:
+        if reservation_store.load() is not None:
+            raise AwsLifecycleError(
+                "an unresolved launch reservation exists; run reconcile"
+            )
+        ledger = _configured_ledger(args.ledger, config)
+        selected_remote = remote
+        if selected_remote is None:
+            ssh_key = args.ssh_key
+            if ssh_key is None:
+                ssh_key = (
+                    Path.home() / ".ssh" / f"{config.key_name}.pem"
+                )
+            selected_remote = SshRemoteSupervisor(
+                aws=aws,
+                ssh_key=ssh_key,
+                local_repo=args.repo_dir,
+                runner=runner,
+                monotonic=monotonic,
+                sleeper=sleeper,
+            )
+        orchestrator = AwsOrchestrator(
+            config=config,
+            aws=aws,
+            ledger=ledger,
+            remote=selected_remote,
+            monotonic=monotonic,
+            sleeper=sleeper,
+            client_token_factory=client_token_factory,
+            reservation_store=reservation_store,
+        )
+        orchestrator.preflight()
+        if aws.project_instances(active_only=True):
+            raise AwsLifecycleError(
+                "active MarioAI-All32 instance exists; run reconcile"
+            )
+
+        measurements: list[Benchmark] = []
+        decision = "all_candidates_measured"
+        grace_hours = Decimal(config.grace_minutes) / Decimal("60")
+        for index, instance_type in enumerate(config.instance_types):
+            phase_spent = _phase_spent_usd(
+                orchestrator.ledger, "benchmark"
+            )
+            conservative_rate = (
+                config.on_demand_ceiling_usd[instance_type]
+                + orchestrator.volume_hourly_usd
+            )
+            projected_candidate = conservative_rate * (
+                _BENCHMARK_MAX_HOURS + grace_hours
+            )
+            if phase_spent + projected_candidate > args.max_spend:
+                decision = "allocation_exhausted"
+                break
+            if index:
+                orchestrator.preflight()
+            instance = orchestrator.launch_guarded_instance(
+                "benchmark",
+                _BENCHMARK_MAX_HOURS,
+                instance_type=instance_type,
+            )
+            try:
+                orchestrator.persist_elapsed(instance, args.ledger)
+                instance = orchestrator.wait_for_running_public_ip(
+                    instance, ledger_path=args.ledger
+                )
+                observation = selected_remote.benchmark(
+                    instance,
+                    environment_steps=_BENCHMARK_ENVIRONMENT_STEPS,
+                    max_seconds=int(
+                        _BENCHMARK_MAX_HOURS * _SECONDS_PER_HOUR
+                    ),
+                    on_tick=lambda: orchestrator._paid_tick(
+                        instance,
+                        args.ledger,
+                        absolute_deadline=orchestrator.training_deadline(
+                            instance
+                        ),
+                    ),
+                    absolute_deadline=orchestrator.training_deadline(
+                        instance
+                    ),
+                )
+                if (
+                    not isinstance(observation, BenchmarkObservation)
+                    or observation.environment_steps
+                    != _BENCHMARK_ENVIRONMENT_STEPS
+                ):
+                    raise AwsLifecycleError(
+                        "benchmark returned an invalid fixed-step observation"
+                    )
+                measurement = Benchmark.from_observation(
+                    instance_type=instance.instance_type,
+                    observation=observation,
+                    instance_hourly_usd=instance.spot_hourly_usd,
+                    volume_hourly_usd=instance.volume_hourly_usd,
+                )
+            except BaseException as benchmark_error:
+                try:
+                    orchestrator.terminate_and_settle(
+                        instance, args.ledger
+                    )
+                except BaseException as termination_error:
+                    benchmark_error.add_note(
+                        "benchmark EC2 termination/final accounting also "
+                        f"failed: {type(termination_error).__name__}: "
+                        f"{termination_error}"
+                    )
+                raise
+            orchestrator.terminate_and_settle(instance, args.ledger)
+            measurements.append(measurement)
+
+        if not measurements:
+            raise BudgetExceeded(
+                "benchmark allocation cannot fit one guarded candidate"
+            )
+        selected = select_benchmark(measurements)
+        _write_json(
+            output,
+            {
+                "benchmark_steps_unit": "environment_steps",
+                "benchmark_environment_steps": (
+                    _BENCHMARK_ENVIRONMENT_STEPS
+                ),
+                "max_spend_usd": str(args.max_spend),
+                "decision": decision,
+                "candidates": [
+                    measurement.to_dict()
+                    for measurement in measurements
+                ],
+                "selected_instance_type": selected.instance_type,
+                "env_steps_per_second": selected.env_steps_per_second,
+                "cost_per_million_steps": str(
+                    selected.cost_per_million_steps
+                ),
+                "peak_rss_gb": selected.peak_rss_gb,
+                "conservative_benchmark_spent_usd": str(
+                    _phase_spent_usd(
+                        orchestrator.ledger, "benchmark"
+                    )
+                ),
+            },
+        )
+    return 0
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -2842,6 +3358,19 @@ def main(
     if args.command == "preflight":
         _write_json(output, asdict(aws.preflight(config)))
         return 0
+    if args.command == "benchmark":
+        return _run_benchmark_command(
+            args=args,
+            config=config,
+            aws=aws,
+            output=output,
+            remote=remote,
+            runner=runner,
+            monotonic=monotonic,
+            sleeper=sleeper,
+            client_token_factory=client_token_factory,
+            wall_clock=wall_clock,
+        )
     if args.command == "status":
         aws.verify_account(config)
         instances = aws.project_instances(instance_id=args.instance_id)
@@ -3039,6 +3568,7 @@ def main(
             instance = orchestrator.launch_guarded_instance(
                 args.phase,
                 args.max_hours,
+                instance_type=args.instance_type,
                 before_mutation=(
                     verify_resume_before_mutation
                     if resume_bundle is not None

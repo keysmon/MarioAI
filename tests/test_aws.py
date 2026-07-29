@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ import yaml
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 import marioai.train as training
+import scripts.aws_all32 as aws_all32
 from marioai.aws import (
     AwsCli,
     AwsCliError,
@@ -280,6 +282,9 @@ class FakeRemote:
         self.started: list[tuple[str, str, int, str]] = []
         self.training_args: list[tuple[str, ...]] = []
         self.start_error: BaseException | None = None
+        self.benchmark_observations = {}
+        self.benchmark_calls = []
+        self.benchmark_error: BaseException | None = None
 
     def start(
         self,
@@ -299,6 +304,33 @@ class FakeRemote:
             (instance.instance_id, phase, max_seconds, s3_prefix)
         )
         self.training_args.append(tuple(train_args))
+
+    def benchmark(
+        self,
+        instance,
+        *,
+        environment_steps,
+        max_seconds,
+        on_tick=None,
+        absolute_deadline=None,
+    ):
+        self.benchmark_calls.append(
+            (
+                instance.instance_id,
+                instance.instance_type,
+                environment_steps,
+                max_seconds,
+                absolute_deadline,
+            )
+        )
+        if self.benchmark_error is not None:
+            raise self.benchmark_error
+        observation = self.benchmark_observations[instance.instance_type]
+        if self.clock is not None:
+            self.clock.now += float(observation.elapsed_seconds)
+        if on_tick is not None:
+            on_tick()
+        return observation
 
     def poll(self, instance) -> SimpleNamespace:
         if self.clock is not None:
@@ -524,6 +556,289 @@ def test_account_configuration_is_exact():
         "phase_2": Decimal("16.00"),
         "recovery": Decimal("10.00"),
         "evaluation": Decimal("4.00"),
+    }
+
+
+def test_benchmark_selects_lower_cost_per_million_steps():
+    offers = [
+        aws_all32.Benchmark("c7i.8xlarge", 1800.0, Decimal("0.5568")),
+        aws_all32.Benchmark("c7i.16xlarge", 2900.0, Decimal("0.9646")),
+    ]
+
+    selected = aws_all32.select_benchmark(offers)
+
+    assert selected.instance_type == "c7i.8xlarge"
+
+
+def test_benchmark_report_uses_exact_observed_duration_spot_and_volume_rate():
+    observation = aws_all32.BenchmarkObservation(
+        environment_steps=250_000,
+        elapsed_seconds=Decimal("125"),
+        peak_rss_gb=3.25,
+    )
+
+    benchmark = aws_all32.Benchmark.from_observation(
+        instance_type="c7i.8xlarge",
+        observation=observation,
+        instance_hourly_usd=Decimal("0.60"),
+        volume_hourly_usd=Decimal("0.12"),
+    )
+
+    assert benchmark.env_steps_per_second == 2000.0
+    assert benchmark.cost_per_million_steps == Decimal("0.1")
+    assert benchmark.observed_cost_usd == Decimal("0.025")
+    assert benchmark.to_dict() == {
+        "instance_type": "c7i.8xlarge",
+        "environment_steps": 250_000,
+        "elapsed_seconds": "125",
+        "env_steps_per_second": 2000.0,
+        "instance_hourly_usd": "0.60",
+        "volume_hourly_usd": "0.12",
+        "cost_per_million_steps": "0.1",
+        "peak_rss_gb": 3.25,
+        "observed_cost_usd": "0.025",
+    }
+
+
+@pytest.mark.parametrize(
+    "benchmark",
+    [
+        lambda: aws_all32.Benchmark("", 1.0, Decimal("0.60")),
+        lambda: aws_all32.Benchmark(
+            "c7i.8xlarge", 0.0, Decimal("0.60")
+        ),
+        lambda: aws_all32.Benchmark(
+            "c7i.8xlarge", float("nan"), Decimal("0.60")
+        ),
+        lambda: aws_all32.Benchmark(
+            "c7i.8xlarge", 1.0, Decimal("-0.01")
+        ),
+    ],
+)
+def test_benchmark_rejects_invalid_measurement_or_rate(benchmark):
+    with pytest.raises(ValueError):
+        benchmark()
+
+
+def test_benchmark_selection_rejects_empty_measurements():
+    with pytest.raises(ValueError, match="at least one"):
+        aws_all32.select_benchmark([])
+
+
+def test_phase_loop_promotes_only_better_coverage_and_reweights_regressions(
+    tmp_path,
+):
+    from marioai.results import EvaluationReport, sha256_file
+    from scripts.train_phase import PhaseLoop
+
+    levels = ("1-1", "1-2")
+    candidates = []
+    train_calls = []
+
+    def train_chunk(*, checkpoint, target_timesteps, level_weights):
+        candidate = tmp_path / f"candidate-{target_timesteps}.zip"
+        candidate.write_bytes(f"candidate {target_timesteps}".encode())
+        candidates.append(candidate)
+        train_calls.append(
+            (checkpoint, target_timesteps, dict(level_weights))
+        )
+        return candidate
+
+    passing_by_chunk = [
+        {"1-1"},
+        {"1-1", "1-2"},
+        {"1-2"},
+        {"1-2"},
+    ]
+    diagnostic_calls = []
+
+    def diagnose(*, checkpoint, active_levels, episodes, seed, deterministic):
+        diagnostic_calls.append(
+            (checkpoint, tuple(active_levels), episodes, seed, deterministic)
+        )
+        passing = passing_by_chunk[len(diagnostic_calls) - 1]
+        return EvaluationReport(
+            checkpoint_sha256=sha256_file(checkpoint),
+            deterministic=deterministic,
+            requested_episodes=episodes,
+            stages={
+                level: {
+                    "passed": level in passing,
+                    "clears": 1 if level in passing else 0,
+                    "episodes": episodes,
+                    "clear_rate": (1 / episodes if level in passing else 0.0),
+                    "mean_max_x": 100.0,
+                    "mean_reward": 1.0,
+                }
+                for level in active_levels
+            },
+            rollouts=[],
+        )
+
+    loop = PhaseLoop(
+        phase="phase_1",
+        deadline=datetime(2026, 7, 24, 13, 0, tzinfo=timezone.utc),
+        checkpoint=None,
+        levels=levels,
+        n_envs=5,
+        total_timesteps=8,
+        chunk_timesteps=2,
+        diagnostic_episodes=3,
+        diagnostic_seed=42000,
+        train_chunk=train_chunk,
+        diagnose=diagnose,
+        checkpoint_timesteps=lambda _path: 0,
+        now=lambda: NOW,
+        report_dir=tmp_path / "diagnostics",
+    )
+
+    best = loop.run()
+
+    assert best == candidates[1]
+    assert [call[0] for call in train_calls] == [
+        None,
+        candidates[0],
+        candidates[1],
+        candidates[2],
+    ]
+    assert all(call[2] == 3 and call[4] is False for call in diagnostic_calls)
+    assert loop.next_weights == {"1-1": 2.0, "1-2": 1.0}
+    assert loop.next_worker_levels == (
+        "1-1",
+        "1-1",
+        "1-1",
+        "1-2",
+        "1-2",
+    )
+    reports = sorted((tmp_path / "diagnostics").glob("*.json"))
+    assert len(reports) == 4
+    assert all(not EvaluationReport.read(path).passed for path in reports)
+
+
+def test_run_phase_resumes_in_environment_step_chunks_and_clamps_final_chunk(
+    tmp_path, monkeypatch
+):
+    from marioai.results import EvaluationReport, sha256_file
+    import scripts.train_phase as phase_training
+
+    config_path = tmp_path / "all32.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "levels": {"phase_1": ["1-1"]},
+                "env": {"skip": 4},
+                "train": {"n_envs": 1, "seed": 42},
+                "evaluation": {
+                    "diagnostic_episodes": 3,
+                    "seed": 42000,
+                },
+                "phases": {
+                    "phase_1": {
+                        "total_timesteps": 8,
+                        "chunk_timesteps": 4,
+                        "level_weights": {},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    initial = tmp_path / "initial.zip"
+    initial.write_bytes(b"three environment steps")
+    targets = []
+
+    def train_shared_chunk(
+        *,
+        phase,
+        config,
+        checkpoint,
+        target_timesteps,
+        level_weights,
+    ):
+        assert phase == "phase_1"
+        assert config["env"]["skip"] == 4
+        assert checkpoint == (initial if not targets else targets[-1][1])
+        candidate = tmp_path / f"candidate-{target_timesteps}.zip"
+        candidate.write_bytes(str(target_timesteps).encode())
+        targets.append((target_timesteps, candidate, dict(level_weights)))
+        return candidate
+
+    def diagnose_shared_checkpoint(
+        *, checkpoint, active_levels, episodes, seed, deterministic
+    ):
+        return EvaluationReport(
+            checkpoint_sha256=sha256_file(checkpoint),
+            deterministic=deterministic,
+            requested_episodes=episodes,
+            stages={
+                "1-1": {
+                    "passed": True,
+                    "clears": 1,
+                    "episodes": 3,
+                    "clear_rate": 1 / 3,
+                    "mean_max_x": float(int(checkpoint.stem.rsplit("-", 1)[1])),
+                    "mean_reward": 1.0,
+                }
+            },
+            rollouts=[],
+        )
+
+    monkeypatch.setattr(phase_training, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(
+        phase_training,
+        "REPORT_ROOT",
+        tmp_path / "reports" / "diagnostics",
+    )
+    monkeypatch.setattr(
+        phase_training, "_checkpoint_timesteps", lambda _path: 3
+    )
+    monkeypatch.setattr(
+        phase_training, "_train_shared_chunk", train_shared_chunk
+    )
+    monkeypatch.setattr(
+        phase_training,
+        "_diagnose_shared_checkpoint",
+        diagnose_shared_checkpoint,
+    )
+    monkeypatch.setattr(phase_training, "_utc_now", lambda: NOW)
+
+    best = phase_training.run_phase(
+        "phase_1",
+        datetime(2026, 7, 24, 13, 0, tzinfo=timezone.utc),
+        initial,
+    )
+
+    assert [target for target, _path, _weights in targets] == [7, 8]
+    assert best == targets[-1][1]
+
+
+def test_train_phase_benchmark_cli_preserves_exact_environment_step_units(
+    monkeypatch,
+):
+    import scripts.train_phase as phase_training
+
+    observed = []
+
+    def workload(environment_steps):
+        observed.append(environment_steps)
+        return Decimal("125.5"), 4.25
+
+    monkeypatch.setattr(
+        phase_training, "_run_benchmark_workload", workload, raising=False
+    )
+    stdout = io.StringIO()
+
+    result = phase_training.main(
+        ["benchmark", "--environment-steps", "250000"],
+        stdout=stdout,
+    )
+
+    assert result == 0
+    assert observed == [250_000]
+    assert json.loads(stdout.getvalue()) == {
+        "environment_steps": 250_000,
+        "elapsed_seconds": "125.5",
+        "peak_rss_gb": 4.25,
     }
 
 
@@ -1026,6 +1341,49 @@ def test_launch_selects_cheapest_offer_and_pins_observed_rate(orchestrator):
 
     assert instance.instance_type == "c7i.8xlarge"
     assert instance.spot_hourly_usd == Decimal("0.5568")
+
+
+def test_benchmark_launch_can_pin_each_configured_candidate(orchestrator):
+    orchestrator.aws.offers = (
+        SpotOffer(
+            instance_type="c7i.8xlarge",
+            availability_zone="us-east-1a",
+            subnet_id=orchestrator.config.subnet_ids[0],
+            hourly_usd=Decimal("0.50"),
+            timestamp=NOW,
+        ),
+        SpotOffer(
+            instance_type="c7i.16xlarge",
+            availability_zone="us-east-1b",
+            subnet_id=orchestrator.config.subnet_ids[1],
+            hourly_usd=Decimal("0.90"),
+            timestamp=NOW,
+        ),
+    )
+
+    instance = orchestrator.launch_guarded_instance(
+        "benchmark",
+        Decimal("0.5"),
+        instance_type="c7i.16xlarge",
+    )
+
+    assert instance.instance_type == "c7i.16xlarge"
+    assert orchestrator.aws.last_run_instances_request["InstanceType"] == (
+        "c7i.16xlarge"
+    )
+
+
+def test_benchmark_launch_rejects_unconfigured_candidate_before_mutation(
+    orchestrator,
+):
+    with pytest.raises(AwsLifecycleError, match="configured candidate"):
+        orchestrator.launch_guarded_instance(
+            "benchmark",
+            Decimal("0.5"),
+            instance_type="m7i.8xlarge",
+        )
+
+    assert not orchestrator.aws.run_instances_called
 
 
 @pytest.mark.parametrize(
@@ -1636,6 +1994,15 @@ def test_mutation_adapter_requires_exact_budget_authorized_shutdown_delay(
     [
         ["preflight", "--config", str(CONFIG_PATH)],
         [
+            "benchmark",
+            "--config",
+            str(CONFIG_PATH),
+            "--ledger",
+            "reports/aws-spend.json",
+            "--max-spend",
+            "4.00",
+        ],
+        [
             "launch",
             "--config",
             str(CONFIG_PATH),
@@ -1685,6 +2052,28 @@ def test_cli_exposes_each_guarded_lifecycle_subcommand(argv):
     args = build_parser().parse_args(argv)
 
     assert args.command == argv[0]
+
+
+def test_cli_launch_and_resume_accept_measured_configured_instance_type():
+    from scripts.aws_all32 import build_parser
+
+    launch = build_parser().parse_args(
+        [
+            "launch",
+            "--config",
+            str(CONFIG_PATH),
+            "--ledger",
+            "reports/aws-spend.json",
+            "--phase",
+            "phase_1",
+            "--max-hours",
+            "4",
+            "--instance-type",
+            "c7i.8xlarge",
+        ]
+    )
+
+    assert launch.instance_type == "c7i.8xlarge"
 
 
 def test_cli_preflight_dispatches_through_read_only_boundary(config):
@@ -1990,6 +2379,297 @@ def test_cli_launch_preflights_starts_monitors_and_terminates(config, tmp_path):
     payload = json.loads(stdout.getvalue())
     assert payload["instance_id"] == "i-0123456789abcdef0"
     assert payload["costed_run"]["instance_hourly_usd"] == "1.428"
+
+
+def _fake_benchmark_lifecycle(config):
+    clock = FakeMonotonic()
+    aws = FakeLifecycleAws(config)
+    aws.offers = (
+        SpotOffer(
+            instance_type="c7i.8xlarge",
+            availability_zone="us-east-1a",
+            subnet_id=config.subnet_ids[0],
+            hourly_usd=Decimal("0.60"),
+            timestamp=NOW,
+        ),
+        SpotOffer(
+            instance_type="c7i.16xlarge",
+            availability_zone="us-east-1b",
+            subnet_id=config.subnet_ids[1],
+            hourly_usd=Decimal("0.90"),
+            timestamp=NOW,
+        ),
+    )
+    instance_ids = iter(
+        ["i-00000000000000001", "i-00000000000000002"]
+    )
+
+    def assign_unique_instance_id():
+        aws.run_instances_response["Instances"][0]["InstanceId"] = next(
+            instance_ids
+        )
+
+    aws.run_instances_hook = assign_unique_instance_id
+    remote = FakeRemote(clock)
+    remote.benchmark_observations = {
+        "c7i.8xlarge": aws_all32.BenchmarkObservation(
+            environment_steps=250_000,
+            elapsed_seconds=Decimal("125"),
+            peak_rss_gb=3.25,
+        ),
+        "c7i.16xlarge": aws_all32.BenchmarkObservation(
+            environment_steps=250_000,
+            elapsed_seconds=Decimal("100"),
+            peak_rss_gb=5.5,
+        ),
+    }
+    return clock, aws, remote
+
+
+def test_cli_benchmark_measures_both_candidates_selects_cost_winner_and_settles(
+    config, tmp_path
+):
+    from scripts.aws_all32 import main
+
+    clock, aws, remote = _fake_benchmark_lifecycle(config)
+    stdout = io.StringIO()
+    ledger_path = tmp_path / "aws-spend.json"
+    tokens = iter(("benchmark-token-1", "benchmark-token-2"))
+
+    result = main(
+        [
+            "benchmark",
+            "--config",
+            str(CONFIG_PATH),
+            "--ledger",
+            str(ledger_path),
+            "--max-spend",
+            "4.00",
+        ],
+        stdout=stdout,
+        aws_override=aws,
+        remote=remote,
+        monotonic=clock,
+        sleeper=lambda _seconds: None,
+        client_token_factory=lambda: next(tokens),
+    )
+
+    assert result == 0
+    assert [call[1:4] for call in remote.benchmark_calls] == [
+        ("c7i.8xlarge", 250_000, 900),
+        ("c7i.16xlarge", 250_000, 900),
+    ]
+    assert aws.terminated_ids == [
+        "i-00000000000000001",
+        "i-00000000000000002",
+    ]
+    ledger = BudgetLedger.load(ledger_path)
+    assert [run.instance_hourly_usd for run in ledger.runs] == [
+        Decimal("1.428"),
+        Decimal("2.856"),
+    ]
+    payload = json.loads(stdout.getvalue())
+    assert payload["decision"] == "all_candidates_measured"
+    assert payload["selected_instance_type"] == "c7i.8xlarge"
+    assert payload["env_steps_per_second"] == 2000.0
+    assert payload["cost_per_million_steps"] == (
+        "0.08487654320987654320987654322"
+    )
+    assert payload["peak_rss_gb"] == 3.25
+    assert [candidate["environment_steps"] for candidate in payload["candidates"]] == [
+        250_000,
+        250_000,
+    ]
+
+
+def test_cli_benchmark_stops_early_when_remaining_allocation_cannot_fit_candidate(
+    config, tmp_path
+):
+    from scripts.aws_all32 import main
+
+    clock, aws, remote = _fake_benchmark_lifecycle(config)
+    ledger_path = tmp_path / "aws-spend.json"
+    volume_hourly = (
+        config.gp3_monthly_usd_per_gb
+        * Decimal(config.root_volume_gb)
+        / Decimal("720")
+    )
+    ledger = BudgetLedger(
+        cap_usd=config.cap_usd,
+        allocations=config.allocations,
+    ).update_run(
+        CostedRun(
+            phase="benchmark",
+            instance_id="i-prior-benchmark",
+            hours=Decimal("2"),
+            instance_hourly_usd=config.on_demand_ceiling_usd[
+                "c7i.8xlarge"
+            ],
+            volume_hourly_usd=volume_hourly,
+        )
+    )
+    ledger.save(ledger_path)
+    stdout = io.StringIO()
+
+    main(
+        [
+            "benchmark",
+            "--config",
+            str(CONFIG_PATH),
+            "--ledger",
+            str(ledger_path),
+            "--max-spend",
+            "4.00",
+        ],
+        stdout=stdout,
+        aws_override=aws,
+        remote=remote,
+        monotonic=clock,
+        sleeper=lambda _seconds: None,
+        client_token_factory=lambda: "benchmark-token-1",
+    )
+
+    payload = json.loads(stdout.getvalue())
+    assert payload["decision"] == "allocation_exhausted"
+    assert [candidate["instance_type"] for candidate in payload["candidates"]] == [
+        "c7i.8xlarge"
+    ]
+    assert aws.terminated_ids == ["i-00000000000000001"]
+
+
+def test_cli_benchmark_refuses_exhausted_or_oversized_allocation_before_launch(
+    config, tmp_path
+):
+    from scripts.aws_all32 import main
+
+    for max_spend in ("4.01", "0"):
+        _clock, aws, remote = _fake_benchmark_lifecycle(config)
+        with pytest.raises((ValueError, SystemExit)):
+            main(
+                [
+                    "benchmark",
+                    "--config",
+                    str(CONFIG_PATH),
+                    "--ledger",
+                    str(tmp_path / f"spend-{max_spend}.json"),
+                    "--max-spend",
+                    max_spend,
+                ],
+                stdout=io.StringIO(),
+                aws_override=aws,
+                remote=remote,
+            )
+        assert not aws.run_instances_called
+
+    clock, aws, remote = _fake_benchmark_lifecycle(config)
+    ledger_path = tmp_path / "exhausted.json"
+    volume_hourly = (
+        config.gp3_monthly_usd_per_gb
+        * Decimal(config.root_volume_gb)
+        / Decimal("720")
+    )
+    BudgetLedger(
+        cap_usd=config.cap_usd,
+        allocations=config.allocations,
+    ).update_run(
+        CostedRun(
+            phase="benchmark",
+            instance_id="i-prior-benchmark",
+            hours=Decimal("2.5"),
+            instance_hourly_usd=config.on_demand_ceiling_usd[
+                "c7i.8xlarge"
+            ],
+            volume_hourly_usd=volume_hourly,
+        )
+    ).save(ledger_path)
+
+    with pytest.raises(BudgetExceeded, match="benchmark.*allocation"):
+        main(
+            [
+                "benchmark",
+                "--config",
+                str(CONFIG_PATH),
+                "--ledger",
+                str(ledger_path),
+                "--max-spend",
+                "4.00",
+            ],
+            stdout=io.StringIO(),
+            aws_override=aws,
+            remote=remote,
+            monotonic=clock,
+            sleeper=lambda _seconds: None,
+        )
+    assert not aws.run_instances_called
+
+
+def test_cli_benchmark_terminates_candidate_when_measurement_fails(
+    config, tmp_path
+):
+    from scripts.aws_all32 import main
+
+    clock, aws, remote = _fake_benchmark_lifecycle(config)
+    remote.benchmark_error = RuntimeError("benchmark worker failed")
+
+    with pytest.raises(RuntimeError, match="benchmark worker failed"):
+        main(
+            [
+                "benchmark",
+                "--config",
+                str(CONFIG_PATH),
+                "--ledger",
+                str(tmp_path / "aws-spend.json"),
+                "--max-spend",
+                "4.00",
+            ],
+            stdout=io.StringIO(),
+            aws_override=aws,
+            remote=remote,
+            monotonic=clock,
+            sleeper=lambda _seconds: None,
+            client_token_factory=lambda: "benchmark-token-1",
+        )
+
+    assert aws.terminated_ids == ["i-00000000000000001"]
+
+
+def test_cli_benchmark_running_project_query_blocks_before_launch(
+    config, tmp_path
+):
+    from scripts.aws_all32 import main
+
+    clock, aws, remote = _fake_benchmark_lifecycle(config)
+    aws.project_results = [
+        (
+            {
+                "instance_id": "i-00000000000000009",
+                "instance_type": "c7i.8xlarge",
+                "public_ip": "203.0.113.9",
+                "state": "running",
+            },
+        )
+    ]
+
+    with pytest.raises(AwsLifecycleError, match="active MarioAI-All32"):
+        main(
+            [
+                "benchmark",
+                "--config",
+                str(CONFIG_PATH),
+                "--ledger",
+                str(tmp_path / "aws-spend.json"),
+                "--max-spend",
+                "4.00",
+            ],
+            stdout=io.StringIO(),
+            aws_override=aws,
+            remote=remote,
+            monotonic=clock,
+            sleeper=lambda _seconds: None,
+        )
+
+    assert not aws.run_instances_called
+    assert remote.benchmark_calls == []
 
 
 def test_cli_launch_terminates_when_remote_start_fails(config, tmp_path):
@@ -3067,6 +3747,72 @@ def test_ssh_remote_start_uses_argument_vectors(orchestrator, tmp_path):
     assert "aws sts get-caller-identity" in dependency_bootstrap
     assert 'if ! kill -0 "$pid"' in startup_script
     assert "</dev/null" in startup_script
+
+
+def test_ssh_remote_benchmark_uses_fresh_host_bootstrap_and_strict_json(
+    orchestrator, tmp_path
+):
+    from scripts.aws_all32 import SshRemoteSupervisor
+
+    orchestrator.preflight()
+    instance = orchestrator.launch_guarded_instance(
+        "benchmark", Decimal("1")
+    )
+    ssh_key = tmp_path / "mario-training-key.pem"
+    ssh_key.write_text("test-only", encoding="utf-8")
+    local_repo = tmp_path / "MarioAI"
+    local_repo.mkdir()
+    calls = []
+
+    def runner(command, **kwargs):
+        calls.append((command, kwargs))
+        stdout = ""
+        if len(calls) == 5:
+            stdout = json.dumps(
+                {
+                    "environment_steps": 250_000,
+                    "elapsed_seconds": "125.5",
+                    "peak_rss_gb": 4.25,
+                }
+            )
+        return SimpleNamespace(stdout=stdout, stderr="", returncode=0)
+
+    remote = SshRemoteSupervisor(
+        aws=orchestrator.aws,
+        ssh_key=ssh_key,
+        local_repo=local_repo,
+        runner=runner,
+        monotonic=lambda: 0.0,
+    )
+
+    observation = remote.benchmark(
+        instance,
+        environment_steps=250_000,
+        max_seconds=900,
+        absolute_deadline=Decimal("900"),
+    )
+
+    assert observation == aws_all32.BenchmarkObservation(
+        environment_steps=250_000,
+        elapsed_seconds=Decimal("125.5"),
+        peak_rss_gb=4.25,
+    )
+    assert [command[0] for command, _kwargs in calls] == [
+        "ssh",
+        "ssh",
+        "rsync",
+        "ssh",
+        "ssh",
+    ]
+    assert all(isinstance(command, list) for command, _kwargs in calls)
+    assert all("shell" not in kwargs for _command, kwargs in calls)
+    assert "import marioai, torch" in calls[3][1]["input"]
+    benchmark_script = calls[4][1]["input"]
+    assert "scripts/train_phase.py benchmark" in benchmark_script
+    assert calls[4][0][-2:] == [
+        shlex.quote("/home/ubuntu/MarioAI"),
+        "250000",
+    ]
 
 
 def test_ssh_readiness_retries_with_bounded_argument_vectors(
