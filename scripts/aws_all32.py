@@ -2755,6 +2755,7 @@ def _resume_training_args(
     arguments = [
         "--config",
         relative(bundle.run_config_path),
+        "--phase-resolved-config",
         "--run-name",
         run_name,
         "--resume",

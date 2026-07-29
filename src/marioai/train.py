@@ -207,20 +207,29 @@ def _override(overrides: argparse.Namespace, name: str):
 
 
 def load_training_config(
-    path: str, phase: str | None, overrides: argparse.Namespace
+    path: str,
+    phase: str | None,
+    overrides: argparse.Namespace,
 ) -> dict:
     """Load a config, select a phase, and apply explicit CLI overrides."""
     with open(path) as config_file:
         cfg = copy.deepcopy(yaml.safe_load(config_file))
 
-    phases = cfg.get("phases")
-    if phases is not None:
-        if phase not in phases:
-            raise ValueError(f"unknown training phase {phase!r}")
-        cfg["train"].update(phases[phase])
-        levels = cfg["levels"][phase]
+    if bool(getattr(overrides, "phase_resolved_config", False)):
+        levels = cfg.get("levels")
+        if not isinstance(levels, list):
+            raise ValueError(
+                "phase-resolved config must contain a levels list"
+            )
     else:
-        levels = cfg["levels"]["train"]
+        phases = cfg.get("phases")
+        if phases is not None:
+            if phase not in phases:
+                raise ValueError(f"unknown training phase {phase!r}")
+            cfg["train"].update(phases[phase])
+            levels = cfg["levels"][phase]
+        else:
+            levels = cfg["levels"]["train"]
     cfg["levels"] = list(levels)
     cfg["train"].setdefault("level_weights", {})
 
@@ -577,6 +586,14 @@ class CurriculumLogCallback(BaseCallback):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument(
+        "--phase-resolved-config",
+        action="store_true",
+        help=(
+            "Treat --config as an already phase-resolved checkpoint config; "
+            "--phase remains run identity metadata."
+        ),
+    )
     parser.add_argument("--phase", choices=("phase_1", "phase_2"), default=None)
     parser.add_argument(
         "--levels",

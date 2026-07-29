@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import gymnasium as gym
@@ -3705,6 +3706,208 @@ def test_cloud_supervisor_never_publishes_manifest_after_artifact_sync_failure(
     assert not any("\ts3\tcp\t" in line for line in aws_calls)
 
 
+def test_cloud_resume_executes_phase_resolved_manifest_config_end_to_end(
+    config, tmp_path
+):
+    """Catches cloud_train applying PHASE twice to manifested resolved YAML."""
+    from scripts import aws_all32
+
+    repository = tmp_path / "MarioAI"
+    staging = repository / ".resume" / "phase_1-integration"
+    staging.mkdir(parents=True)
+    (repository / "models").mkdir()
+    (repository / "reports").mkdir()
+    (repository / ".venv" / "bin").mkdir(parents=True)
+    manifest_uri, artifacts, manifest = _checkpoint_objects(
+        config, tmp_path
+    )
+    del manifest_uri
+    paths = {
+        "model": staging / manifest["model"],
+        "run_config": staging / manifest["run_config"],
+        "signature": staging / manifest["signature"],
+        "vecnormalize": staging / manifest["vecnormalize"],
+        "budget_ledger": staging / manifest["budget_ledger"],
+    }
+    for path in paths.values():
+        path.write_bytes(artifacts[path.name])
+    manifest_path = staging / "latest.json"
+    manifest_path.write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    authoritative_ledger_path = (
+        staging / "authoritative-budget-ledger.json"
+    )
+    BudgetLedger(
+        cap_usd=config.cap_usd, allocations=config.allocations
+    ).save(authoritative_ledger_path)
+    bundle = aws_all32.ResumeBundle(
+        root=staging,
+        manifest_path=manifest_path,
+        model_path=paths["model"],
+        run_config_path=paths["run_config"],
+        signature_path=paths["signature"],
+        vecnormalize_path=paths["vecnormalize"],
+        budget_ledger_path=paths["budget_ledger"],
+        manifest=manifest,
+    )
+    train_args = aws_all32._resume_training_args(
+        bundle,
+        repository,
+        authoritative_ledger_path=authoritative_ledger_path,
+    )
+
+    command_dir = tmp_path / "bin"
+    command_dir.mkdir()
+    _fake_executable(
+        command_dir / "timeout",
+        'shift 3\nexec "$@"\n',
+    )
+    _fake_executable(command_dir / "aws", "exit 0\n")
+    _fake_executable(command_dir / "sudo", "exit 0\n")
+    events_path = tmp_path / "training-events.json"
+    python_shim = repository / ".venv" / "bin" / "python"
+    python_shim.write_text(
+        f"""#!{sys.executable}
+import json
+import os
+from pathlib import Path
+import sys
+
+import marioai.train as training
+
+events = {{"argv": sys.argv[3:]}}
+
+
+class FakeLoadedModel:
+    num_timesteps = 250000
+
+
+class FakeTrainingModel(FakeLoadedModel):
+    def learn(self, *, total_timesteps, callback, reset_num_timesteps):
+        events["learn_timesteps"] = total_timesteps
+        events["reset_num_timesteps"] = reset_num_timesteps
+        events["callback_count"] = len(callback)
+        events["checkpoint_phase"] = callback[0].phase
+        events["checkpoint_ledger"] = str(
+            callback[0].budget_ledger_path
+        )
+
+    def save(self, path):
+        Path(path).with_suffix(".zip").write_bytes(b"resumed")
+
+
+class FakeVecEnv:
+    def save(self, path):
+        Path(path).write_bytes(b"normalization")
+
+    def close(self):
+        events["closed"] = True
+
+
+def fake_load(path, **_kwargs):
+    events["loaded_model"] = str(path)
+    return FakeLoadedModel()
+
+
+def fake_build_training_env(cfg, args, vecnormalize_path=None):
+    events["phase"] = args.phase
+    events["config"] = args.config
+    events["levels"] = cfg["levels"]
+    events["total_timesteps"] = cfg["train"]["total_timesteps"]
+    events["resume"] = args.resume
+    events["vecnormalize"] = str(vecnormalize_path)
+    events["ledger"] = str(args.budget_ledger_snapshot)
+    return FakeVecEnv()
+
+
+def fake_create_model(_cfg, args, _venv, _device):
+    events["create_model_resume"] = args.resume
+    return FakeTrainingModel()
+
+
+training.resolve_device = lambda _name: "cpu"
+training.validate_resume_model = lambda *_args, **_kwargs: None
+training.PPO.load = staticmethod(fake_load)
+training.build_training_env = fake_build_training_env
+training.create_model = fake_create_model
+training.main(sys.argv[3:])
+Path(os.environ["TRAINING_EVENTS"]).write_text(
+    json.dumps(events, sort_keys=True), encoding="utf-8"
+)
+""",
+        encoding="utf-8",
+    )
+    python_shim.chmod(0o755)
+    environment = {
+        **os.environ,
+        "PATH": f"{command_dir}:{os.environ['PATH']}",
+        "PYTHONPATH": str(Path(__file__).parents[1]),
+        "TRAINING_EVENTS": str(events_path),
+    }
+
+    completed = subprocess.run(
+        [
+            "bash",
+            str(CLOUD_TRAIN_PATH),
+            "phase_1",
+            "120",
+            str(repository),
+            "s3://bucket/marioai/all32/",
+            *train_args,
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+        timeout=15,
+        env=environment,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    events = json.loads(events_path.read_text(encoding="utf-8"))
+    assert events["phase"] == "phase_1"
+    assert events["config"] == (
+        ".resume/phase_1-integration/"
+        "ckpt_run_config_250000_steps.yaml"
+    )
+    assert events["levels"] == [
+        "1-1",
+        "1-2",
+        "1-3",
+        "1-4",
+        "2-1",
+        "2-2",
+        "2-3",
+        "2-4",
+        "3-1",
+        "3-2",
+        "3-3",
+        "3-4",
+        "4-1",
+        "4-2",
+        "4-3",
+        "4-4",
+    ]
+    assert events["loaded_model"] == (
+        ".resume/phase_1-integration/ckpt_250000_steps.zip"
+    )
+    assert events["create_model_resume"] == events["loaded_model"]
+    assert events["vecnormalize"] == (
+        ".resume/phase_1-integration/"
+        "ckpt_vecnormalize_250000_steps.pkl"
+    )
+    assert events["ledger"] == (
+        ".resume/phase_1-integration/"
+        "authoritative-budget-ledger.json"
+    )
+    assert events["checkpoint_phase"] == "phase_1"
+    assert events["checkpoint_ledger"] == events["ledger"]
+    assert events["total_timesteps"] == 32000000
+    assert events["learn_timesteps"] == 31750000
+    assert events["reset_num_timesteps"] is False
+    assert events["closed"] is True
+
+
 def test_restore_downloads_only_exact_manifest_named_bundle(config, tmp_path):
     """Catches wildcard/latest guessing or downloading unmanifested S3 objects."""
     from scripts import aws_all32
@@ -3943,6 +4146,7 @@ def test_cli_resume_verifies_before_paid_launch_and_passes_exact_paths(
                 ".resume/phase_1-test/"
                 "ckpt_run_config_250000_steps.yaml"
             ),
+            "--phase-resolved-config",
             "--run-name",
             "all32-phase_1",
             "--resume",
