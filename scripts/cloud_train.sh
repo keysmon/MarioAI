@@ -33,6 +33,12 @@ if [[ ! "$SYNC_INTERVAL_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
   echo "sync interval must be a positive integer" >&2
   exit 64
 fi
+DURABLE_STOP_RESERVE_SECONDS=${MARIOAI_DURABLE_STOP_RESERVE_SECONDS:-60}
+if [[ ! "$DURABLE_STOP_RESERVE_SECONDS" =~ ^[1-9][0-9]*$ ]] || \
+  (( DURABLE_STOP_RESERVE_SECONDS >= MAX_SECONDS )); then
+  echo "durable-stop reserve must be positive and below maximum seconds" >&2
+  exit 64
+fi
 
 sync_checkpoints() {
   local snapshot_dir
@@ -102,5 +108,11 @@ trap finish EXIT INT TERM
 cd "$REPO_DIR" || exit 1
 periodic_sync &
 SYNC_PID=$!
+DEADLINE_EPOCH=$((
+  $(date +%s) + MAX_SECONDS - DURABLE_STOP_RESERVE_SECONDS
+))
 timeout --signal=TERM --kill-after=300 "$MAX_SECONDS" \
-  .venv/bin/python -m marioai.train --phase "$PHASE" "$@"
+  .venv/bin/python scripts/train_phase.py phase \
+  --phase "$PHASE" \
+  --deadline-epoch "$DEADLINE_EPOCH" \
+  "$@"

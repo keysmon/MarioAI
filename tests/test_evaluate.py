@@ -1,4 +1,5 @@
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -489,6 +490,54 @@ def test_rollout_seed_controls_environment_reset_and_policy_sampling(monkeypatch
     assert different.max_x == (124 * 3 + 124 * 7) % 97
     assert different.max_x != first.max_x
     assert all(environment.closed for environment in environments)
+
+
+def test_rollout_stops_at_aware_deadline_and_closes_environment(monkeypatch):
+    deadline = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
+    times = iter(
+        [
+            deadline - timedelta(seconds=1),
+            deadline - timedelta(seconds=1),
+            deadline,
+        ]
+    )
+
+    class MultiStepEnv(_OneStepVectorEnv):
+        def __init__(self):
+            super().__init__()
+            self.steps = 0
+
+        def step(self, action):
+            self.steps += 1
+            return (
+                np.array([0]),
+                np.array([0.0]),
+                np.array([False]),
+                [{"flag_get": False, "time": 200, "x_pos": int(action[0])}],
+            )
+
+    environment = MultiStepEnv()
+    monkeypatch.setattr(
+        evaluation,
+        "_make_evaluation_env",
+        lambda **_kwargs: environment,
+    )
+
+    with pytest.raises(
+        evaluation.EvaluationDeadlineReached,
+        match="deadline",
+    ):
+        evaluate_rollout(
+            _SeededPolicy(),
+            "1-1",
+            seed=5,
+            deterministic=False,
+            deadline=deadline,
+            now=lambda: next(times),
+        )
+
+    assert environment.steps == 1
+    assert environment.closed is True
 
 
 def test_evaluation_factory_pins_complex_action_set():

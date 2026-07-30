@@ -687,6 +687,153 @@ def test_durable_checkpoint_writes_complete_resume_manifest(tmp_path):
     }
 
 
+def test_durable_checkpoint_publishes_immutable_generation_manifest(
+    tmp_path,
+):
+    """Every phase candidate must be addressable without a mutable head."""
+    cfg = _orchestration_config(normalize_reward=False)
+    ledger_path = tmp_path / "aws-spend.json"
+    ledger_path.write_text('{"schema_version":1}\n', encoding="utf-8")
+
+    class FakeModel:
+        num_timesteps = 250000
+        action_space = gym.spaces.Discrete(12)
+        observation_space = gym.spaces.Box(
+            0, 255, shape=(4, 84, 84), dtype=np.uint8
+        )
+        policy = SimpleNamespace(
+            features_extractor=_impala_extractor(
+                features_dim=512,
+                channels=(16, 32, 32),
+            )
+        )
+
+        def save(self, path):
+            Path(path).write_bytes(b"candidate model")
+
+    callback = training.DurableCheckpointCallback(
+        save_path=tmp_path,
+        save_freq=1,
+        run_config=cfg,
+        budget_ledger_path=ledger_path,
+        phase="phase_1",
+        run_name="all32-phase_1",
+    )
+
+    generation_manifest = callback.save_checkpoint(FakeModel())
+
+    assert generation_manifest == (
+        tmp_path / "ckpt_manifest_250000_steps.json"
+    )
+    assert generation_manifest.is_file()
+    assert (tmp_path / "latest.json").read_bytes() == (
+        generation_manifest.read_bytes()
+    )
+
+
+def test_phase_training_returns_complete_final_generation_manifest(
+    monkeypatch, tmp_path
+):
+    """The candidate handed to diagnostics is the final durable bundle."""
+    cfg = _orchestration_config(normalize_reward=False)
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text('{"schema_version":1}\n', encoding="utf-8")
+    callback_types = []
+
+    class FakeModel:
+        num_timesteps = 0
+        action_space = gym.spaces.Discrete(12)
+        observation_space = gym.spaces.Box(
+            0, 255, shape=(4, 84, 84), dtype=np.uint8
+        )
+        policy = SimpleNamespace(
+            features_extractor=_impala_extractor(
+                features_dim=512,
+                channels=(16, 32, 32),
+            )
+        )
+
+        def learn(self, *, total_timesteps, callback, **_kwargs):
+            callback_types.extend(
+                type(item).__name__ for item in callback
+            )
+            self.num_timesteps += total_timesteps
+
+        def save(self, path):
+            Path(path).with_suffix(".zip").write_bytes(b"final candidate")
+
+    class FakeEnvironment:
+        def close(self):
+            pass
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        training,
+        "load_training_config",
+        lambda *_args, **_kwargs: cfg,
+    )
+    monkeypatch.setattr(
+        training, "build_training_env", lambda *_args, **_kwargs: FakeEnvironment()
+    )
+    monkeypatch.setattr(
+        training, "create_model", lambda *_args, **_kwargs: FakeModel()
+    )
+
+    manifest_path = training.main(
+        [
+            "--phase",
+            "phase_1",
+            "--run-name",
+            "phase-chunk",
+            "--budget-ledger-snapshot",
+            str(ledger),
+            "--publish-final-checkpoint",
+        ]
+    )
+
+    assert manifest_path == (
+        tmp_path
+        / "models"
+        / "phase-chunk"
+        / "ckpt_manifest_64_steps.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["num_timesteps"] == 64
+    assert callback_types == [
+        "DurableCheckpointCallback",
+        "StopAtTimestepsCallback",
+    ]
+    for field, hash_field in (
+        ("model", "sha256"),
+        ("run_config", "run_config_sha256"),
+        ("signature", "signature_sha256"),
+        ("budget_ledger", "budget_ledger_sha256"),
+    ):
+        artifact = manifest_path.parent / manifest[field]
+        assert artifact.is_file()
+        assert training.sha256_file(artifact) == manifest[hash_field]
+
+
+def test_deadline_callback_stops_training_before_outer_timeout():
+    callback = training.StopAtDeadlineCallback(
+        deadline_epoch=100,
+        clock=lambda: 101,
+    )
+    callback.model = SimpleNamespace(num_timesteps=32)
+
+    assert callback._on_step() is False
+    assert callback.stopped_at_timesteps == 32
+
+
+def test_phase_chunk_callback_stops_at_exact_absolute_target():
+    callback = training.StopAtTimestepsCallback(2_000_000)
+    callback.model = SimpleNamespace(num_timesteps=1_999_936)
+    assert callback._on_step() is True
+
+    callback.model.num_timesteps = 2_000_000
+    assert callback._on_step() is False
+
+
 def test_durable_checkpoint_same_timestep_artifacts_are_immutable(tmp_path):
     """Catches same-generation checkpoint bytes being silently replaced."""
     cfg = _orchestration_config(normalize_reward=False)

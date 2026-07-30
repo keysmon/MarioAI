@@ -85,6 +85,24 @@ class FakeMonotonic:
         return self.now
 
 
+def test_documented_direct_aws_cli_loads_phase_runner():
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(CONFIG_PATH.parents[1] / "scripts" / "aws_all32.py"),
+            "--help",
+        ],
+        cwd=CONFIG_PATH.parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "Guarded AWS lifecycle" in completed.stdout
+
+
 class FakeLifecycleAws:
     """In-memory lifecycle boundary; no AWS command is ever started."""
 
@@ -625,6 +643,545 @@ def test_benchmark_selection_rejects_empty_measurements():
         aws_all32.select_benchmark([])
 
 
+def test_process_tree_rss_sampler_sums_simultaneous_descendants_only(
+    tmp_path,
+):
+    import scripts.train_phase as phase_training
+
+    def write_status(pid: int, ppid: int, rss_kib: int) -> None:
+        process = tmp_path / str(pid)
+        process.mkdir(exist_ok=True)
+        (process / "status").write_text(
+            (
+                f"Name:\tprocess-{pid}\n"
+                f"Pid:\t{pid}\n"
+                f"PPid:\t{ppid}\n"
+                f"VmRSS:\t{rss_kib} kB\n"
+            ),
+            encoding="utf-8",
+        )
+
+    write_status(100, 1, 100)
+    write_status(101, 100, 200)
+    write_status(102, 100, 300)
+    write_status(103, 101, 400)
+    write_status(999, 1, 9999)
+    sampler = phase_training.ProcessTreePeakRss(
+        root_pid=100,
+        proc_root=tmp_path,
+        interval_seconds=0.01,
+    )
+
+    sampler.sample()
+    assert sampler.peak_bytes == (100 + 200 + 300 + 400) * 1024
+
+    write_status(100, 1, 50)
+    write_status(101, 100, 50)
+    write_status(102, 100, 50)
+    write_status(103, 101, 50)
+    sampler.sample()
+    assert sampler.peak_bytes == (100 + 200 + 300 + 400) * 1024
+
+    (tmp_path / "103" / "status").unlink()
+    sampler.sample()
+    assert sampler.peak_bytes == (100 + 200 + 300 + 400) * 1024
+
+
+def _write_phase_bundle(
+    repository: Path,
+    *,
+    directory_name: str,
+    timesteps: int,
+    model_payload: bytes,
+    budget_ledger_payload: bytes = b'{"schema_version":1}\n',
+) -> Path:
+    directory = repository / "models" / directory_name
+    directory.mkdir(parents=True)
+    names = {
+        "model": f"ckpt_{timesteps}_steps.zip",
+        "run_config": f"ckpt_run_config_{timesteps}_steps.yaml",
+        "signature": f"ckpt_signature_{timesteps}_steps.json",
+        "budget_ledger": (
+            f"ckpt_budget_ledger_{timesteps}_steps.json"
+        ),
+    }
+    payloads = {
+        "model": model_payload,
+        "run_config": b"levels: [1-1]\n",
+        "signature": b'{"schema_version":1}\n',
+        "budget_ledger": budget_ledger_payload,
+    }
+    for field, name in names.items():
+        (directory / name).write_bytes(payloads[field])
+    manifest = {
+        "schema_version": 1,
+        "run_name": directory_name,
+        "phase": "phase_1",
+        "num_timesteps": timesteps,
+        "model": names["model"],
+        "sha256": hashlib.sha256(model_payload).hexdigest(),
+        "action_set": "complex",
+        "action_count": 12,
+        "extractor": "impala",
+        "extractor_class": (
+            "marioai.features.ImpalaCnnFeaturesExtractor"
+        ),
+        "normalize_reward": False,
+        "vecnormalize": None,
+        "vecnormalize_sha256": None,
+        "signature": names["signature"],
+        "signature_sha256": hashlib.sha256(
+            payloads["signature"]
+        ).hexdigest(),
+        "run_config": names["run_config"],
+        "run_config_sha256": hashlib.sha256(
+            payloads["run_config"]
+        ).hexdigest(),
+        "budget_ledger": names["budget_ledger"],
+        "budget_ledger_sha256": hashlib.sha256(
+            payloads["budget_ledger"]
+        ).hexdigest(),
+    }
+    manifest_path = (
+        directory / f"ckpt_manifest_{timesteps}_steps.json"
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
+def test_phase_lineage_round_trip_keeps_last_candidate_and_promoted_best(
+    tmp_path,
+):
+    from marioai.results import (
+        EvaluationReport,
+        RolloutResult,
+        summarize_stage,
+    )
+    import scripts.train_phase as phase_training
+
+    best_manifest = _write_phase_bundle(
+        tmp_path,
+        directory_name="all32-phase_1-chunk-000000000004",
+        timesteps=4,
+        model_payload=b"best",
+    )
+    last_manifest = _write_phase_bundle(
+        tmp_path,
+        directory_name="all32-phase_1-chunk-000000000006",
+        timesteps=6,
+        model_payload=b"regressed last",
+    )
+    best_bundle = phase_training.BundleIdentity.from_manifest(
+        best_manifest, repository_root=tmp_path
+    )
+    last_bundle = phase_training.BundleIdentity.from_manifest(
+        last_manifest, repository_root=tmp_path
+    )
+    rollouts = [
+        RolloutResult(
+            level="1-1",
+            seed=42000 + index,
+            cleared=index == 0,
+            terminal_cause="flag" if index == 0 else "death",
+            max_x=100 - index,
+            reward=float(index),
+            steps=10,
+            wall_seconds=0.1,
+        )
+        for index in range(3)
+    ]
+    report = EvaluationReport(
+        checkpoint_sha256=best_bundle.model_sha256,
+        deterministic=False,
+        requested_episodes=3,
+        stages={"1-1": summarize_stage("1-1", rollouts)},
+        rollouts=rollouts,
+    )
+    report_path = (
+        tmp_path
+        / "models"
+        / "all32-phase_1"
+        / "diagnostics"
+        / "best.json"
+    )
+    report.write(report_path)
+    report_identity = phase_training.ReportIdentity.from_report(
+        report_path, repository_root=tmp_path
+    )
+    lineage = phase_training.PhaseLineage(
+        phase="phase_1",
+        run_name="all32-phase_1",
+        last_candidate=last_bundle,
+        last_diagnostic=None,
+        promoted_best=best_bundle,
+        best_report=report_identity,
+        next_weights={"1-1": 2.0},
+        pending_training=None,
+    )
+    store = phase_training.PhaseLineageStore(
+        tmp_path / "models" / "all32-phase_1" / "latest.json",
+        repository_root=tmp_path,
+    )
+
+    store.save(lineage)
+    restored = store.load()
+
+    assert restored.last_candidate == last_bundle
+    assert restored.promoted_best == best_bundle
+    assert restored.last_candidate != restored.promoted_best
+    assert restored.best_report == report_identity
+    assert restored.best_report.load(tmp_path) == report
+    assert restored.next_weights == {"1-1": 2.0}
+
+
+def test_train_shared_chunk_returns_only_a_verified_complete_bundle(
+    monkeypatch, tmp_path
+):
+    import scripts.train_phase as phase_training
+
+    manifest_path = _write_phase_bundle(
+        tmp_path,
+        directory_name="all32-phase_1-chunk-000000000004",
+        timesteps=4,
+        model_payload=b"complete candidate",
+    )
+    observed_arguments = []
+
+    def fake_main(arguments):
+        observed_arguments.extend(arguments)
+        return manifest_path
+
+    monkeypatch.setattr(phase_training.training, "main", fake_main)
+
+    candidate = phase_training._train_shared_chunk(
+        phase="phase_1",
+        config={},
+        config_path=tmp_path / "all32.yaml",
+        run_name_prefix="all32-phase_1",
+        budget_ledger_snapshot=tmp_path / "ledger.json",
+        checkpoint=None,
+        target_timesteps=4,
+        level_weights={"1-1": 1.0},
+        repository_root=tmp_path,
+        deadline=datetime.fromtimestamp(
+            1785524400, tz=timezone.utc
+        ),
+    )
+
+    assert isinstance(candidate, phase_training.BundleIdentity)
+    assert candidate.manifest_path == manifest_path.relative_to(
+        tmp_path
+    ).as_posix()
+    assert candidate.model_sha256 == hashlib.sha256(
+        b"complete candidate"
+    ).hexdigest()
+    assert "--publish-final-checkpoint" in observed_arguments
+    assert observed_arguments[
+        observed_arguments.index("--deadline-epoch") + 1
+    ] == "1785524400"
+
+
+def _three_rollout_report(
+    bundle,
+    *,
+    levels: tuple[str, ...],
+    base_seed: int,
+    passing: set[str],
+    progress: int,
+):
+    from marioai.results import (
+        EvaluationReport,
+        RolloutResult,
+        summarize_stage,
+    )
+
+    rollouts = []
+    stages = {}
+    for level_index, level in enumerate(levels):
+        stage_rollouts = [
+            RolloutResult(
+                level=level,
+                seed=base_seed + level_index * 3 + episode_index,
+                cleared=level in passing and episode_index == 0,
+                terminal_cause=(
+                    "flag"
+                    if level in passing and episode_index == 0
+                    else "death"
+                ),
+                max_x=progress + episode_index,
+                reward=float(progress),
+                steps=10,
+                wall_seconds=0.1,
+            )
+            for episode_index in range(3)
+        ]
+        rollouts.extend(stage_rollouts)
+        stages[level] = summarize_stage(level, stage_rollouts)
+    return EvaluationReport(
+        checkpoint_sha256=bundle.model_sha256,
+        deterministic=False,
+        requested_episodes=3,
+        stages=stages,
+        rollouts=rollouts,
+    )
+
+
+def test_phase_restart_diagnoses_pending_last_without_auto_promoting_regression(
+    tmp_path,
+):
+    import scripts.train_phase as phase_training
+
+    levels = ("1-1", "1-2")
+    best_bundle = phase_training.BundleIdentity.from_manifest(
+        _write_phase_bundle(
+            tmp_path,
+            directory_name="all32-phase_1-chunk-000000000004",
+            timesteps=4,
+            model_payload=b"promoted best",
+        ),
+        repository_root=tmp_path,
+    )
+    last_bundle = phase_training.BundleIdentity.from_manifest(
+        _write_phase_bundle(
+            tmp_path,
+            directory_name="all32-phase_1-chunk-000000000006",
+            timesteps=6,
+            model_payload=b"pending regression",
+        ),
+        repository_root=tmp_path,
+    )
+    best_report = _three_rollout_report(
+        best_bundle,
+        levels=levels,
+        base_seed=42004,
+        passing={"1-1", "1-2"},
+        progress=100,
+    )
+    best_report_path = (
+        tmp_path
+        / "models"
+        / "all32-phase_1"
+        / "diagnostics"
+        / "best.json"
+    )
+    best_report.write(best_report_path)
+    store = phase_training.PhaseLineageStore(
+        tmp_path / "models" / "all32-phase_1" / "latest.json",
+        repository_root=tmp_path,
+    )
+    store.save(
+        phase_training.PhaseLineage(
+            phase="phase_1",
+            run_name="all32-phase_1",
+            last_candidate=last_bundle,
+            last_diagnostic=None,
+            promoted_best=best_bundle,
+            best_report=phase_training.ReportIdentity.from_report(
+                best_report_path, repository_root=tmp_path
+            ),
+            next_weights={"1-1": 1.0, "1-2": 1.0},
+            pending_training=None,
+        )
+    )
+    train_calls = []
+    diagnostic_calls = []
+
+    def diagnose(
+        *,
+        checkpoint,
+        active_levels,
+        episodes,
+        seed,
+        deterministic,
+        deadline,
+    ):
+        diagnostic_calls.append(checkpoint)
+        assert checkpoint == last_bundle
+        assert deadline == NOW + timedelta(hours=1)
+        return _three_rollout_report(
+            checkpoint,
+            levels=tuple(active_levels),
+            base_seed=seed,
+            passing={"1-2"},
+            progress=20,
+        )
+
+    loop = phase_training.PhaseLoop(
+        phase="phase_1",
+        deadline=NOW + timedelta(hours=1),
+        checkpoint=None,
+        levels=levels,
+        n_envs=2,
+        total_timesteps=6,
+        chunk_timesteps=2,
+        diagnostic_episodes=3,
+        diagnostic_seed=42000,
+        train_chunk=lambda **kwargs: train_calls.append(kwargs),
+        diagnose=diagnose,
+        checkpoint_timesteps=lambda _path: 0,
+        now=lambda: NOW,
+        report_dir=(
+            tmp_path / "models" / "all32-phase_1" / "diagnostics"
+        ),
+        lineage_store=store,
+        repository_root=tmp_path,
+        run_name="all32-phase_1",
+    )
+
+    best = loop.run()
+    restored = store.load()
+
+    assert best == best_bundle.model(tmp_path)
+    assert diagnostic_calls == [last_bundle]
+    assert train_calls == []
+    assert restored.last_candidate == last_bundle
+    assert restored.last_diagnostic is not None
+    assert restored.promoted_best == best_bundle
+    assert restored.best_report.checkpoint_sha256 == (
+        best_bundle.model_sha256
+    )
+
+
+def test_phase_diagnostic_rejects_invalid_rollout_schema_even_when_summary_matches(
+    tmp_path,
+):
+    import scripts.train_phase as phase_training
+
+    bundle = phase_training.BundleIdentity.from_manifest(
+        _write_phase_bundle(
+            tmp_path,
+            directory_name="all32-phase_1-chunk-000000000006",
+            timesteps=6,
+            model_payload=b"candidate",
+        ),
+        repository_root=tmp_path,
+    )
+    valid = _three_rollout_report(
+        bundle,
+        levels=("1-1",),
+        base_seed=42006,
+        passing={"1-1"},
+        progress=10,
+    )
+    invalid_rollouts = list(valid.rollouts)
+    invalid_rollouts[0] = replace(invalid_rollouts[0], steps=0)
+    invalid = replace(valid, rollouts=invalid_rollouts)
+    loop = phase_training.PhaseLoop(
+        phase="phase_1",
+        deadline=NOW + timedelta(hours=1),
+        checkpoint=None,
+        levels=("1-1",),
+        n_envs=1,
+        total_timesteps=6,
+        chunk_timesteps=2,
+        diagnostic_episodes=3,
+        diagnostic_seed=42000,
+        train_chunk=lambda **_kwargs: bundle,
+        diagnose=lambda **_kwargs: valid,
+        checkpoint_timesteps=lambda _path: 0,
+        now=lambda: NOW,
+        report_dir=tmp_path / "diagnostics",
+    )
+
+    loop._validate_bundle_diagnostic(bundle, valid)
+    with pytest.raises(ValueError, match="diagnostic"):
+        loop._validate_bundle_diagnostic(bundle, invalid)
+
+
+def test_phase_diagnostic_deadline_returns_best_and_keeps_candidate_pending(
+    tmp_path,
+):
+    import scripts.train_phase as phase_training
+
+    best_bundle = phase_training.BundleIdentity.from_manifest(
+        _write_phase_bundle(
+            tmp_path,
+            directory_name="all32-phase_1-chunk-000000000004",
+            timesteps=4,
+            model_payload=b"best",
+        ),
+        repository_root=tmp_path,
+    )
+    pending_bundle = phase_training.BundleIdentity.from_manifest(
+        _write_phase_bundle(
+            tmp_path,
+            directory_name="all32-phase_1-chunk-000000000006",
+            timesteps=6,
+            model_payload=b"pending",
+        ),
+        repository_root=tmp_path,
+    )
+    best_report = _three_rollout_report(
+        best_bundle,
+        levels=("1-1",),
+        base_seed=42004,
+        passing={"1-1"},
+        progress=100,
+    )
+    report_path = (
+        tmp_path
+        / "models"
+        / "all32-phase_1"
+        / "diagnostics"
+        / "best.json"
+    )
+    best_report.write(report_path)
+    store = phase_training.PhaseLineageStore(
+        tmp_path / "models" / "all32-phase_1" / "latest.json",
+        repository_root=tmp_path,
+    )
+    store.save(
+        phase_training.PhaseLineage(
+            phase="phase_1",
+            run_name="all32-phase_1",
+            last_candidate=pending_bundle,
+            last_diagnostic=None,
+            promoted_best=best_bundle,
+            best_report=phase_training.ReportIdentity.from_report(
+                report_path, repository_root=tmp_path
+            ),
+            next_weights={"1-1": 1.0},
+            pending_training=None,
+        )
+    )
+
+    def deadline_diagnostic(**_kwargs):
+        raise phase_training.evaluation.EvaluationDeadlineReached(
+            "diagnostic deadline reached"
+        )
+
+    loop = phase_training.PhaseLoop(
+        phase="phase_1",
+        deadline=NOW + timedelta(hours=1),
+        checkpoint=None,
+        levels=("1-1",),
+        n_envs=1,
+        total_timesteps=6,
+        chunk_timesteps=2,
+        diagnostic_episodes=3,
+        diagnostic_seed=42000,
+        train_chunk=lambda **_kwargs: pytest.fail("must not train"),
+        diagnose=deadline_diagnostic,
+        checkpoint_timesteps=lambda _path: 0,
+        now=lambda: NOW,
+        report_dir=(
+            tmp_path / "models" / "all32-phase_1" / "diagnostics"
+        ),
+        lineage_store=store,
+        repository_root=tmp_path,
+        run_name="all32-phase_1",
+    )
+
+    assert loop.run() == best_bundle.model(tmp_path)
+    restored = store.load()
+    assert restored.last_candidate == pending_bundle
+    assert restored.last_diagnostic is None
+    assert restored.promoted_best == best_bundle
+
+
 def test_phase_loop_promotes_only_better_coverage_and_reweights_regressions(
     tmp_path,
 ):
@@ -718,7 +1275,6 @@ def test_phase_loop_promotes_only_better_coverage_and_reweights_regressions(
 def test_run_phase_resumes_in_environment_step_chunks_and_clamps_final_chunk(
     tmp_path, monkeypatch
 ):
-    from marioai.results import EvaluationReport, sha256_file
     import scripts.train_phase as phase_training
 
     config_path = tmp_path / "all32.yaml"
@@ -743,8 +1299,15 @@ def test_run_phase_resumes_in_environment_step_chunks_and_clamps_final_chunk(
         ),
         encoding="utf-8",
     )
-    initial = tmp_path / "initial.zip"
-    initial.write_bytes(b"three environment steps")
+    initial = phase_training.BundleIdentity.from_manifest(
+        _write_phase_bundle(
+            tmp_path,
+            directory_name="all32-phase_1-initial",
+            timesteps=3,
+            model_payload=b"three environment steps",
+        ),
+        repository_root=tmp_path,
+    )
     targets = []
 
     def train_shared_chunk(
@@ -754,44 +1317,45 @@ def test_run_phase_resumes_in_environment_step_chunks_and_clamps_final_chunk(
         checkpoint,
         target_timesteps,
         level_weights,
+        **_kwargs,
     ):
         assert phase == "phase_1"
         assert config["env"]["skip"] == 4
         assert checkpoint == (initial if not targets else targets[-1][1])
-        candidate = tmp_path / f"candidate-{target_timesteps}.zip"
-        candidate.write_bytes(str(target_timesteps).encode())
+        candidate = phase_training.BundleIdentity.from_manifest(
+            _write_phase_bundle(
+                tmp_path,
+                directory_name=(
+                    "all32-phase_1-chunk-"
+                    f"{target_timesteps:012d}"
+                ),
+                timesteps=target_timesteps,
+                model_payload=str(target_timesteps).encode(),
+            ),
+            repository_root=tmp_path,
+        )
         targets.append((target_timesteps, candidate, dict(level_weights)))
         return candidate
 
     def diagnose_shared_checkpoint(
-        *, checkpoint, active_levels, episodes, seed, deterministic
+        *,
+        checkpoint,
+        active_levels,
+        episodes,
+        seed,
+        deterministic,
+        **_kwargs,
     ):
-        return EvaluationReport(
-            checkpoint_sha256=sha256_file(checkpoint),
-            deterministic=deterministic,
-            requested_episodes=episodes,
-            stages={
-                "1-1": {
-                    "passed": True,
-                    "clears": 1,
-                    "episodes": 3,
-                    "clear_rate": 1 / 3,
-                    "mean_max_x": float(int(checkpoint.stem.rsplit("-", 1)[1])),
-                    "mean_reward": 1.0,
-                }
-            },
-            rollouts=[],
+        assert episodes == 3
+        assert deterministic is False
+        return _three_rollout_report(
+            checkpoint,
+            levels=tuple(active_levels),
+            base_seed=seed,
+            passing={"1-1"},
+            progress=checkpoint.num_timesteps,
         )
 
-    monkeypatch.setattr(phase_training, "CONFIG_PATH", config_path)
-    monkeypatch.setattr(
-        phase_training,
-        "REPORT_ROOT",
-        tmp_path / "reports" / "diagnostics",
-    )
-    monkeypatch.setattr(
-        phase_training, "_checkpoint_timesteps", lambda _path: 3
-    )
     monkeypatch.setattr(
         phase_training, "_train_shared_chunk", train_shared_chunk
     )
@@ -806,10 +1370,12 @@ def test_run_phase_resumes_in_environment_step_chunks_and_clamps_final_chunk(
         "phase_1",
         datetime(2026, 7, 24, 13, 0, tzinfo=timezone.utc),
         initial,
+        config_path=config_path,
+        repository_root=tmp_path,
     )
 
     assert [target for target, _path, _weights in targets] == [7, 8]
-    assert best == targets[-1][1]
+    assert best == targets[-1][1].model(tmp_path)
 
 
 def test_train_phase_benchmark_cli_preserves_exact_environment_step_units(
@@ -839,6 +1405,65 @@ def test_train_phase_benchmark_cli_preserves_exact_environment_step_units(
         "environment_steps": 250_000,
         "elapsed_seconds": "125.5",
         "peak_rss_gb": 4.25,
+    }
+
+
+def test_train_phase_phase_cli_requires_identity_and_aware_deadline(
+    monkeypatch, tmp_path
+):
+    import scripts.train_phase as phase_training
+
+    ledger = tmp_path / "ledger.json"
+    ledger.write_text("{}\n", encoding="utf-8")
+    observed = {}
+
+    def fake_run_phase(phase, deadline, checkpoint, **kwargs):
+        observed.update(
+            phase=phase,
+            deadline=deadline,
+            checkpoint=checkpoint,
+            kwargs=kwargs,
+        )
+        return tmp_path / "best.zip"
+
+    monkeypatch.setattr(phase_training, "run_phase", fake_run_phase)
+    stdout = io.StringIO()
+
+    result = phase_training.main(
+        [
+            "phase",
+            "--phase",
+            "phase_1",
+            "--run-name",
+            "all32-phase_1",
+            "--config",
+            "configs/all32.yaml",
+            "--deadline-epoch",
+            "1785524400",
+            "--budget-ledger-snapshot",
+            str(ledger),
+        ],
+        stdout=stdout,
+    )
+
+    assert result == 0
+    assert observed == {
+        "phase": "phase_1",
+        "deadline": datetime.fromtimestamp(
+            1785524400, tz=timezone.utc
+        ),
+        "checkpoint": None,
+        "kwargs": {
+            "config_path": Path("configs/all32.yaml"),
+            "run_name": "all32-phase_1",
+            "budget_ledger_snapshot": ledger,
+            "lineage_path": None,
+        },
+    }
+    assert json.loads(stdout.getvalue()) == {
+        "best_checkpoint": str(tmp_path / "best.zip"),
+        "phase": "phase_1",
+        "run_name": "all32-phase_1",
     }
 
 
@@ -2379,6 +3004,56 @@ def test_cli_launch_preflights_starts_monitors_and_terminates(config, tmp_path):
     payload = json.loads(stdout.getvalue())
     assert payload["instance_id"] == "i-0123456789abcdef0"
     assert payload["costed_run"]["instance_hourly_usd"] == "1.428"
+
+
+def test_cli_fresh_phase_launch_passes_required_phase_worker_identity(
+    config, tmp_path
+):
+    from scripts.aws_all32 import main
+
+    clock = FakeMonotonic()
+    aws = FakeLifecycleAws(config)
+    remote = FakeRemote(clock)
+    ledger_path = tmp_path / "aws-spend.json"
+
+    result = main(
+        [
+            "launch",
+            "--config",
+            str(CONFIG_PATH),
+            "--ledger",
+            str(ledger_path),
+            "--phase",
+            "phase_1",
+            "--max-hours",
+            "1.0",
+            "--repo-dir",
+            str(tmp_path),
+        ],
+        stdout=io.StringIO(),
+        aws_override=aws,
+        remote=remote,
+        monotonic=clock,
+        sleeper=lambda _seconds: None,
+        client_token_factory=lambda: "phase-worker-token",
+    )
+
+    assert result == 0
+    assert len(remote.training_args) == 1
+    arguments = remote.training_args[0]
+    assert arguments[:4] == (
+        "--config",
+        "configs/all32.yaml",
+        "--run-name",
+        "all32-phase_1",
+    )
+    ledger_index = arguments.index("--budget-ledger-snapshot")
+    remote_ledger = tmp_path / arguments[ledger_index + 1]
+    assert remote_ledger.is_file()
+    assert remote_ledger.is_relative_to(tmp_path / ".resume")
+    assert BudgetLedger.load(
+        remote_ledger, cap_usd=config.cap_usd
+    ).runs[0].instance_id == "i-0123456789abcdef0"
 
 
 def _fake_benchmark_lifecycle(config):
@@ -4017,6 +4692,75 @@ def _fake_executable(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
+def test_cloud_supervisor_executes_phase_worker_with_absolute_deadline(
+    tmp_path,
+):
+    command_dir = tmp_path / "bin"
+    command_dir.mkdir()
+    command_log = tmp_path / "commands.log"
+    repository = tmp_path / "MarioAI"
+    (repository / ".venv" / "bin").mkdir(parents=True)
+    (repository / "models").mkdir()
+    (repository / "reports").mkdir()
+    ledger = repository / ".resume" / "phase_1" / "ledger.json"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text("{}\n", encoding="utf-8")
+    logger = (
+        'printf "%s" "$0" >> "$COMMAND_LOG"\n'
+        'for argument in "$@"; do '
+        'printf "\\t%s" "$argument" >> "$COMMAND_LOG"; done\n'
+        'printf "\\n" >> "$COMMAND_LOG"\n'
+    )
+    _fake_executable(command_dir / "timeout", logger + "exit 7\n")
+    _fake_executable(command_dir / "aws", "exit 0\n")
+    _fake_executable(command_dir / "sudo", "exit 0\n")
+    environment = {
+        **os.environ,
+        "PATH": f"{command_dir}:{os.environ['PATH']}",
+        "COMMAND_LOG": str(command_log),
+    }
+    started_epoch = int(datetime.now(timezone.utc).timestamp())
+
+    completed = subprocess.run(
+        [
+            "bash",
+            str(CLOUD_TRAIN_PATH),
+            "phase_1",
+            "120",
+            str(repository),
+            "s3://bucket/marioai/all32/",
+            "--config",
+            "configs/all32.yaml",
+            "--run-name",
+            "all32-phase_1",
+            "--budget-ledger-snapshot",
+            ".resume/phase_1/ledger.json",
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        env=environment,
+    )
+
+    assert completed.returncode == 7
+    timeout_call = next(
+        line
+        for line in command_log.read_text(encoding="utf-8").splitlines()
+        if line.startswith(str(command_dir / "timeout"))
+    ).split("\t")
+    assert "scripts/train_phase.py" in timeout_call
+    assert "phase" in timeout_call
+    assert timeout_call[timeout_call.index("--phase") + 1] == "phase_1"
+    deadline_epoch = int(
+        timeout_call[timeout_call.index("--deadline-epoch") + 1]
+    )
+    assert started_epoch + 59 <= deadline_epoch <= started_epoch + 62
+    assert timeout_call[timeout_call.index("--run-name") + 1] == (
+        "all32-phase_1"
+    )
+
+
 def _vecnormalize_bytes(
     tmp_path: Path, *, clip_reward: float = 10.0
 ) -> bytes:
@@ -4263,12 +5007,25 @@ def test_cloud_supervisor_syncs_and_shuts_down_after_training_and_sync_failures(
 
     assert completed.returncode == 7
     commands = command_log.read_text(encoding="utf-8").splitlines()
-    assert commands == [
-        (
-            f"{command_dir / 'timeout'}\t--signal=TERM\t--kill-after=300"
-            "\t120\t.venv/bin/python\t-m\tmarioai.train"
-            "\t--phase\tphase_1\t--resume\tmodels/previous.zip"
-        ),
+    training_command = commands[0].split("\t")
+    assert training_command[:10] == [
+        str(command_dir / "timeout"),
+        "--signal=TERM",
+        "--kill-after=300",
+        "120",
+        ".venv/bin/python",
+        "scripts/train_phase.py",
+        "phase",
+        "--phase",
+        "phase_1",
+        "--deadline-epoch",
+    ]
+    assert int(training_command[10]) > 0
+    assert training_command[11:] == [
+        "--resume",
+        "models/previous.zip",
+    ]
+    assert commands[1:] == [
         (
             f"{command_dir / 'aws'}\ts3\tsync\t{repository}/models/"
             "\ts3://bucket/marioai/all32/models/"
@@ -4515,69 +5272,64 @@ def test_cloud_resume_executes_phase_resolved_manifest_config_end_to_end(
     python_shim = repository / ".venv" / "bin" / "python"
     python_shim.write_text(
         f"""#!{sys.executable}
+import argparse
 import json
 import os
 from pathlib import Path
 import sys
 
 import marioai.train as training
+import scripts.train_phase as phase_training
 
 events = {{"argv": sys.argv[3:]}}
 
 
-class FakeLoadedModel:
-    num_timesteps = 250000
-
-
-class FakeTrainingModel(FakeLoadedModel):
-    def learn(self, *, total_timesteps, callback, reset_num_timesteps):
-        events["learn_timesteps"] = total_timesteps
-        events["reset_num_timesteps"] = reset_num_timesteps
-        events["callback_count"] = len(callback)
-        events["checkpoint_phase"] = callback[0].phase
-        events["checkpoint_ledger"] = str(
-            callback[0].budget_ledger_path
-        )
-
-    def save(self, path):
-        Path(path).with_suffix(".zip").write_bytes(b"resumed")
-
-
-class FakeVecEnv:
-    def save(self, path):
-        Path(path).write_bytes(b"normalization")
-
-    def close(self):
-        events["closed"] = True
-
-
-def fake_load(path, **_kwargs):
-    events["loaded_model"] = str(path)
-    return FakeLoadedModel()
-
-
-def fake_build_training_env(cfg, args, vecnormalize_path=None):
-    events["phase"] = args.phase
-    events["config"] = args.config
+def fake_run_phase(
+    phase,
+    deadline,
+    checkpoint,
+    *,
+    config_path,
+    run_name,
+    budget_ledger_snapshot,
+    lineage_path,
+    phase_resolved_config=False,
+    **_kwargs,
+):
+    overrides = argparse.Namespace(
+        phase_resolved_config=phase_resolved_config,
+        levels=None,
+        timesteps=None,
+        n_envs=None,
+        lr=None,
+        ent_coef=None,
+        level_weights_json=None,
+    )
+    cfg = training.load_training_config(
+        str(config_path), phase, overrides
+    )
+    identity = phase_training.BundleIdentity.from_manifest(
+        checkpoint, repository_root=Path.cwd()
+    )
+    events["phase"] = phase
+    events["config"] = str(config_path)
     events["levels"] = cfg["levels"]
     events["total_timesteps"] = cfg["train"]["total_timesteps"]
-    events["resume"] = args.resume
-    events["vecnormalize"] = str(vecnormalize_path)
-    events["ledger"] = str(args.budget_ledger_snapshot)
-    return FakeVecEnv()
+    events["phase_resolved_config"] = phase_resolved_config
+    events["run_name"] = run_name
+    events["resume_manifest"] = str(checkpoint)
+    events["loaded_model"] = str(identity.model(Path.cwd()))
+    events["vecnormalize"] = identity.vecnormalize_path
+    events["ledger"] = str(budget_ledger_snapshot)
+    events["lineage"] = (
+        None if lineage_path is None else str(lineage_path)
+    )
+    events["deadline_epoch"] = int(deadline.timestamp())
+    return identity.model(Path.cwd())
 
 
-def fake_create_model(_cfg, args, _venv, _device):
-    events["create_model_resume"] = args.resume
-    return FakeTrainingModel()
-
-
-training.resolve_device = lambda _name: "cpu"
-training.validate_resume_model = lambda *_args, **_kwargs: None
-training.PPO.load = staticmethod(fake_load)
-training.build_training_env = fake_build_training_env
-training.create_model = fake_create_model
-training.main(sys.argv[3:])
+phase_training.run_phase = fake_run_phase
+phase_training.main(sys.argv[2:])
 Path(os.environ["TRAINING_EVENTS"]).write_text(
     json.dumps(events, sort_keys=True), encoding="utf-8"
 )
@@ -4634,10 +5386,12 @@ Path(os.environ["TRAINING_EVENTS"]).write_text(
         "4-3",
         "4-4",
     ]
-    assert events["loaded_model"] == (
-        ".resume/phase_1-integration/ckpt_250000_steps.zip"
+    assert events["loaded_model"] == str(
+        repository
+        / ".resume"
+        / "phase_1-integration"
+        / "ckpt_250000_steps.zip"
     )
-    assert events["create_model_resume"] == events["loaded_model"]
     assert events["vecnormalize"] == (
         ".resume/phase_1-integration/"
         "ckpt_vecnormalize_250000_steps.pkl"
@@ -4646,12 +5400,14 @@ Path(os.environ["TRAINING_EVENTS"]).write_text(
         ".resume/phase_1-integration/"
         "authoritative-budget-ledger.json"
     )
-    assert events["checkpoint_phase"] == "phase_1"
-    assert events["checkpoint_ledger"] == events["ledger"]
+    assert events["resume_manifest"] == (
+        ".resume/phase_1-integration/latest.json"
+    )
+    assert events["phase_resolved_config"] is True
+    assert events["run_name"] == "all32-phase_1"
+    assert events["lineage"] is None
     assert events["total_timesteps"] == 32000000
-    assert events["learn_timesteps"] == 31750000
-    assert events["reset_num_timesteps"] is False
-    assert events["closed"] is True
+    assert events["deadline_epoch"] > 0
 
 
 def test_restore_downloads_only_exact_manifest_named_bundle(config, tmp_path):
@@ -4717,6 +5473,217 @@ def test_restore_downloads_only_exact_manifest_named_bundle(config, tmp_path):
             )
         ],
     ]
+
+
+def test_restore_phase_lineage_verifies_last_best_and_incumbent_report(
+    config, tmp_path
+):
+    import scripts.train_phase as phase_training
+
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    ledger_path = destination / "aws-spend.json"
+    ledger = BudgetLedger(
+        cap_usd=config.cap_usd, allocations=config.allocations
+    )
+    ledger.save(ledger_path)
+    source_ledger = source / "ledger.json"
+    ledger.save(source_ledger)
+    ledger_payload = source_ledger.read_bytes()
+    best = phase_training.BundleIdentity.from_manifest(
+        _write_phase_bundle(
+            source,
+            directory_name="all32-phase_1-chunk-000000000004",
+            timesteps=4,
+            model_payload=b"best",
+            budget_ledger_payload=ledger_payload,
+        ),
+        repository_root=source,
+    )
+    last = phase_training.BundleIdentity.from_manifest(
+        _write_phase_bundle(
+            source,
+            directory_name="all32-phase_1-chunk-000000000006",
+            timesteps=6,
+            model_payload=b"last",
+            budget_ledger_payload=ledger_payload,
+        ),
+        repository_root=source,
+    )
+    report = _three_rollout_report(
+        best,
+        levels=("1-1",),
+        base_seed=42004,
+        passing={"1-1"},
+        progress=100,
+    )
+    report_path = (
+        source
+        / "models"
+        / "all32-phase_1"
+        / "diagnostics"
+        / "best.json"
+    )
+    report.write(report_path)
+    source_store = phase_training.PhaseLineageStore(
+        source / "models" / "all32-phase_1" / "latest.json",
+        repository_root=source,
+    )
+    source_store.save(
+        phase_training.PhaseLineage(
+            phase="phase_1",
+            run_name="all32-phase_1",
+            last_candidate=last,
+            last_diagnostic=None,
+            promoted_best=best,
+            best_report=phase_training.ReportIdentity.from_report(
+                report_path, repository_root=source
+            ),
+            next_weights={"1-1": 1.0},
+            pending_training=None,
+        )
+    )
+    objects = {
+        f"{config.s3_prefix}{path.relative_to(source).as_posix()}": (
+            path.read_bytes()
+        )
+        for path in source.rglob("*")
+        if path.is_file()
+    }
+    lineage_uri = (
+        f"{config.s3_prefix}models/all32-phase_1/latest.json"
+    )
+
+    class FakeStore:
+        def __init__(self):
+            self.downloads = []
+
+        def download(self, uri, path):
+            self.downloads.append(uri)
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_bytes(objects[uri])
+
+    object_store = FakeStore()
+    restored = aws_all32.restore_phase_lineage(
+        config=config,
+        phase="phase_1",
+        lineage_s3_uri=lineage_uri,
+        repo_dir=destination,
+        ledger_path=ledger_path,
+        object_store=object_store,
+        bundle_validator=lambda *_args, **_kwargs: None,
+    )
+
+    assert restored.lineage.last_candidate.model_sha256 == (
+        last.model_sha256
+    )
+    assert restored.lineage.promoted_best.model_sha256 == (
+        best.model_sha256
+    )
+    assert restored.lineage.best_report.checkpoint_sha256 == (
+        best.model_sha256
+    )
+    assert restored.lineage_path == (
+        destination / "models" / "all32-phase_1" / "latest.json"
+    )
+    assert f"{config.s3_prefix}ledger.json" not in object_store.downloads
+
+
+def test_phase_resume_validator_allows_only_bounded_chunk_target(
+    tmp_path, monkeypatch
+):
+    """A legitimate partial chunk config must survive live resume validation."""
+    phase = "phase_1"
+    trusted_repo = CONFIG_PATH.parents[1]
+    downloaded = aws_all32._resolved_all32_config(
+        trusted_repo / "configs" / "all32.yaml", phase
+    )
+    downloaded["train"]["total_timesteps"] = 2_000_000
+    downloaded["train"]["level_weights"] = {
+        level: 1.0 for level in downloaded["levels"]
+    }
+    signature = training.checkpoint_resume_signature(
+        downloaded, phase
+    )
+    root = tmp_path / "bundle"
+    root.mkdir()
+    (root / "run.yaml").write_text(
+        yaml.safe_dump(downloaded, sort_keys=False), encoding="utf-8"
+    )
+    (root / "signature.json").write_text(
+        json.dumps(signature), encoding="utf-8"
+    )
+    (root / "model.zip").write_bytes(b"model")
+    (root / "vec.pkl").write_bytes(b"normalization")
+    manifest = {
+        "phase": phase,
+        "action_set": signature["environment"]["action_set"],
+        "action_count": signature["environment"]["action_count"],
+        "extractor": signature["policy"]["extractor"],
+        "extractor_class": signature["policy"]["extractor_class"],
+        "normalize_reward": signature["normalization"]["normalize_reward"],
+    }
+    (root / "manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    identity = SimpleNamespace(
+        manifest_path="bundle/manifest.json",
+        run_config_path="bundle/run.yaml",
+        signature_path="bundle/signature.json",
+        vecnormalize_path="bundle/vec.pkl",
+        model_path="bundle/model.zip",
+        num_timesteps=1_999_936,
+    )
+    monkeypatch.setattr(
+        aws_all32,
+        "_validate_vecnormalize_checkpoint",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        aws_all32,
+        "_default_model_validator",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            num_timesteps=identity.num_timesteps
+        ),
+    )
+
+    aws_all32._default_phase_bundle_validator(
+        identity,
+        tmp_path,
+        phase=phase,
+        trusted_repo=trusted_repo,
+    )
+
+    downloaded["train"]["level_weights"] = {}
+    signature = training.checkpoint_resume_signature(
+        downloaded, phase
+    )
+    (root / "run.yaml").write_text(
+        yaml.safe_dump(downloaded, sort_keys=False), encoding="utf-8"
+    )
+    (root / "signature.json").write_text(
+        json.dumps(signature), encoding="utf-8"
+    )
+    aws_all32._default_phase_bundle_validator(
+        identity,
+        tmp_path,
+        phase=phase,
+        trusted_repo=trusted_repo,
+    )
+
+    downloaded["train"]["total_timesteps"] = 32_000_001
+    (root / "run.yaml").write_text(
+        yaml.safe_dump(downloaded, sort_keys=False), encoding="utf-8"
+    )
+    with pytest.raises(AwsLifecycleError, match="chunk target"):
+        aws_all32._default_phase_bundle_validator(
+            identity,
+            tmp_path,
+            phase=phase,
+            trusted_repo=trusted_repo,
+        )
 
 
 def test_restore_rejects_model_timestep_that_disagrees_with_manifest(
@@ -4896,12 +5863,7 @@ def test_cli_resume_verifies_before_paid_launch_and_passes_exact_paths(
             "--run-name",
             "all32-phase_1",
             "--resume",
-            ".resume/phase_1-test/ckpt_250000_steps.zip",
-            "--resume-vecnormalize",
-            (
-                ".resume/phase_1-test/"
-                "ckpt_vecnormalize_250000_steps.pkl"
-            ),
+            ".resume/phase_1-test/latest.json",
             "--budget-ledger-snapshot",
             (
                 ".resume/phase_1-test/"

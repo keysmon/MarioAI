@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import time
 from collections.abc import Mapping
 
 import torch
@@ -558,15 +559,19 @@ class DurableCheckpointCallback(CheckpointCallback):
             "budget_ledger": budget_ledger_name,
             "budget_ledger_sha256": sha256_file(budget_ledger_path),
         }
-        manifest_path = save_path / "latest.json"
-        _atomic_write_bytes(
-            manifest_path,
-            (
-                json.dumps(manifest, sort_keys=True, separators=(",", ":"))
-                + "\n"
-            ).encode("utf-8"),
+        manifest_payload = (
+            json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        generation_manifest_path = (
+            save_path
+            / f"{self.name_prefix}_manifest_{num_timesteps}_steps.json"
         )
-        return manifest_path
+        _write_immutable_bytes(
+            generation_manifest_path, manifest_payload
+        )
+        _atomic_write_bytes(save_path / "latest.json", manifest_payload)
+        return generation_manifest_path
 
 
 class CurriculumLogCallback(BaseCallback):
@@ -581,6 +586,56 @@ class CurriculumLogCallback(BaseCallback):
         if fronts:
             self.logger.record("curriculum/frontier_mean", sum(fronts) / len(fronts))
         return True
+
+
+class StopAtDeadlineCallback(BaseCallback):
+    """Stop PPO at its next vector step before an outer process timeout."""
+
+    def __init__(
+        self,
+        *,
+        deadline_epoch: int,
+        clock=None,
+    ) -> None:
+        super().__init__()
+        if (
+            isinstance(deadline_epoch, bool)
+            or not isinstance(deadline_epoch, int)
+            or deadline_epoch <= 0
+        ):
+            raise ValueError("deadline_epoch must be a positive integer")
+        self.deadline_epoch = deadline_epoch
+        self._clock = time.time if clock is None else clock
+        self.stopped_at_timesteps: int | None = None
+
+    def _on_step(self) -> bool:
+        if self._clock() < self.deadline_epoch:
+            return True
+        timesteps = getattr(self.model, "num_timesteps", None)
+        if isinstance(timesteps, bool) or not isinstance(timesteps, int):
+            raise ValueError("deadline stop observed invalid model progress")
+        self.stopped_at_timesteps = timesteps
+        return False
+
+
+class StopAtTimestepsCallback(BaseCallback):
+    """Stop a phase chunk at its exact absolute environment-step target."""
+
+    def __init__(self, target_timesteps: int) -> None:
+        super().__init__()
+        if (
+            isinstance(target_timesteps, bool)
+            or not isinstance(target_timesteps, int)
+            or target_timesteps <= 0
+        ):
+            raise ValueError("target_timesteps must be a positive integer")
+        self.target_timesteps = target_timesteps
+
+    def _on_step(self) -> bool:
+        timesteps = getattr(self.model, "num_timesteps", None)
+        if isinstance(timesteps, bool) or not isinstance(timesteps, int):
+            raise ValueError("chunk stop observed invalid model progress")
+        return timesteps < self.target_timesteps
 
 
 def parse_args(argv=None):
@@ -682,6 +737,15 @@ def parse_args(argv=None):
             "checkpoint bundle."
         ),
     )
+    parser.add_argument(
+        "--publish-final-checkpoint",
+        action="store_true",
+        help=(
+            "Publish and return a complete immutable manifest for the exact "
+            "final model state."
+        ),
+    )
+    parser.add_argument("--deadline-epoch", type=int)
     parser.add_argument("--run-name", required=True)
     return parser.parse_args(argv)
 
@@ -825,8 +889,20 @@ def main(argv=None):
             curriculum_threshold=args.curriculum_threshold,
         )
         callbacks = [checkpoint_callback]
+        if args.publish_final_checkpoint:
+            callbacks.append(
+                StopAtTimestepsCallback(
+                    cfg["train"]["total_timesteps"]
+                )
+            )
         if args.start_snapshots:
             callbacks.append(CurriculumLogCallback())
+        if args.deadline_epoch is not None:
+            callbacks.append(
+                StopAtDeadlineCallback(
+                    deadline_epoch=args.deadline_epoch
+                )
+            )
 
         reset_timesteps = args.resume is None or args.reset_timesteps
         learn_timesteps = cfg["train"]["total_timesteps"]
@@ -849,12 +925,18 @@ def main(argv=None):
                 callback=callbacks,
                 reset_num_timesteps=reset_timesteps,
             )
+        final_manifest = None
+        if args.publish_final_checkpoint:
+            final_manifest = checkpoint_callback.save_checkpoint(
+                model
+            ).resolve()
         model.save(str(out_dir / "final"))
         if cfg["train"]["normalize_reward"]:
             venv.save(str(out_dir / "vecnormalize.pkl"))
     finally:
         venv.close()
     print(f"SAVED {out_dir}/final.zip")
+    return final_manifest
 
 
 if __name__ == "__main__":

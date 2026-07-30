@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections.abc import Callable
+import copy
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal, ROUND_CEILING
 import fcntl
@@ -30,6 +31,10 @@ import yaml
 from stable_baselines3.common.vec_env import VecNormalize
 
 import marioai.train as training
+if __package__:
+    from scripts import train_phase as phase_training
+else:
+    import train_phase as phase_training
 from marioai.aws import AwsCli, AwsConfig, PreflightResult, SpotOffer
 from marioai.budget import BudgetExceeded, BudgetLedger, CostedRun
 
@@ -250,6 +255,15 @@ class ResumeBundle:
     vecnormalize_path: Path | None
     budget_ledger_path: Path
     manifest: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class PhaseResumeBundle:
+    """Verified durable last/best phase lineage staged for remote resume."""
+
+    root: Path
+    lineage_path: Path
+    lineage: phase_training.PhaseLineage
 
 
 class S3CheckpointStore:
@@ -479,7 +493,7 @@ def restore_checkpoint_bundle(
     ledger_path: Path,
     object_store: Any,
     model_validator: Callable[[Path, dict], Any] = _default_model_validator,
-) -> ResumeBundle:
+) -> ResumeBundle | PhaseResumeBundle:
     """Download and verify exactly one manifested generation before launch."""
     if phase not in {"phase_1", "phase_2"}:
         raise AwsLifecycleError(
@@ -506,6 +520,19 @@ def restore_checkpoint_bundle(
             raise AwsLifecycleError(
                 "checkpoint manifest is not valid UTF-8 JSON"
             ) from error
+        if (
+            isinstance(manifest, dict)
+            and manifest.get("kind") == "marioai-phase-lineage"
+        ):
+            shutil.rmtree(staging_root)
+            return restore_phase_lineage(
+                config=config,
+                phase=phase,
+                lineage_s3_uri=checkpoint_s3_uri,
+                repo_dir=repo_dir,
+                ledger_path=ledger_path,
+                object_store=object_store,
+            )
         expected_fields = {
             "schema_version",
             "run_name",
@@ -717,8 +744,432 @@ def restore_checkpoint_bundle(
         raise
 
 
-def verify_resume_bundle(bundle: ResumeBundle) -> None:
+def _configured_object_relative(config: AwsConfig, uri: str) -> str:
+    root_bucket, root_key = _s3_location(config.s3_prefix.rstrip("/"))
+    object_bucket, object_key = _s3_location(uri)
+    prefix = f"{root_key.rstrip('/')}/"
+    if object_bucket != root_bucket or not object_key.startswith(prefix):
+        raise AwsLifecycleError(
+            "phase lineage object is outside the configured S3 prefix"
+        )
+    relative = object_key.removeprefix(prefix)
+    path = Path(relative)
+    if (
+        not relative
+        or path.is_absolute()
+        or "\\" in relative
+        or "%" in relative
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise AwsLifecycleError("phase lineage object path is unsafe")
+    return path.as_posix()
+
+
+def _read_json_file(path: Path, description: str) -> Any:
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise AwsLifecycleError(
+            f"{description} is not valid UTF-8 JSON"
+        ) from error
+
+
+def _phase_identity_paths(payload: dict[str, Any]) -> set[str]:
+    paths: set[str] = set()
+    for field in ("last_candidate", "promoted_best"):
+        bundle = payload.get(field)
+        if bundle is None:
+            continue
+        if not isinstance(bundle, dict):
+            raise AwsLifecycleError(
+                "phase lineage bundle identity is malformed"
+            )
+        expected = {
+            item.name for item in phase_training.BundleIdentity.__dataclass_fields__.values()
+        }
+        if set(bundle) != expected:
+            raise AwsLifecycleError(
+                "phase lineage bundle identity has an invalid schema"
+            )
+        for path_field in (
+            "manifest_path",
+            "model_path",
+            "run_config_path",
+            "signature_path",
+            "budget_ledger_path",
+        ):
+            value = bundle.get(path_field)
+            if not isinstance(value, str):
+                raise AwsLifecycleError(
+                    "phase lineage bundle path is invalid"
+                )
+            paths.add(value)
+        vecnormalize = bundle.get("vecnormalize_path")
+        if vecnormalize is not None:
+            if not isinstance(vecnormalize, str):
+                raise AwsLifecycleError(
+                    "phase lineage VecNormalize path is invalid"
+                )
+            paths.add(vecnormalize)
+    for field in ("last_diagnostic", "best_report"):
+        report = payload.get(field)
+        if report is None:
+            continue
+        if not isinstance(report, dict) or set(report) != {
+            "path",
+            "sha256",
+            "checkpoint_sha256",
+        }:
+            raise AwsLifecycleError(
+                "phase lineage report identity is malformed"
+            )
+        path = report.get("path")
+        if not isinstance(path, str):
+            raise AwsLifecycleError(
+                "phase lineage report path is invalid"
+            )
+        paths.add(path)
+    for value in paths:
+        candidate = Path(value)
+        if (
+            candidate.is_absolute()
+            or "\\" in value
+            or "%" in value
+            or any(part in {"", ".", ".."} for part in candidate.parts)
+        ):
+            raise AwsLifecycleError(
+                "phase lineage identity path is unsafe"
+            )
+    return paths
+
+
+def _default_phase_bundle_validator(
+    identity: phase_training.BundleIdentity,
+    repository_root: Path,
+    *,
+    phase: str,
+    trusted_repo: Path,
+) -> None:
+    """Verify dynamic weights while pinning every other trusted setting."""
+    manifest_path = repository_root / identity.manifest_path
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    run_config_path = repository_root / identity.run_config_path
+    signature_path = repository_root / identity.signature_path
+    downloaded_config = yaml.safe_load(
+        run_config_path.read_text(encoding="utf-8")
+    )
+    signature = json.loads(
+        signature_path.read_text(encoding="utf-8")
+    )
+    trusted_path = trusted_repo / "configs" / "all32.yaml"
+    if not trusted_path.is_file():
+        trusted_path = (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "all32.yaml"
+        )
+    trusted_config = _resolved_all32_config(trusted_path, phase)
+    if not isinstance(downloaded_config, dict) or not isinstance(
+        signature, dict
+    ):
+        raise AwsLifecycleError(
+            "phase checkpoint config or signature is malformed"
+        )
+    weights = downloaded_config.get("train", {}).get("level_weights")
+    levels = downloaded_config.get("levels")
+    if (
+        not isinstance(levels, list)
+        or not isinstance(weights, dict)
+        or (
+            bool(weights)
+            and (
+                set(weights) != set(levels)
+                or not all(
+                    isinstance(level, str)
+                    and not isinstance(weight, bool)
+                    and isinstance(weight, (int, float))
+                    and math.isfinite(weight)
+                    and weight > 0
+                    for level, weight in weights.items()
+                )
+            )
+        )
+    ):
+        raise AwsLifecycleError(
+            "phase checkpoint regression weights are invalid"
+        )
+    downloaded_static = copy.deepcopy(downloaded_config)
+    trusted_static = copy.deepcopy(trusted_config)
+    downloaded_target = downloaded_static["train"].get(
+        "total_timesteps"
+    )
+    trusted_target = trusted_static["train"].get("total_timesteps")
+    if (
+        isinstance(downloaded_target, bool)
+        or not isinstance(downloaded_target, int)
+        or isinstance(trusted_target, bool)
+        or not isinstance(trusted_target, int)
+        or identity.num_timesteps > downloaded_target
+        or downloaded_target > trusted_target
+    ):
+        raise AwsLifecycleError(
+            "phase checkpoint chunk target is outside trusted bounds"
+        )
+    downloaded_static["train"]["level_weights"] = {}
+    trusted_static["train"]["level_weights"] = {}
+    downloaded_static["train"]["total_timesteps"] = trusted_target
+    expected_signature = training.checkpoint_resume_signature(
+        downloaded_config, phase
+    )
+    if (
+        downloaded_static != trusted_static
+        or signature != expected_signature
+        or manifest.get("phase") != phase
+        or manifest.get("action_set")
+        != expected_signature["environment"]["action_set"]
+        or manifest.get("action_count")
+        != expected_signature["environment"]["action_count"]
+        or manifest.get("extractor")
+        != expected_signature["policy"]["extractor"]
+        or manifest.get("extractor_class")
+        != expected_signature["policy"]["extractor_class"]
+        or manifest.get("normalize_reward")
+        != expected_signature["normalization"]["normalize_reward"]
+    ):
+        raise AwsLifecycleError(
+            "phase checkpoint does not match the trusted all-32 identity"
+        )
+    if identity.vecnormalize_path is not None:
+        _validate_vecnormalize_checkpoint(
+            repository_root / identity.vecnormalize_path,
+            signature,
+        )
+    model = _default_model_validator(
+        repository_root / identity.model_path,
+        downloaded_config,
+    )
+    if getattr(model, "num_timesteps", None) != identity.num_timesteps:
+        raise AwsLifecycleError(
+            "phase checkpoint model timestep does not match its manifest"
+        )
+
+
+def _materialize_phase_file(
+    source: Path, destination: Path, *, replace_existing: bool
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not replace_existing and destination.exists():
+        if (
+            destination.is_symlink()
+            or not destination.is_file()
+            or training.sha256_file(destination)
+            != training.sha256_file(source)
+        ):
+            raise AwsLifecycleError(
+                f"existing phase artifact differs: {destination}"
+            )
+        return
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", dir=destination.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(source.read_bytes())
+            output.flush()
+            os.fsync(output.fileno())
+        if replace_existing:
+            os.replace(temporary, destination)
+        else:
+            try:
+                os.link(temporary, destination)
+            except FileExistsError as error:
+                raise AwsLifecycleError(
+                    f"phase artifact appeared during restore: {destination}"
+                ) from error
+        directory_fd = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def restore_phase_lineage(
+    *,
+    config: AwsConfig,
+    phase: str,
+    lineage_s3_uri: str,
+    repo_dir: Path,
+    ledger_path: Path,
+    object_store: Any,
+    bundle_validator: Callable[..., None] | None = None,
+) -> PhaseResumeBundle:
+    """Download and verify both phase heads plus incumbent evidence."""
+    if phase not in {"phase_1", "phase_2"}:
+        raise AwsLifecycleError("phase lineage requires phase_1 or phase_2")
+    head_relative = _configured_object_relative(
+        config, lineage_s3_uri
+    )
+    if (
+        head_relative
+        != f"models/all32-{phase}/latest.json"
+    ):
+        raise AwsLifecycleError(
+            "phase lineage URI does not name the canonical phase head"
+        )
+    repo_root = Path(repo_dir).resolve()
+    staging_parent = repo_root / ".resume"
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(prefix=f"{phase}-lineage-", dir=staging_parent)
+    )
+    mirror = staging_root / "repository"
+    downloaded: set[str] = set()
+
+    def download(relative: str) -> Path:
+        if relative in downloaded:
+            return mirror / relative
+        candidate = Path(relative)
+        if (
+            candidate.is_absolute()
+            or "\\" in relative
+            or "%" in relative
+            or any(part in {"", ".", ".."} for part in candidate.parts)
+        ):
+            raise AwsLifecycleError(
+                "phase lineage identity path is unsafe"
+            )
+        destination = mirror / candidate
+        object_store.download(
+            f"{config.s3_prefix}{candidate.as_posix()}",
+            destination,
+        )
+        downloaded.add(relative)
+        return destination
+
+    try:
+        head_path = download(head_relative)
+        head = _read_json_file(head_path, "phase lineage head")
+        state_name = head.get("phase_state") if isinstance(head, dict) else None
+        if (
+            not isinstance(head, dict)
+            or set(head) != {
+                "schema_version",
+                "kind",
+                "phase",
+                "run_name",
+                "phase_state",
+                "phase_state_sha256",
+            }
+            or head.get("schema_version") != 1
+            or head.get("kind") != "marioai-phase-lineage"
+            or head.get("phase") != phase
+            or head.get("run_name") != f"all32-{phase}"
+            or not isinstance(state_name, str)
+            or _CHECKPOINT_FILENAME_PATTERN.fullmatch(state_name) is None
+            or Path(state_name).name != state_name
+        ):
+            raise AwsLifecycleError(
+                "phase lineage head has an invalid schema"
+            )
+        state_relative = (
+            f"{Path(head_relative).parent.as_posix()}/{state_name}"
+        )
+        state_path = download(state_relative)
+        expected_state_hash = _checkpoint_hash(
+            head.get("phase_state_sha256"), field="phase state"
+        )
+        if training.sha256_file(state_path) != expected_state_hash:
+            raise AwsLifecycleError("phase lineage state SHA-256 mismatch")
+        state_payload = _read_json_file(
+            state_path, "phase lineage state"
+        )
+        if not isinstance(state_payload, dict):
+            raise AwsLifecycleError(
+                "phase lineage state must be a JSON object"
+            )
+        identity_paths = _phase_identity_paths(state_payload)
+        for relative in sorted(identity_paths):
+            download(relative)
+        staged_store = phase_training.PhaseLineageStore(
+            head_path, repository_root=mirror
+        )
+        lineage = staged_store.load()
+        if (
+            lineage.phase != phase
+            or lineage.run_name != f"all32-{phase}"
+        ):
+            raise AwsLifecycleError(
+                "phase lineage identity does not match requested phase"
+            )
+        selected_validator = (
+            _default_phase_bundle_validator
+            if bundle_validator is None
+            else bundle_validator
+        )
+        unique_bundles = {
+            bundle.manifest_sha256: bundle
+            for bundle in (
+                lineage.last_candidate,
+                lineage.promoted_best,
+            )
+            if bundle is not None
+        }
+        current_ledger = _configured_ledger(ledger_path, config)
+        for bundle in unique_bundles.values():
+            selected_validator(
+                bundle,
+                mirror,
+                phase=phase,
+                trusted_repo=repo_root,
+            )
+            checkpoint_ledger = _configured_ledger(
+                mirror / bundle.budget_ledger_path, config
+            )
+            _require_authoritative_ledger_superset(
+                checkpoint_ledger, current_ledger
+            )
+
+        for relative in sorted(downloaded - {head_relative}):
+            _materialize_phase_file(
+                mirror / relative,
+                repo_root / relative,
+                replace_existing=False,
+            )
+        canonical_head = repo_root / head_relative
+        _materialize_phase_file(
+            head_path, canonical_head, replace_existing=True
+        )
+        canonical_store = phase_training.PhaseLineageStore(
+            canonical_head, repository_root=repo_root
+        )
+        canonical_lineage = canonical_store.load()
+        return PhaseResumeBundle(
+            root=staging_root,
+            lineage_path=canonical_head,
+            lineage=canonical_lineage,
+        )
+    except BaseException:
+        shutil.rmtree(staging_root)
+        raise
+
+
+def verify_resume_bundle(
+    bundle: ResumeBundle | PhaseResumeBundle,
+) -> None:
     """Re-authenticate staged bytes immediately before paid mutation."""
+    if isinstance(bundle, PhaseResumeBundle):
+        restored = phase_training.PhaseLineageStore(
+            bundle.lineage_path,
+            repository_root=bundle.lineage_path.parents[2],
+        ).load()
+        if restored != bundle.lineage:
+            raise AwsLifecycleError(
+                "verified phase lineage changed before launch"
+            )
+        return
     artifact_fields = [
         ("model", "sha256", bundle.model_path),
         (
@@ -3074,7 +3525,7 @@ def _terminal_target_confirmed(aws: Any, instance_id: str) -> bool:
 
 
 def _resume_training_args(
-    bundle: ResumeBundle,
+    bundle: ResumeBundle | PhaseResumeBundle,
     repo_dir: Path,
     *,
     authoritative_ledger_path: Path,
@@ -3089,6 +3540,20 @@ def _resume_training_args(
                 "verified resume artifact escaped the repository"
             ) from error
 
+    if isinstance(bundle, PhaseResumeBundle):
+        run_name = bundle.lineage.run_name
+        lineage_path = relative(bundle.lineage_path)
+        return (
+            "--config",
+            "configs/all32.yaml",
+            "--run-name",
+            run_name,
+            "--lineage",
+            lineage_path,
+            "--budget-ledger-snapshot",
+            relative(authoritative_ledger_path),
+        )
+
     run_name = bundle.manifest.get("run_name")
     if (
         not isinstance(run_name, str)
@@ -3102,15 +3567,8 @@ def _resume_training_args(
         "--run-name",
         run_name,
         "--resume",
-        relative(bundle.model_path),
+        relative(bundle.manifest_path),
     ]
-    if bundle.vecnormalize_path is not None:
-        arguments.extend(
-            [
-                "--resume-vecnormalize",
-                relative(bundle.vecnormalize_path),
-            ]
-        )
     arguments.extend(
         [
             "--budget-ledger-snapshot",
@@ -3121,7 +3579,7 @@ def _resume_training_args(
 
 
 def _snapshot_authoritative_ledger(
-    bundle: ResumeBundle,
+    bundle: ResumeBundle | PhaseResumeBundle,
     ledger_path: Path,
     config: AwsConfig,
 ) -> Path:
@@ -3129,6 +3587,56 @@ def _snapshot_authoritative_ledger(
     snapshot_path = bundle.root / "authoritative-budget-ledger.json"
     _configured_ledger(ledger_path, config).save(snapshot_path)
     return snapshot_path
+
+
+def _resume_budget_ledger_paths(
+    bundle: ResumeBundle | PhaseResumeBundle,
+    repo_dir: Path,
+) -> tuple[Path, ...]:
+    if isinstance(bundle, ResumeBundle):
+        return (bundle.budget_ledger_path,)
+    identities = {
+        identity.budget_ledger_path
+        for identity in (
+            bundle.lineage.last_candidate,
+            bundle.lineage.promoted_best,
+        )
+        if identity is not None
+    }
+    return tuple(
+        Path(repo_dir) / relative for relative in sorted(identities)
+    )
+
+
+def _fresh_phase_training_args(
+    *,
+    phase: str,
+    repo_dir: Path,
+    ledger_path: Path,
+    config: AwsConfig,
+) -> tuple[str, ...]:
+    """Stage current accounting and return exact fresh phase-worker arguments."""
+    if phase not in {"phase_1", "phase_2"}:
+        raise AwsLifecycleError(
+            "fresh phase training requires phase_1 or phase_2"
+        )
+    repo_root = Path(repo_dir).resolve()
+    staging_parent = repo_root / ".resume"
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(prefix=f"{phase}-fresh-", dir=staging_parent)
+    )
+    snapshot_path = staging_root / "authoritative-budget-ledger.json"
+    _configured_ledger(ledger_path, config).save(snapshot_path)
+    relative_snapshot = snapshot_path.relative_to(repo_root).as_posix()
+    return (
+        "--config",
+        "configs/all32.yaml",
+        "--run-name",
+        f"all32-{phase}",
+        "--budget-ledger-snapshot",
+        relative_snapshot,
+    )
 
 
 def _phase_spent_usd(ledger: BudgetLedger, phase: str) -> Decimal:
@@ -3337,7 +3845,7 @@ def main(
     else:
         aws = aws_override
 
-    resume_bundle: ResumeBundle | None = None
+    resume_bundle: ResumeBundle | PhaseResumeBundle | None = None
     if args.command == "resume":
         selected_store = checkpoint_store
         if selected_store is None:
@@ -3509,12 +4017,17 @@ def main(
                 )
             ledger = _configured_ledger(args.ledger, config)
             if resume_bundle is not None:
-                checkpoint_ledger = _configured_ledger(
-                    resume_bundle.budget_ledger_path, config
-                )
-                _require_authoritative_ledger_superset(
-                    checkpoint_ledger, ledger
-                )
+                for checkpoint_ledger_path in (
+                    _resume_budget_ledger_paths(
+                        resume_bundle, args.repo_dir
+                    )
+                ):
+                    checkpoint_ledger = _configured_ledger(
+                        checkpoint_ledger_path, config
+                    )
+                    _require_authoritative_ledger_superset(
+                        checkpoint_ledger, ledger
+                    )
             selected_remote = remote
             if selected_remote is None:
                 ssh_key = args.ssh_key
@@ -3554,12 +4067,17 @@ def main(
                 current_ledger = _configured_ledger(
                     args.ledger, config
                 )
-                _require_authoritative_ledger_superset(
-                    _configured_ledger(
-                        resume_bundle.budget_ledger_path, config
-                    ),
-                    current_ledger,
-                )
+                for checkpoint_ledger_path in (
+                    _resume_budget_ledger_paths(
+                        resume_bundle, args.repo_dir
+                    )
+                ):
+                    _require_authoritative_ledger_superset(
+                        _configured_ledger(
+                            checkpoint_ledger_path, config
+                        ),
+                        current_ledger,
+                    )
                 if current_ledger != ledger:
                     raise AwsLifecycleError(
                         "authoritative ledger changed before mutation"
@@ -3592,6 +4110,17 @@ def main(
                             resume_bundle, args.ledger, config
                         )
                     )
+                fresh_train_args: tuple[str, ...] = ()
+                if (
+                    resume_bundle is None
+                    and args.phase in {"phase_1", "phase_2"}
+                ):
+                    fresh_train_args = _fresh_phase_training_args(
+                        phase=args.phase,
+                        repo_dir=args.repo_dir,
+                        ledger_path=args.ledger,
+                        config=config,
+                    )
                 start_kwargs = {
                     "phase": args.phase,
                     "max_seconds": max_seconds,
@@ -3606,6 +4135,7 @@ def main(
                     "absolute_deadline": orchestrator.training_deadline(
                         instance
                     ),
+                    "train_args": fresh_train_args,
                 }
                 if resume_bundle is not None:
                     start_kwargs["train_args"] = _resume_training_args(

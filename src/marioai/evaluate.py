@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 import time
 
@@ -22,6 +23,27 @@ from marioai.results import (
     summarize_stage,
 )
 from marioai.train import validate_resume_model
+
+
+class EvaluationDeadlineReached(RuntimeError):
+    """Raised before another environment step would cross the phase deadline."""
+
+
+def _require_before_deadline(
+    deadline: datetime | None,
+    now: Callable[[], datetime],
+) -> None:
+    if deadline is None:
+        return
+    if deadline.tzinfo is None or deadline.utcoffset() is None:
+        raise ValueError("evaluation deadline must be timezone-aware")
+    current = now()
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("evaluation clock must return aware datetimes")
+    if current >= deadline:
+        raise EvaluationDeadlineReached(
+            "evaluation deadline reached before the next rollout step"
+        )
 
 
 def _make_evaluation_env(
@@ -60,10 +82,15 @@ def evaluate_rollout(
     skip: int = 4,
     shape: int = 84,
     action_set: str = "complex",
+    deadline: datetime | None = None,
+    now: Callable[[], datetime] | None = None,
 ) -> RolloutResult:
     """Run one independently seeded rollout on one Mario stage."""
     if max_steps <= 0:
         raise ValueError("max_steps must be positive")
+    if now is None:
+        now = lambda: datetime.now(timezone.utc)
+    _require_before_deadline(deadline, now)
 
     environment = _make_evaluation_env(
         level=level,
@@ -84,6 +111,7 @@ def evaluate_rollout(
         last_info: dict = {}
         steps = 0
         for steps in range(1, max_steps + 1):
+            _require_before_deadline(deadline, now)
             action, _ = model.predict(
                 observation,
                 deterministic=deterministic,
@@ -126,11 +154,16 @@ def evaluate_checkpoint(
     seed: int = 42000,
     deterministic: bool = False,
     legacy_diagnostic: bool = False,
+    deadline: datetime | None = None,
+    now: Callable[[], datetime] | None = None,
 ) -> EvaluationReport:
     """Evaluate the same compatible checkpoint over every requested stage."""
     selected_levels = validate_levels(levels)
     if episodes <= 0:
         raise ValueError("episodes must be positive")
+    if now is None:
+        now = lambda: datetime.now(timezone.utc)
+    _require_before_deadline(deadline, now)
 
     checkpoint_sha256 = sha256_file(model_path)
     model = PPO.load(model_path, device="cpu")
@@ -166,6 +199,8 @@ def evaluate_checkpoint(
                 seed=seed + level_index * episodes + episode_index,
                 deterministic=deterministic,
                 action_set=action_set,
+                deadline=deadline,
+                now=now,
             )
             for episode_index in range(episodes)
         ]

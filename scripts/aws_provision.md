@@ -98,6 +98,13 @@ persists a crash-recoverable reservation first, and refuses a maximum runtime
 that cannot fit the phase allocation or hard USD 50 cap. Do not bypass the
 command with a raw `run-instances` call.
 
+For `phase_1` and `phase_2`, the remote supervisor runs the shared-policy
+phase worker automatically. It trains in fixed environment-step chunks,
+diagnoses every complete candidate, retains continuous last-candidate lineage
+separately from the promoted best, and deterministically reweights regressed
+levels for the next chunk. Its aware inner deadline is 60 seconds before the
+outer GNU `timeout`, reserving time to persist and sync complete artifacts.
+
 Check all project instances, or one exact ID:
 
 ```bash
@@ -141,9 +148,9 @@ The command refuses an unowned or malformed instance ID. If SSH, training,
 sync, or accounting fails, preserve the error and run `reconcile`; never erase
 the launch sidecar manually.
 
-## 6. Resume an exact durable bundle
+## 6. Resume exact phase lineage
 
-Use only the manifested S3 object for the same shared phase:
+Use only the canonical phase-lineage head for the same shared phase:
 
 ```bash
 .venv/bin/python scripts/aws_all32.py resume \
@@ -157,11 +164,22 @@ Use only the manifested S3 object for the same shared phase:
   --ssh-key "$HOME/.ssh/mario-training-key.pem"
 ```
 
-Resume downloads only the manifest-named model/config/signature,
-VecNormalize state, and ledger snapshot. Hash, policy/environment identity,
-timestep, and authoritative-ledger checks all occur before paid mutation.
-Chunk progress is expressed in environment steps; a resumed checkpoint trains
-only the remaining phase target.
+`latest.json` is a small phase-lineage head, not a guessed checkpoint name.
+It hashes an immutable phase-state object that names the exact last candidate,
+promoted best, incumbent diagnostic report, and next level weights. Resume
+downloads only those named objects and each referenced complete
+model/config/signature/VecNormalize/ledger bundle. It verifies every hash,
+report-to-checkpoint pairing, policy/environment identity, timestep, and both
+checkpoint-ledger histories against the authoritative ledger before paid
+mutation. The same identities are rehashed immediately before
+`run-instances`.
+
+If interruption happened after a candidate bundle was persisted but before
+its diagnostic, the resumed phase diagnoses that last candidate first. It
+never promotes an undiagnosed or regressed last candidate automatically.
+Chunk progress is expressed in environment steps, so training continues from
+the exact last candidate while returning only the independently promoted
+best.
 
 ## 7. Spend and evidence checks
 
@@ -181,7 +199,9 @@ Before another paid action, also inspect the benchmark and diagnostic evidence:
 
 ```bash
 .venv/bin/python -m json.tool reports/aws-benchmark.json
-find reports/diagnostics -type f -name '*.json' -print | sort
+find models/all32-phase_1/diagnostics \
+  -type f -name '*.json' -print | sort
+.venv/bin/python -m json.tool models/all32-phase_1/latest.json
 ```
 
 Chunk diagnostics are permanently separate from acceptance evidence: exactly
