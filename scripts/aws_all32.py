@@ -65,6 +65,10 @@ class AwsLifecycleError(RuntimeError):
     """Raised when a paid-instance lifecycle cannot be handled safely."""
 
 
+class AwsCapacityUnavailable(AwsLifecycleError):
+    """Raised when EC2 definitively rejects a launch before creating it."""
+
+
 @dataclass(frozen=True)
 class BenchmarkObservation:
     """Exact remote duration and memory observation for one fixed workload."""
@@ -1571,6 +1575,23 @@ class AwsCommandAdapter:
                 f"reconcile using ClientToken {request['ClientToken']!r} "
                 "and do not submit a new token"
             ) from error
+        except AwsLifecycleError as error:
+            cause = error.__cause__
+            stderr = (
+                (cause.stderr or "").strip()
+                if isinstance(cause, subprocess.CalledProcessError)
+                else ""
+            )
+            if re.search(
+                r"An error occurred \(InsufficientInstanceCapacity\) "
+                r"when calling the RunInstances operation:",
+                stderr,
+            ):
+                raise AwsCapacityUnavailable(
+                    "EC2 definitively rejected run-instances before creation: "
+                    "InsufficientInstanceCapacity"
+                ) from error
+            raise
         if not isinstance(payload, dict):
             raise AwsLifecycleError(
                 "AWS ec2 run-instances returned a non-object response"
@@ -2402,28 +2423,32 @@ class AwsOrchestrator:
                 "no valid allowed Spot offer is available for the "
                 "configured candidate"
             )
-        offer = min(
-            candidate_offers,
-            key=lambda item: (
-                item.hourly_usd,
-                item.instance_type,
-                item.availability_zone,
-                item.subnet_id,
-            ),
-        )
-        if (
-            offer.instance_type not in self.config.instance_types
-            or (
-                offer.subnet_id,
-                offer.availability_zone,
+        ordered_offers = tuple(
+            sorted(
+                candidate_offers,
+                key=lambda item: (
+                    item.hourly_usd,
+                    item.instance_type,
+                    item.availability_zone,
+                    item.subnet_id,
+                ),
             )
-            not in set(self._preflight_result.subnet_azs)
+        )
+        selected_instance_type = ordered_offers[0].instance_type
+        ordered_offers = tuple(
+            offer
+            for offer in ordered_offers
+            if offer.instance_type == selected_instance_type
+        )
+        if any(
+            offer.instance_type not in self.config.instance_types
+            for offer in ordered_offers
         ):
             raise AwsLifecycleError(
                 "Spot offer is outside the preflight-authorized configuration"
             )
         on_demand_hourly = self.config.on_demand_ceiling_usd[
-            offer.instance_type
+            selected_instance_type
         ]
         grace_hours = Decimal(self.config.grace_minutes) / Decimal("60")
         reserve_usd = (
@@ -2445,147 +2470,172 @@ class AwsOrchestrator:
             raise AwsLifecycleError(
                 "SSM returned an invalid AMI ID; launch was not attempted"
             )
-        client_token = self._client_token_factory()
-        if (
-            not isinstance(client_token, str)
-            or _CLIENT_TOKEN_PATTERN.fullmatch(client_token) is None
-        ):
-            raise AwsLifecycleError(
-                "client token must contain 1-64 safe characters"
-            )
         self._require_fresh_preflight()
         tags = [
             {"Key": "Project", "Value": "MarioAI-All32"},
             {"Key": "Phase", "Value": phase},
         ]
-        request = {
-            "ImageId": ami_id,
-            "InstanceType": offer.instance_type,
-            "MinCount": 1,
-            "MaxCount": 1,
-            "ClientToken": client_token,
-            "UserData": _shutdown_user_data(max_hours),
-            "KeyName": self.config.key_name,
-            "IamInstanceProfile": {"Name": self.config.instance_profile},
-            "Placement": {"AvailabilityZone": offer.availability_zone},
-            "InstanceMarketOptions": {
-                "MarketType": "spot",
-                "SpotOptions": {"SpotInstanceType": "one-time"},
-            },
-            "InstanceInitiatedShutdownBehavior": "terminate",
-            "NetworkInterfaces": [
-                {
-                    "AssociatePublicIpAddress": True,
-                    "DeleteOnTermination": True,
-                    "DeviceIndex": 0,
-                    "Groups": [self.config.security_group_id],
-                    "SubnetId": offer.subnet_id,
-                }
-            ],
-            "BlockDeviceMappings": [
-                {
-                    "DeviceName": "/dev/sda1",
-                    "Ebs": {
-                        "DeleteOnTermination": True,
-                        "Encrypted": True,
-                        "VolumeSize": self.config.root_volume_gb,
-                        "VolumeType": "gp3",
-                    },
-                }
-            ],
-            "TagSpecifications": [
-                {"ResourceType": "instance", "Tags": tags},
-                {"ResourceType": "volume", "Tags": tags},
-            ],
-        }
-        final_preflight = self.preflight()
-        if (
-            offer.subnet_id,
-            offer.availability_zone,
-        ) not in set(final_preflight.subnet_azs):
-            raise AwsLifecycleError(
-                "selected Spot offer is outside the final preflight"
-            )
-        if self.aws.project_instances(active_only=True):
-            raise AwsLifecycleError(
-                "active MarioAI-All32 instance appeared before mutation"
-            )
-        self._require_fresh_preflight()
-        if before_mutation is not None:
-            before_mutation()
-        reservation = LaunchReservation(
-            client_token=client_token,
-            state="reserved",
-            phase=phase,
-            request=request,
-            instance_hourly_usd=offer.hourly_usd,
-            on_demand_hourly_usd=on_demand_hourly,
-            volume_hourly_usd=self.volume_hourly_usd,
-            max_hours=max_hours,
-            grace_hours=grace_hours,
-            requested_epoch_seconds=(
-                self.reservation_store.now_epoch_seconds()
-                if self.reservation_store is not None
-                else Decimal("0")
-            ),
-        )
-        if self.reservation_store is not None:
-            if self.reservation_store.load() is not None:
+        last_capacity_error: AwsCapacityUnavailable | None = None
+        for offer in ordered_offers:
+            client_token = self._client_token_factory()
+            if (
+                not isinstance(client_token, str)
+                or _CLIENT_TOKEN_PATTERN.fullmatch(client_token) is None
+            ):
                 raise AwsLifecycleError(
-                    "an unresolved launch reservation exists; run reconcile"
+                    "client token must contain 1-64 safe characters"
                 )
-            self.reservation_store.save(reservation)
-        self._preflight_result = None
-        self._preflight_authorized_at = None
-        launch_requested_at = _monotonic_decimal(self._monotonic())
-        payload = self.aws.run_instances(request, max_hours=max_hours)
-        try:
-            instance = _launched_instance_payload(
-                payload,
+            request = {
+                "ImageId": ami_id,
+                "InstanceType": offer.instance_type,
+                "MinCount": 1,
+                "MaxCount": 1,
+                "ClientToken": client_token,
+                "UserData": _shutdown_user_data(max_hours),
+                "KeyName": self.config.key_name,
+                "IamInstanceProfile": {"Name": self.config.instance_profile},
+                "Placement": {"AvailabilityZone": offer.availability_zone},
+                "InstanceMarketOptions": {
+                    "MarketType": "spot",
+                    "SpotOptions": {"SpotInstanceType": "one-time"},
+                },
+                "InstanceInitiatedShutdownBehavior": "terminate",
+                "NetworkInterfaces": [
+                    {
+                        "AssociatePublicIpAddress": True,
+                        "DeleteOnTermination": True,
+                        "DeviceIndex": 0,
+                        "Groups": [self.config.security_group_id],
+                        "SubnetId": offer.subnet_id,
+                    }
+                ],
+                "BlockDeviceMappings": [
+                    {
+                        "DeviceName": "/dev/sda1",
+                        "Ebs": {
+                            "DeleteOnTermination": True,
+                            "Encrypted": True,
+                            "VolumeSize": self.config.root_volume_gb,
+                            "VolumeType": "gp3",
+                        },
+                    }
+                ],
+                "TagSpecifications": [
+                    {"ResourceType": "instance", "Tags": tags},
+                    {"ResourceType": "volume", "Tags": tags},
+                ],
+            }
+            final_preflight = self.preflight()
+            if (
+                offer.subnet_id,
+                offer.availability_zone,
+            ) not in set(final_preflight.subnet_azs):
+                raise AwsLifecycleError(
+                    "selected Spot offer is outside the final preflight"
+                )
+            if self.aws.project_instances(active_only=True):
+                raise AwsLifecycleError(
+                    "active MarioAI-All32 instance appeared before mutation"
+                )
+            self._require_fresh_preflight()
+            if before_mutation is not None:
+                before_mutation()
+            reservation = LaunchReservation(
+                client_token=client_token,
+                state="reserved",
+                phase=phase,
                 request=request,
-                expected_instance_profile=_preflight_profile_identity(
-                    final_preflight
+                instance_hourly_usd=offer.hourly_usd,
+                on_demand_hourly_usd=on_demand_hourly,
+                volume_hourly_usd=self.volume_hourly_usd,
+                max_hours=max_hours,
+                grace_hours=grace_hours,
+                requested_epoch_seconds=(
+                    self.reservation_store.now_epoch_seconds()
+                    if self.reservation_store is not None
+                    else Decimal("0")
                 ),
             )
-        except AwsLifecycleError as error:
-            raise AwsLifecycleError(
-                f"{error}; reconcile the ambiguous launch using "
-                f"ClientToken {client_token!r}"
-            ) from error
-        launched = LaunchedInstance(
-            phase=phase,
-            instance_id=instance["InstanceId"],
-            instance_type=offer.instance_type,
-            availability_zone=offer.availability_zone,
-            subnet_id=offer.subnet_id,
-            ami_id=ami_id,
-            public_ip=instance.get("PublicIpAddress"),
-            spot_hourly_usd=offer.hourly_usd,
-            volume_hourly_usd=self.volume_hourly_usd,
-            max_hours=max_hours,
-            launched_monotonic=launch_requested_at,
-        )
-        if self.reservation_store is not None:
+            if self.reservation_store is not None:
+                if self.reservation_store.load() is not None:
+                    raise AwsLifecycleError(
+                        "an unresolved launch reservation exists; run reconcile"
+                    )
+                self.reservation_store.save(reservation)
+            self._preflight_result = None
+            self._preflight_authorized_at = None
+            launch_requested_at = _monotonic_decimal(self._monotonic())
             try:
-                self.reservation_store.save(
-                    replace(
-                        reservation,
-                        state="launched",
-                        instance_id=instance["InstanceId"],
-                    )
+                payload = self.aws.run_instances(
+                    request, max_hours=max_hours
                 )
-            except BaseException as state_error:
+            except AwsCapacityUnavailable as error:
+                last_capacity_error = error
+                if self.reservation_store is not None:
+                    durable = self.reservation_store.load()
+                    if (
+                        durable is None
+                        or durable.client_token != client_token
+                        or durable.state != "reserved"
+                    ):
+                        raise AwsLifecycleError(
+                            "definitive capacity rejection does not match "
+                            "the durable launch reservation"
+                        ) from error
+                    self.reservation_store.clear()
+                continue
+            try:
+                instance = _launched_instance_payload(
+                    payload,
+                    request=request,
+                    expected_instance_profile=_preflight_profile_identity(
+                        final_preflight
+                    ),
+                )
+            except AwsLifecycleError as error:
+                raise AwsLifecycleError(
+                    f"{error}; reconcile the ambiguous launch using "
+                    f"ClientToken {client_token!r}"
+                ) from error
+            launched = LaunchedInstance(
+                phase=phase,
+                instance_id=instance["InstanceId"],
+                instance_type=offer.instance_type,
+                availability_zone=offer.availability_zone,
+                subnet_id=offer.subnet_id,
+                ami_id=ami_id,
+                public_ip=instance.get("PublicIpAddress"),
+                spot_hourly_usd=offer.hourly_usd,
+                volume_hourly_usd=self.volume_hourly_usd,
+                max_hours=max_hours,
+                launched_monotonic=launch_requested_at,
+            )
+            if self.reservation_store is not None:
                 try:
-                    self.terminate_and_settle(
-                        launched, self.reservation_store.ledger_path
+                    self.reservation_store.save(
+                        replace(
+                            reservation,
+                            state="launched",
+                            instance_id=instance["InstanceId"],
+                        )
                     )
-                except BaseException as cleanup_error:
-                    state_error.add_note(
-                        "post-launch cleanup also failed: "
-                        f"{type(cleanup_error).__name__}: {cleanup_error}"
-                    )
-                raise
-        return launched
+                except BaseException as state_error:
+                    try:
+                        self.terminate_and_settle(
+                            launched, self.reservation_store.ledger_path
+                        )
+                    except BaseException as cleanup_error:
+                        state_error.add_note(
+                            "post-launch cleanup also failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                    raise
+            return launched
+        if last_capacity_error is not None:
+            raise last_capacity_error
+        raise AwsLifecycleError(
+            "no valid allowed Spot offer is available for launch"
+        )
 
     def _require_fresh_preflight(self) -> None:
         authorized_at = self._preflight_authorized_at
@@ -3923,6 +3973,7 @@ def main(
                     )
                 instances_by_id[item_id] = item
             recovered_id: str | None = None
+            old_empty_reservation_confirmed = False
             if reservation is not None:
                 recovered = aws.project_instances(
                     client_token=reservation.client_token
@@ -3931,6 +3982,28 @@ def main(
                     raise AwsLifecycleError(
                         "ClientToken reconciliation returned multiple instances"
                     )
+                reservation_age = (
+                    reservation_store.now_epoch_seconds()
+                    - reservation.requested_epoch_seconds
+                )
+                old_reserved_without_instance = (
+                    reservation.state == "reserved"
+                    and reservation.instance_id is None
+                    and reservation_age >= (
+                        (reservation.max_hours + reservation.grace_hours)
+                        * _SECONDS_PER_HOUR
+                    )
+                )
+                if not recovered and old_reserved_without_instance:
+                    recovered = aws.project_instances(
+                        client_token=reservation.client_token
+                    )
+                    if len(recovered) > 1:
+                        raise AwsLifecycleError(
+                            "ClientToken reconciliation returned multiple "
+                            "instances"
+                        )
+                    old_empty_reservation_confirmed = not recovered
                 recovered_id = reservation.instance_id
                 if recovered:
                     token_id = recovered[0].get("instance_id")
@@ -3991,8 +4064,9 @@ def main(
                     instance_id=recovered_id,
                 )
                 ledger.save(args.ledger)
-                if recovered_id is not None and _terminal_target_confirmed(
-                    aws, recovered_id
+                if old_empty_reservation_confirmed or (
+                    recovered_id is not None
+                    and _terminal_target_confirmed(aws, recovered_id)
                 ):
                     reservation_store.clear()
                     reservation_cleared = True

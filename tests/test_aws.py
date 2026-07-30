@@ -2455,6 +2455,47 @@ def test_adapter_wraps_ambiguous_launch_timeout_without_retry(
     ] == [["ec2", "run-instances"]]
 
 
+def test_adapter_distinguishes_definitive_capacity_rejection(
+    config, orchestrator
+):
+    import scripts.aws_all32 as aws_module
+
+    runner = FakeRunner()
+    adapter = aws_module.AwsCommandAdapter(
+        config=config,
+        readonly=FakeLifecycleAws(config),
+        runner=runner,
+    )
+    adapter.preflight(config)
+    runner.add(
+        [
+            "ssm",
+            "get-parameter",
+            "--name",
+            config.ami_ssm_parameter,
+            "--query",
+            "Parameter.Value",
+        ],
+        "ami-0123456789abcdef0",
+    )
+    adapter.resolve_ami(config.ami_ssm_parameter)
+    runner.error = subprocess.CalledProcessError(
+        255,
+        ["aws", "ec2", "run-instances"],
+        stderr=(
+            "An error occurred (InsufficientInstanceCapacity) when calling "
+            "the RunInstances operation: We currently do not have sufficient "
+            "capacity in the Availability Zone you requested."
+        ),
+    )
+    orchestrator.preflight()
+    orchestrator.launch_guarded_instance("benchmark", Decimal("1"))
+    request = orchestrator.aws.last_run_instances_request
+
+    with pytest.raises(aws_module.AwsCapacityUnavailable):
+        adapter.run_instances(request, max_hours=Decimal("1"))
+
+
 @pytest.mark.parametrize(
     "case",
     [
@@ -3521,6 +3562,188 @@ def test_launch_runs_fresh_full_preflight_immediately_before_mutation(
     assert calls_at_mutation == [2]
 
 
+def test_capacity_rejection_falls_back_to_next_authorized_offer(
+    config, tmp_path
+):
+    from scripts.aws_all32 import (
+        AwsCapacityUnavailable,
+        AwsOrchestrator,
+        LaunchStateStore,
+    )
+
+    aws = FakeLifecycleAws(config)
+    aws.offers = (
+        SpotOffer(
+            instance_type="c7i.8xlarge",
+            availability_zone="us-east-1a",
+            subnet_id=config.subnet_ids[0],
+            hourly_usd=Decimal("0.50"),
+            timestamp=NOW,
+        ),
+        SpotOffer(
+            instance_type="c7i.8xlarge",
+            availability_zone="us-east-1b",
+            subnet_id=config.subnet_ids[1],
+            hourly_usd=Decimal("0.51"),
+            timestamp=NOW,
+        ),
+    )
+    aws.project_results = [(), ()]
+    requests = []
+
+    def reject_first_offer():
+        requests.append(aws.last_run_instances_request)
+        if len(requests) == 1:
+            raise AwsCapacityUnavailable("capacity unavailable")
+
+    aws.run_instances_hook = reject_first_offer
+    tokens = iter(("capacity-token-a", "capacity-token-b"))
+    ledger_path = tmp_path / "aws-spend.json"
+    with LaunchStateStore(ledger_path) as store:
+        orchestrator = AwsOrchestrator(
+            config=config,
+            aws=aws,
+            ledger=BudgetLedger(
+                cap_usd=config.cap_usd, allocations=config.allocations
+            ),
+            remote=FakeRemote(),
+            client_token_factory=lambda: next(tokens),
+            reservation_store=store,
+        )
+        orchestrator.preflight()
+
+        launched = orchestrator.launch_guarded_instance(
+            "benchmark", Decimal("0.25"), instance_type="c7i.8xlarge"
+        )
+
+        reservation = store.load()
+
+    assert launched.availability_zone == "us-east-1b"
+    assert [request["ClientToken"] for request in requests] == [
+        "capacity-token-a",
+        "capacity-token-b",
+    ]
+    assert [
+        request["Placement"]["AvailabilityZone"] for request in requests
+    ] == ["us-east-1a", "us-east-1b"]
+    assert reservation is not None
+    assert reservation.client_token == "capacity-token-b"
+    assert reservation.state == "launched"
+
+
+def test_exhausted_capacity_offers_leave_no_unresolved_reservation(
+    config, tmp_path
+):
+    from scripts.aws_all32 import (
+        AwsCapacityUnavailable,
+        AwsOrchestrator,
+        LaunchStateStore,
+    )
+
+    aws = FakeLifecycleAws(config)
+    aws.offers = (
+        SpotOffer(
+            instance_type="c7i.8xlarge",
+            availability_zone="us-east-1a",
+            subnet_id=config.subnet_ids[0],
+            hourly_usd=Decimal("0.50"),
+            timestamp=NOW,
+        ),
+        SpotOffer(
+            instance_type="c7i.8xlarge",
+            availability_zone="us-east-1b",
+            subnet_id=config.subnet_ids[1],
+            hourly_usd=Decimal("0.51"),
+            timestamp=NOW,
+        ),
+    )
+    aws.project_results = [(), ()]
+    requests = []
+
+    def reject_offer():
+        requests.append(aws.last_run_instances_request)
+        raise AwsCapacityUnavailable("capacity unavailable")
+
+    aws.run_instances_hook = reject_offer
+    tokens = iter(("exhausted-token-a", "exhausted-token-b"))
+    ledger_path = tmp_path / "aws-spend.json"
+    with LaunchStateStore(ledger_path) as store:
+        orchestrator = AwsOrchestrator(
+            config=config,
+            aws=aws,
+            ledger=BudgetLedger(
+                cap_usd=config.cap_usd, allocations=config.allocations
+            ),
+            remote=FakeRemote(),
+            client_token_factory=lambda: next(tokens),
+            reservation_store=store,
+        )
+        orchestrator.preflight()
+
+        with pytest.raises(AwsCapacityUnavailable):
+            orchestrator.launch_guarded_instance(
+                "benchmark", Decimal("0.25"), instance_type="c7i.8xlarge"
+            )
+
+        assert store.load() is None
+
+    assert len(requests) == 2
+
+
+def test_ambiguous_launch_does_not_try_another_offer(config, tmp_path):
+    from scripts.aws_all32 import AwsOrchestrator, LaunchStateStore
+
+    aws = FakeLifecycleAws(config)
+    aws.offers = (
+        SpotOffer(
+            instance_type="c7i.8xlarge",
+            availability_zone="us-east-1a",
+            subnet_id=config.subnet_ids[0],
+            hourly_usd=Decimal("0.50"),
+            timestamp=NOW,
+        ),
+        SpotOffer(
+            instance_type="c7i.8xlarge",
+            availability_zone="us-east-1b",
+            subnet_id=config.subnet_ids[1],
+            hourly_usd=Decimal("0.51"),
+            timestamp=NOW,
+        ),
+    )
+    attempts = []
+
+    def time_out():
+        attempts.append(aws.last_run_instances_request)
+        raise TimeoutError("ambiguous launch")
+
+    aws.run_instances_hook = time_out
+    tokens = iter(("ambiguous-token-a", "must-not-be-used"))
+    ledger_path = tmp_path / "aws-spend.json"
+    with LaunchStateStore(ledger_path) as store:
+        orchestrator = AwsOrchestrator(
+            config=config,
+            aws=aws,
+            ledger=BudgetLedger(
+                cap_usd=config.cap_usd, allocations=config.allocations
+            ),
+            remote=FakeRemote(),
+            client_token_factory=lambda: next(tokens),
+            reservation_store=store,
+        )
+        orchestrator.preflight()
+
+        with pytest.raises(TimeoutError, match="ambiguous launch"):
+            orchestrator.launch_guarded_instance(
+                "benchmark", Decimal("0.25"), instance_type="c7i.8xlarge"
+            )
+
+        reservation = store.load()
+
+    assert len(attempts) == 1
+    assert reservation is not None
+    assert reservation.client_token == "ambiguous-token-a"
+
+
 def test_ambiguous_launch_keeps_stable_reservation_and_blocks_retry(
     config, tmp_path
 ):
@@ -3756,6 +3979,7 @@ def test_reconcile_keeps_ambiguous_unknown_reservation_fail_closed(
             ],
             stdout=stdout,
             aws_override=FakeLifecycleAws(config),
+            wall_clock=lambda: 1001.0,
         )
         == 0
     )
@@ -3784,6 +4008,127 @@ def test_reconcile_keeps_ambiguous_unknown_reservation_fail_closed(
             aws_override=FakeLifecycleAws(config),
             remote=FakeRemote(),
         )
+
+
+def test_reconcile_clears_old_empty_sidecar_but_retains_conservative_costs(
+    config, orchestrator, tmp_path
+):
+    from scripts.aws_all32 import (
+        LaunchReservation,
+        LaunchStateStore,
+        _settle_reservation,
+        main,
+    )
+
+    orchestrator.preflight()
+    orchestrator.launch_guarded_instance("benchmark", Decimal("0.25"))
+    ledger_path = tmp_path / "aws-spend.json"
+    reservation = LaunchReservation(
+        client_token="old-empty-token",
+        state="reserved",
+        phase="benchmark",
+        request=orchestrator.aws.last_run_instances_request,
+        instance_hourly_usd=Decimal("0.5568"),
+        on_demand_hourly_usd=Decimal("1.428"),
+        volume_hourly_usd=Decimal("8") / Decimal("720"),
+        max_hours=Decimal("0.25"),
+        grace_hours=Decimal("0.25"),
+        requested_epoch_seconds=Decimal("1000"),
+    )
+    actual = CostedRun(
+        phase="benchmark",
+        instance_id="i-0123456789abcdef0",
+        hours=Decimal("0.05"),
+        instance_hourly_usd=Decimal("1.428"),
+        volume_hourly_usd=Decimal("8") / Decimal("720"),
+    )
+    ledger = BudgetLedger(
+        cap_usd=config.cap_usd,
+        allocations=config.allocations,
+    ).update_run(actual)
+    conservative = _settle_reservation(
+        ledger, reservation, instance_id=None
+    )
+    conservative.save(ledger_path)
+    with LaunchStateStore(ledger_path) as store:
+        store.save(reservation)
+
+    aws = FakeLifecycleAws(config)
+    aws.project_results = [(), (), ()]
+    stdout = io.StringIO()
+
+    assert (
+        main(
+            [
+                "reconcile",
+                "--config",
+                str(CONFIG_PATH),
+                "--ledger",
+                str(ledger_path),
+            ],
+            stdout=stdout,
+            aws_override=aws,
+            wall_clock=lambda: 2801.0,
+        )
+        == 0
+    )
+
+    result = BudgetLedger.load(ledger_path, cap_usd=config.cap_usd)
+    assert json.loads(stdout.getvalue())["reservation_cleared"] is True
+    assert not store.state_path.exists()
+    assert aws.project_results == []
+    assert {run.instance_id for run in result.runs} == {
+        actual.instance_id,
+        "pending:old-empty-token",
+    }
+    assert result.spent_usd == conservative.spent_usd
+
+
+def test_reconcile_keeps_empty_reservation_until_runtime_and_grace_age(
+    config, orchestrator, tmp_path
+):
+    from scripts.aws_all32 import LaunchReservation, LaunchStateStore, main
+
+    orchestrator.preflight()
+    orchestrator.launch_guarded_instance("benchmark", Decimal("0.25"))
+    ledger_path = tmp_path / "aws-spend.json"
+    reservation = LaunchReservation(
+        client_token="not-old-enough-token",
+        state="reserved",
+        phase="benchmark",
+        request=orchestrator.aws.last_run_instances_request,
+        instance_hourly_usd=Decimal("0.5568"),
+        on_demand_hourly_usd=Decimal("1.428"),
+        volume_hourly_usd=Decimal("8") / Decimal("720"),
+        max_hours=Decimal("0.25"),
+        grace_hours=Decimal("0.25"),
+        requested_epoch_seconds=Decimal("1000"),
+    )
+    with LaunchStateStore(ledger_path) as store:
+        store.save(reservation)
+    aws = FakeLifecycleAws(config)
+    aws.project_results = [(), (), ()]
+    stdout = io.StringIO()
+
+    assert (
+        main(
+            [
+                "reconcile",
+                "--config",
+                str(CONFIG_PATH),
+                "--ledger",
+                str(ledger_path),
+            ],
+            stdout=stdout,
+            aws_override=aws,
+            wall_clock=lambda: 1901.0,
+        )
+        == 0
+    )
+
+    assert json.loads(stdout.getvalue())["reservation_cleared"] is False
+    assert store.state_path.exists()
+    assert aws.project_results == [()]
 
 
 def test_reconcile_never_substitutes_unrelated_project_instance(
@@ -3828,6 +4173,7 @@ def test_reconcile_never_substitutes_unrelated_project_instance(
             ],
             stdout=io.StringIO(),
             aws_override=aws,
+            wall_clock=lambda: 1001.0,
         )
         == 0
     )
