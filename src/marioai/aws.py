@@ -528,7 +528,7 @@ class AwsCli:
                     bucket,
                     "--prefix",
                     key_prefix,
-                    "--max-items",
+                    "--max-keys",
                     "1",
                 ],
             ),
