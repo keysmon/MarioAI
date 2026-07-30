@@ -1998,7 +1998,7 @@ set -eu
 [ "$VERSION_ID" = 24.04 ]
 sudo env DEBIAN_FRONTEND=noninteractive apt-get update
 sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  --no-install-recommends ca-certificates curl unzip rsync python3 \
+  --no-install-recommends ca-certificates curl libgl1 unzip rsync python3 \
   python3-venv
 if ! command -v aws >/dev/null 2>&1; then
   work_dir="$(mktemp -d)"

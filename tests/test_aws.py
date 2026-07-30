@@ -4424,6 +4424,54 @@ def test_ssh_remote_start_uses_argument_vectors(orchestrator, tmp_path):
     assert "</dev/null" in startup_script
 
 
+def test_fresh_host_bootstrap_installs_libgl_before_train_phase_import(
+    orchestrator, tmp_path
+):
+    """Missing libgl1 leaves cv2 unable to load during the import smoke."""
+    from scripts.aws_all32 import SshRemoteSupervisor
+
+    orchestrator.preflight()
+    instance = orchestrator.launch_guarded_instance(
+        "benchmark", Decimal("1")
+    )
+    ssh_key = tmp_path / "mario-training-key.pem"
+    ssh_key.write_text("test-only", encoding="utf-8")
+    local_repo = tmp_path / "MarioAI"
+    local_repo.mkdir()
+    calls = []
+
+    def runner(command, **kwargs):
+        calls.append((command, kwargs))
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    remote = SshRemoteSupervisor(
+        aws=orchestrator.aws,
+        ssh_key=ssh_key,
+        local_repo=local_repo,
+        runner=runner,
+        monotonic=lambda: 0.0,
+    )
+
+    remote.start(
+        instance,
+        phase="benchmark",
+        max_seconds=3600,
+        s3_prefix=orchestrator.config.s3_prefix,
+    )
+
+    os_bootstrap = calls[1][1]["input"]
+    dependency_bootstrap = calls[3][1]["input"]
+    bootstrap_inputs = [
+        kwargs["input"] for _, kwargs in calls if "input" in kwargs
+    ]
+    assert "apt-get install -y" in os_bootstrap
+    assert "libgl1" in os_bootstrap
+    assert "import scripts.train_phase" in dependency_bootstrap
+    assert bootstrap_inputs.index(os_bootstrap) < bootstrap_inputs.index(
+        dependency_bootstrap
+    )
+
+
 def test_ssh_remote_benchmark_uses_fresh_host_bootstrap_and_strict_json(
     orchestrator, tmp_path
 ):
