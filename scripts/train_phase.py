@@ -394,6 +394,7 @@ class PhaseLineage:
     best_report: ReportIdentity | None
     next_weights: Mapping[str, float]
     pending_training: Mapping[str, object] | None
+    bootstrap_source: BundleIdentity | None = None
 
     def validate(self, repository_root: Path) -> None:
         if (
@@ -420,6 +421,15 @@ class PhaseLineage:
             )
         ):
             raise ValueError("phase lineage identity is invalid")
+        if self.bootstrap_source is not None:
+            self.bootstrap_source.validate(repository_root)
+            if (
+                self.phase != "phase_2"
+                or self.bootstrap_source.phase != "phase_1"
+            ):
+                raise ValueError(
+                    "phase lineage bootstrap source is invalid"
+                )
         for bundle in (self.last_candidate, self.promoted_best):
             if bundle is not None:
                 bundle.validate(repository_root)
@@ -450,7 +460,7 @@ class PhaseLineage:
 
     def to_dict(self) -> dict:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "phase": self.phase,
             "run_name": self.run_name,
             "last_candidate": (
@@ -479,13 +489,18 @@ class PhaseLineage:
                 if self.pending_training is not None
                 else None
             ),
+            "bootstrap_source": (
+                self.bootstrap_source.to_dict()
+                if self.bootstrap_source is not None
+                else None
+            ),
         }
 
     @classmethod
     def from_dict(
         cls, payload: object, *, repository_root: Path
     ) -> PhaseLineage:
-        expected = {
+        expected_v1 = {
             "schema_version",
             "phase",
             "run_name",
@@ -496,10 +511,18 @@ class PhaseLineage:
             "next_weights",
             "pending_training",
         }
+        expected_v2 = expected_v1 | {"bootstrap_source"}
         if (
             not isinstance(payload, dict)
-            or set(payload) != expected
-            or payload.get("schema_version") != 1
+            or (
+                payload.get("schema_version") == 1
+                and set(payload) != expected_v1
+            )
+            or (
+                payload.get("schema_version") == 2
+                and set(payload) != expected_v2
+            )
+            or payload.get("schema_version") not in {1, 2}
         ):
             raise ValueError("phase lineage has an invalid schema")
 
@@ -530,6 +553,7 @@ class PhaseLineage:
             best_report=report(payload["best_report"]),
             next_weights=payload["next_weights"],
             pending_training=payload["pending_training"],
+            bootstrap_source=bundle(payload.get("bootstrap_source")),
         )
         lineage.validate(repository_root)
         return lineage
@@ -803,9 +827,22 @@ class PhaseLoop:
         else:
             if self.checkpoint is None:
                 initial_bundle = None
+                bootstrap_source = None
             elif isinstance(self.checkpoint, BundleIdentity):
-                initial_bundle = self.checkpoint
-                initial_bundle.validate(self.repository_root)
+                self.checkpoint.validate(self.repository_root)
+                if self.checkpoint.phase == self.phase:
+                    initial_bundle = self.checkpoint
+                    bootstrap_source = None
+                elif (
+                    self.phase == "phase_2"
+                    and self.checkpoint.phase == "phase_1"
+                ):
+                    initial_bundle = None
+                    bootstrap_source = self.checkpoint
+                else:
+                    raise ValueError(
+                        "checkpoint cannot bootstrap the requested phase"
+                    )
             else:
                 raise ValueError(
                     "durable phase resume requires a complete bundle identity"
@@ -821,6 +858,7 @@ class PhaseLoop:
                     level: 1.0 for level in self.levels
                 },
                 pending_training=None,
+                bootstrap_source=bootstrap_source,
             )
             self.lineage_store.save(lineage)
         self.next_weights = dict(lineage.next_weights)
@@ -885,8 +923,15 @@ class PhaseLoop:
                 self.lineage_store.save(lineage)
                 continue
 
+            training_source = (
+                candidate
+                if candidate is not None
+                else lineage.bootstrap_source
+            )
             current_timesteps = (
-                candidate.num_timesteps if candidate is not None else 0
+                training_source.num_timesteps
+                if training_source is not None
+                else 0
             )
             if (
                 current_timesteps >= self.total_timesteps
@@ -901,8 +946,8 @@ class PhaseLoop:
                 lineage,
                 pending_training={
                     "source_manifest_sha256": (
-                        candidate.manifest_sha256
-                        if candidate is not None
+                        training_source.manifest_sha256
+                        if training_source is not None
                         else None
                     ),
                     "target_timesteps": target_timesteps,
@@ -910,7 +955,7 @@ class PhaseLoop:
             )
             self.lineage_store.save(lineage)
             trained = self._train_chunk(
-                checkpoint=candidate,
+                checkpoint=training_source,
                 target_timesteps=target_timesteps,
                 level_weights=self.next_weights,
                 deadline=self.deadline,

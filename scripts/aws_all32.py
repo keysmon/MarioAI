@@ -784,7 +784,11 @@ def _read_json_file(path: Path, description: str) -> Any:
 
 def _phase_identity_paths(payload: dict[str, Any]) -> set[str]:
     paths: set[str] = set()
-    for field in ("last_candidate", "promoted_best"):
+    for field in (
+        "bootstrap_source",
+        "last_candidate",
+        "promoted_best",
+    ):
         bundle = payload.get(field)
         if bundle is None:
             continue
@@ -1120,6 +1124,7 @@ def restore_phase_lineage(
         unique_bundles = {
             bundle.manifest_sha256: bundle
             for bundle in (
+                lineage.bootstrap_source,
                 lineage.last_candidate,
                 lineage.promoted_best,
             )
@@ -1130,7 +1135,7 @@ def restore_phase_lineage(
             selected_validator(
                 bundle,
                 mirror,
-                phase=phase,
+                phase=bundle.phase,
                 trusted_repo=repo_root,
             )
             checkpoint_ledger = _configured_ledger(
@@ -3369,6 +3374,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path(__file__).resolve().parents[1],
     )
     resume.add_argument("--checkpoint-s3-uri", required=True)
+    resume.add_argument(
+        "--bootstrap-from-phase",
+        choices=("phase_1",),
+        help="bootstrap phase_2 from the promoted phase_1 lineage",
+    )
 
     status = subparsers.add_parser(
         "status", help="show Project=MarioAI-All32 instance state"
@@ -3617,6 +3627,8 @@ def _resume_training_args(
     repo_dir: Path,
     *,
     authoritative_ledger_path: Path,
+    target_phase: str | None = None,
+    bootstrap_source_phase: str | None = None,
 ) -> tuple[str, ...]:
     repo_root = Path(repo_dir).resolve()
 
@@ -3629,6 +3641,36 @@ def _resume_training_args(
             ) from error
 
     if isinstance(bundle, PhaseResumeBundle):
+        source_phase = bundle.lineage.phase
+        selected_phase = (
+            source_phase if target_phase is None else target_phase
+        )
+        if bootstrap_source_phase is not None:
+            promoted = bundle.lineage.promoted_best
+            if (
+                bootstrap_source_phase != "phase_1"
+                or source_phase != bootstrap_source_phase
+                or selected_phase != "phase_2"
+                or promoted is None
+            ):
+                raise AwsLifecycleError(
+                    "phase bootstrap requires a promoted phase_1 policy "
+                    "and phase_2 target"
+                )
+            return (
+                "--config",
+                "configs/all32.yaml",
+                "--run-name",
+                "all32-phase_2",
+                "--resume",
+                relative(repo_root / promoted.manifest_path),
+                "--budget-ledger-snapshot",
+                relative(authoritative_ledger_path),
+            )
+        if selected_phase != source_phase:
+            raise AwsLifecycleError(
+                "phase resume target does not match its lineage"
+            )
         run_name = bundle.lineage.run_name
         lineage_path = relative(bundle.lineage_path)
         return (
@@ -3642,6 +3684,10 @@ def _resume_training_args(
             relative(authoritative_ledger_path),
         )
 
+    if bootstrap_source_phase is not None:
+        raise AwsLifecycleError(
+            "phase bootstrap requires durable promoted lineage"
+        )
     run_name = bundle.manifest.get("run_name")
     if (
         not isinstance(run_name, str)
@@ -3686,6 +3732,7 @@ def _resume_budget_ledger_paths(
     identities = {
         identity.budget_ledger_path
         for identity in (
+            bundle.lineage.bootstrap_source,
             bundle.lineage.last_candidate,
             bundle.lineage.promoted_best,
         )
@@ -3922,6 +3969,13 @@ def main(
 ) -> int:
     """Dispatch one explicit lifecycle command."""
     args = build_parser().parse_args(argv)
+    if (
+        getattr(args, "bootstrap_from_phase", None) is not None
+        and args.phase != "phase_2"
+    ):
+        raise AwsLifecycleError(
+            "--bootstrap-from-phase is only valid for phase_2"
+        )
     output = sys.stdout if stdout is None else stdout
     config = AwsConfig.from_yaml(args.config)
     cli_kwargs: dict[str, Any] = {
@@ -3950,7 +4004,11 @@ def main(
             )
         resume_bundle = restore_checkpoint_bundle(
             config=config,
-            phase=args.phase,
+            phase=(
+                args.bootstrap_from_phase
+                if args.bootstrap_from_phase is not None
+                else args.phase
+            ),
             checkpoint_s3_uri=args.checkpoint_s3_uri,
             repo_dir=args.repo_dir,
             ledger_path=args.ledger,
@@ -4261,6 +4319,10 @@ def main(
                         args.repo_dir,
                         authoritative_ledger_path=(
                             authoritative_ledger_snapshot
+                        ),
+                        target_phase=args.phase,
+                        bootstrap_source_phase=(
+                            args.bootstrap_from_phase
                         ),
                     )
                 selected_remote.start(instance, **start_kwargs)

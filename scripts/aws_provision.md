@@ -43,7 +43,7 @@ second instance.
 
 ## 2. Measured benchmark gate — maximum USD 4.00
 
-The fixed workload is exactly 250,000 Stable-Baselines environment/action
+The fixed workload is exactly 100,000 Stable-Baselines environment/action
 steps. With frame skip 4, these are decision steps, not one million emulator
 frames.
 
@@ -181,7 +181,29 @@ Chunk progress is expressed in environment steps, so training continues from
 the exact last candidate while returning only the independently promoted
 best.
 
-## 7. Spend and evidence checks
+## 7. Bootstrap phase 2 from the promoted phase-1 policy
+
+Phase 2 must continue the same shared policy. Restore the canonical phase-1
+lineage and explicitly bootstrap from its independently promoted best:
+
+```bash
+.venv/bin/python scripts/aws_all32.py resume \
+  --config configs/aws-all32.yaml \
+  --ledger reports/aws-spend.json \
+  --phase phase_2 \
+  --bootstrap-from-phase phase_1 \
+  --max-hours 4.00 \
+  --instance-type "$INSTANCE_TYPE" \
+  --checkpoint-s3-uri \
+    s3://defectlens-phase3-002559670021/marioai/all32/models/all32-phase_1/latest.json \
+  --ssh-key "$HOME/.ssh/mario-training-key.pem"
+```
+
+The bootstrap source is retained in phase-2 lineage for crash recovery and
+provenance. It is never diagnosed or promoted as phase-2 evidence; the first
+new phase-2 candidate is trained on all 32 levels, then diagnosed normally.
+
+## 8. Spend and evidence checks
 
 ```bash
 .venv/bin/python -c \

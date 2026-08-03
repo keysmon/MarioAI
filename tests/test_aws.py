@@ -694,6 +694,7 @@ def _write_phase_bundle(
     timesteps: int,
     model_payload: bytes,
     budget_ledger_payload: bytes = b'{"schema_version":1}\n',
+    phase: str = "phase_1",
 ) -> Path:
     directory = repository / "models" / directory_name
     directory.mkdir(parents=True)
@@ -716,7 +717,7 @@ def _write_phase_bundle(
     manifest = {
         "schema_version": 1,
         "run_name": directory_name,
-        "phase": "phase_1",
+        "phase": phase,
         "num_timesteps": timesteps,
         "model": names["model"],
         "sha256": hashlib.sha256(model_payload).hexdigest(),
@@ -835,6 +836,179 @@ def test_phase_lineage_round_trip_keeps_last_candidate_and_promoted_best(
     assert restored.best_report == report_identity
     assert restored.best_report.load(tmp_path) == report
     assert restored.next_weights == {"1-1": 2.0}
+
+
+def test_phase_two_bootstrap_trains_from_phase_one_without_diagnosing_or_promoting_it(
+    tmp_path,
+):
+    import scripts.train_phase as phase_training
+
+    bootstrap = phase_training.BundleIdentity.from_manifest(
+        _write_phase_bundle(
+            tmp_path,
+            directory_name="all32-phase_1-chunk-000000000004",
+            timesteps=4,
+            model_payload=b"phase one curriculum",
+        ),
+        repository_root=tmp_path,
+    )
+    candidate = phase_training.BundleIdentity.from_manifest(
+        _write_phase_bundle(
+            tmp_path,
+            directory_name="all32-phase_2-chunk-000000000008",
+            timesteps=8,
+            model_payload=b"phase two candidate",
+            phase="phase_2",
+        ),
+        repository_root=tmp_path,
+    )
+    store = phase_training.PhaseLineageStore(
+        tmp_path / "models" / "all32-phase_2" / "latest.json",
+        repository_root=tmp_path,
+    )
+    train_calls = []
+    diagnostic_calls = []
+
+    def train(**kwargs):
+        train_calls.append(kwargs)
+        return candidate
+
+    def diagnose(**kwargs):
+        diagnostic_calls.append(kwargs["checkpoint"])
+        return _three_rollout_report(
+            candidate,
+            levels=("1-1",),
+            base_seed=42008,
+            passing={"1-1"},
+            progress=100,
+        )
+
+    loop = phase_training.PhaseLoop(
+        phase="phase_2",
+        deadline=NOW + timedelta(hours=1),
+        checkpoint=bootstrap,
+        levels=("1-1",),
+        n_envs=1,
+        total_timesteps=8,
+        chunk_timesteps=4,
+        diagnostic_episodes=3,
+        diagnostic_seed=42000,
+        train_chunk=train,
+        diagnose=diagnose,
+        checkpoint_timesteps=lambda _path: 0,
+        now=lambda: NOW,
+        report_dir=tmp_path / "models" / "all32-phase_2" / "diagnostics",
+        lineage_store=store,
+        repository_root=tmp_path,
+        run_name="all32-phase_2",
+    )
+
+    assert loop.run() == candidate.model(tmp_path)
+    assert train_calls[0]["checkpoint"] == bootstrap
+    assert train_calls[0]["target_timesteps"] == 8
+    assert diagnostic_calls == [candidate]
+    restored = store.load()
+    assert restored.bootstrap_source == bootstrap
+    assert restored.last_candidate == candidate
+    assert restored.promoted_best == candidate
+
+
+def test_phase_two_resume_arguments_bootstrap_only_the_promoted_phase_one_policy(
+    tmp_path,
+):
+    from scripts import aws_all32
+    import scripts.train_phase as phase_training
+
+    promoted = phase_training.BundleIdentity.from_manifest(
+        _write_phase_bundle(
+            tmp_path,
+            directory_name="all32-phase_1-chunk-000000000004",
+            timesteps=4,
+            model_payload=b"promoted curriculum",
+        ),
+        repository_root=tmp_path,
+    )
+    report = _three_rollout_report(
+        promoted,
+        levels=("1-1",),
+        base_seed=42004,
+        passing={"1-1"},
+        progress=100,
+    )
+    report_path = (
+        tmp_path / "models" / "all32-phase_1" / "diagnostics" / "best.json"
+    )
+    report.write(report_path)
+    lineage = phase_training.PhaseLineage(
+        phase="phase_1",
+        run_name="all32-phase_1",
+        last_candidate=promoted,
+        last_diagnostic=phase_training.ReportIdentity.from_report(
+            report_path, repository_root=tmp_path
+        ),
+        promoted_best=promoted,
+        best_report=phase_training.ReportIdentity.from_report(
+            report_path, repository_root=tmp_path
+        ),
+        next_weights={"1-1": 1.0},
+        pending_training=None,
+    )
+    lineage_path = tmp_path / "models" / "all32-phase_1" / "latest.json"
+    lineage_path.write_text("{}\n", encoding="utf-8")
+    ledger_path = tmp_path / ".resume" / "authoritative-ledger.json"
+    ledger_path.parent.mkdir()
+    ledger_path.write_text("{}\n", encoding="utf-8")
+    bundle = aws_all32.PhaseResumeBundle(
+        root=tmp_path,
+        lineage_path=lineage_path,
+        lineage=lineage,
+    )
+
+    arguments = aws_all32._resume_training_args(
+        bundle,
+        tmp_path,
+        authoritative_ledger_path=ledger_path,
+        target_phase="phase_2",
+        bootstrap_source_phase="phase_1",
+    )
+
+    assert arguments == (
+        "--config",
+        "configs/all32.yaml",
+        "--run-name",
+        "all32-phase_2",
+        "--resume",
+        promoted.manifest_path,
+        "--budget-ledger-snapshot",
+        ".resume/authoritative-ledger.json",
+    )
+
+
+def test_phase_bootstrap_cli_rejects_any_target_other_than_phase_two():
+    from scripts import aws_all32
+
+    with pytest.raises(
+        AwsLifecycleError,
+        match="only valid for phase_2",
+    ):
+        aws_all32.main(
+            [
+                "resume",
+                "--config",
+                str(CONFIG_PATH),
+                "--ledger",
+                "reports/aws-spend.json",
+                "--phase",
+                "phase_1",
+                "--max-hours",
+                "1",
+                "--checkpoint-s3-uri",
+                "s3://bucket/prefix/latest.json",
+                "--bootstrap-from-phase",
+                "phase_1",
+            ],
+            stdout=io.StringIO(),
+        )
 
 
 def test_train_shared_chunk_returns_only_a_verified_complete_bundle(
