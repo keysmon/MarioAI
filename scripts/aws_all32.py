@@ -69,6 +69,10 @@ class AwsCapacityUnavailable(AwsLifecycleError):
     """Raised when EC2 definitively rejects a launch before creating it."""
 
 
+class AwsSpotQuotaExceeded(AwsLifecycleError):
+    """Raised when EC2 definitively rejects a launch for the Spot quota."""
+
+
 @dataclass(frozen=True)
 class BenchmarkObservation:
     """Exact remote duration and memory observation for one fixed workload."""
@@ -1592,6 +1596,16 @@ class AwsCommandAdapter:
                     "EC2 definitively rejected run-instances before creation: "
                     "InsufficientInstanceCapacity"
                 ) from error
+            if re.search(
+                r"An error occurred \(MaxSpotInstanceCountExceeded\) "
+                r"when calling the RunInstances operation"
+                r"(?: \(reached max retries: \d+\))?:",
+                stderr,
+            ):
+                raise AwsSpotQuotaExceeded(
+                    "EC2 definitively rejected run-instances before creation: "
+                    "MaxSpotInstanceCountExceeded"
+                ) from error
             raise
         if not isinstance(payload, dict):
             raise AwsLifecycleError(
@@ -2573,6 +2587,20 @@ class AwsOrchestrator:
                 payload = self.aws.run_instances(
                     request, max_hours=max_hours
                 )
+            except AwsSpotQuotaExceeded as error:
+                if self.reservation_store is not None:
+                    durable = self.reservation_store.load()
+                    if (
+                        durable is None
+                        or durable.client_token != client_token
+                        or durable.state != "reserved"
+                    ):
+                        raise AwsLifecycleError(
+                            "definitive Spot quota rejection does not match "
+                            "the durable launch reservation"
+                        ) from error
+                    self.reservation_store.clear()
+                raise
             except AwsCapacityUnavailable as error:
                 last_capacity_error = error
                 if self.reservation_store is not None:
@@ -3782,11 +3810,17 @@ def _run_benchmark_command(
                 break
             if index:
                 orchestrator.preflight()
-            instance = orchestrator.launch_guarded_instance(
-                "benchmark",
-                _BENCHMARK_MAX_HOURS,
-                instance_type=instance_type,
-            )
+            try:
+                instance = orchestrator.launch_guarded_instance(
+                    "benchmark",
+                    _BENCHMARK_MAX_HOURS,
+                    instance_type=instance_type,
+                )
+            except AwsSpotQuotaExceeded:
+                if not measurements:
+                    raise
+                decision = "candidate_unavailable"
+                break
             try:
                 orchestrator.persist_elapsed(instance, args.ledger)
                 instance = orchestrator.wait_for_running_public_ip(

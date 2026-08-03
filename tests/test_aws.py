@@ -2537,6 +2537,46 @@ def test_adapter_distinguishes_definitive_capacity_rejection(
         adapter.run_instances(request, max_hours=Decimal("1"))
 
 
+def test_adapter_distinguishes_definitive_spot_quota_rejection(
+    config, orchestrator
+):
+    import scripts.aws_all32 as aws_module
+
+    runner = FakeRunner()
+    adapter = aws_module.AwsCommandAdapter(
+        config=config,
+        readonly=FakeLifecycleAws(config),
+        runner=runner,
+    )
+    adapter.preflight(config)
+    runner.add(
+        [
+            "ssm",
+            "get-parameter",
+            "--name",
+            config.ami_ssm_parameter,
+            "--query",
+            "Parameter.Value",
+        ],
+        "ami-0123456789abcdef0",
+    )
+    adapter.resolve_ami(config.ami_ssm_parameter)
+    runner.error = subprocess.CalledProcessError(
+        255,
+        ["aws", "ec2", "run-instances"],
+        stderr=(
+            "An error occurred (MaxSpotInstanceCountExceeded) when calling "
+            "the RunInstances operation: Max spot instance count exceeded"
+        ),
+    )
+    orchestrator.preflight()
+    orchestrator.launch_guarded_instance("benchmark", Decimal("1"))
+    request = orchestrator.aws.last_run_instances_request
+
+    with pytest.raises(aws_module.AwsSpotQuotaExceeded):
+        adapter.run_instances(request, max_hours=Decimal("1"))
+
+
 @pytest.mark.parametrize(
     "case",
     [
@@ -3239,6 +3279,50 @@ def test_cli_benchmark_measures_both_candidates_selects_cost_winner_and_settles(
     ]
 
 
+def test_cli_benchmark_keeps_completed_candidate_when_second_hits_spot_quota(
+    config, tmp_path
+):
+    from scripts.aws_all32 import AwsSpotQuotaExceeded, main
+
+    clock, aws, remote = _fake_benchmark_lifecycle(config)
+
+    def reject_second_candidate():
+        if aws.last_run_instances_request["InstanceType"] == "c7i.16xlarge":
+            raise AwsSpotQuotaExceeded("spot quota exceeded")
+
+    aws.run_instances_hook = reject_second_candidate
+    stdout = io.StringIO()
+    tokens = iter(("benchmark-token-1", "benchmark-token-2"))
+
+    assert (
+        main(
+            [
+                "benchmark",
+                "--config",
+                str(CONFIG_PATH),
+                "--ledger",
+                str(tmp_path / "aws-spend.json"),
+                "--max-spend",
+                "4.00",
+            ],
+            stdout=stdout,
+            aws_override=aws,
+            remote=remote,
+            monotonic=clock,
+            sleeper=lambda _seconds: None,
+            client_token_factory=lambda: next(tokens),
+        )
+        == 0
+    )
+
+    payload = json.loads(stdout.getvalue())
+    assert payload["decision"] == "candidate_unavailable"
+    assert payload["selected_instance_type"] == "c7i.8xlarge"
+    assert [item["instance_type"] for item in payload["candidates"]] == [
+        "c7i.8xlarge"
+    ]
+
+
 def test_cli_benchmark_stops_early_when_remaining_allocation_cannot_fit_candidate(
     config, tmp_path
 ):
@@ -3783,6 +3867,64 @@ def test_ambiguous_launch_does_not_try_another_offer(config, tmp_path):
     assert len(attempts) == 1
     assert reservation is not None
     assert reservation.client_token == "ambiguous-token-a"
+
+
+def test_spot_quota_rejection_clears_reservation_without_az_retry(
+    config, tmp_path
+):
+    from scripts.aws_all32 import (
+        AwsOrchestrator,
+        AwsSpotQuotaExceeded,
+        LaunchStateStore,
+    )
+
+    aws = FakeLifecycleAws(config)
+    aws.offers = (
+        SpotOffer(
+            instance_type="c7i.8xlarge",
+            availability_zone="us-east-1a",
+            subnet_id=config.subnet_ids[0],
+            hourly_usd=Decimal("0.50"),
+            timestamp=NOW,
+        ),
+        SpotOffer(
+            instance_type="c7i.8xlarge",
+            availability_zone="us-east-1b",
+            subnet_id=config.subnet_ids[1],
+            hourly_usd=Decimal("0.51"),
+            timestamp=NOW,
+        ),
+    )
+    attempts = []
+
+    def reject_for_quota():
+        attempts.append(aws.last_run_instances_request)
+        raise AwsSpotQuotaExceeded("spot quota exceeded")
+
+    aws.run_instances_hook = reject_for_quota
+    tokens = iter(("quota-token-a", "must-not-be-used"))
+    ledger_path = tmp_path / "aws-spend.json"
+    with LaunchStateStore(ledger_path) as store:
+        orchestrator = AwsOrchestrator(
+            config=config,
+            aws=aws,
+            ledger=BudgetLedger(
+                cap_usd=config.cap_usd, allocations=config.allocations
+            ),
+            remote=FakeRemote(),
+            client_token_factory=lambda: next(tokens),
+            reservation_store=store,
+        )
+        orchestrator.preflight()
+
+        with pytest.raises(AwsSpotQuotaExceeded):
+            orchestrator.launch_guarded_instance(
+                "benchmark", Decimal("0.25"), instance_type="c7i.8xlarge"
+            )
+
+        assert store.load() is None
+
+    assert len(attempts) == 1
 
 
 def test_ambiguous_launch_keeps_stable_reservation_and_blocks_retry(
