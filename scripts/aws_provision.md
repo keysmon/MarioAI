@@ -76,7 +76,7 @@ INSTANCE_TYPE="$(
 printf '%s\n' "$INSTANCE_TYPE"
 ```
 
-Only `c7i.8xlarge` or `c7i.16xlarge` is valid. The lifecycle command rejects
+Only `c7i.4xlarge` or `c7i.16xlarge` is valid. The lifecycle command rejects
 any other value before mutation.
 
 ## 3. Launch and status

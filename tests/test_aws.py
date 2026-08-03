@@ -121,7 +121,7 @@ class FakeLifecycleAws:
                     "InstanceId": "i-0123456789abcdef0",
                     "ClientToken": "task-3-idempotency-token",
                     "ImageId": "ami-0123456789abcdef0",
-                    "InstanceType": "c7i.8xlarge",
+                    "InstanceType": "c7i.4xlarge",
                     "InstanceLifecycle": "spot",
                     "KeyName": config.key_name,
                     "IamInstanceProfile": {
@@ -144,7 +144,7 @@ class FakeLifecycleAws:
         self._default_run_instances_response = self.run_instances_response
         self.offers: tuple[SpotOffer, ...] = (
             SpotOffer(
-                instance_type="c7i.8xlarge",
+                instance_type="c7i.4xlarge",
                 availability_zone="us-east-1a",
                 subnet_id=self.config.subnet_ids[0],
                 hourly_usd=Decimal("0.5568"),
@@ -505,7 +505,7 @@ def _successful_runner(config: AwsConfig) -> FakeRunner:
         {
             "SpotPriceHistory": [
                 {
-                    "InstanceType": "c7i.8xlarge",
+                    "InstanceType": "c7i.4xlarge",
                     "AvailabilityZone": "us-east-1a",
                     "SpotPrice": "0.5568",
                     "Timestamp": NOW.isoformat(),
@@ -558,9 +558,9 @@ def test_account_configuration_is_exact():
     assert cfg.key_name == "mario-training-key"
     assert cfg.instance_profile == "defectlens-gpu-role"
     assert cfg.s3_prefix == "s3://defectlens-phase3-002559670021/marioai/all32/"
-    assert cfg.instance_types == ("c7i.8xlarge", "c7i.16xlarge")
+    assert cfg.instance_types == ("c7i.4xlarge", "c7i.16xlarge")
     assert cfg.on_demand_ceiling_usd == {
-        "c7i.8xlarge": Decimal("1.428"),
+        "c7i.4xlarge": Decimal("0.714"),
         "c7i.16xlarge": Decimal("2.856"),
     }
     assert cfg.root_volume_gb == 100
@@ -579,13 +579,13 @@ def test_account_configuration_is_exact():
 
 def test_benchmark_selects_lower_cost_per_million_steps():
     offers = [
-        aws_all32.Benchmark("c7i.8xlarge", 1800.0, Decimal("0.5568")),
+        aws_all32.Benchmark("c7i.4xlarge", 1800.0, Decimal("0.5568")),
         aws_all32.Benchmark("c7i.16xlarge", 2900.0, Decimal("0.9646")),
     ]
 
     selected = aws_all32.select_benchmark(offers)
 
-    assert selected.instance_type == "c7i.8xlarge"
+    assert selected.instance_type == "c7i.4xlarge"
 
 
 def test_benchmark_report_uses_exact_observed_duration_spot_and_volume_rate():
@@ -596,7 +596,7 @@ def test_benchmark_report_uses_exact_observed_duration_spot_and_volume_rate():
     )
 
     benchmark = aws_all32.Benchmark.from_observation(
-        instance_type="c7i.8xlarge",
+        instance_type="c7i.4xlarge",
         observation=observation,
         instance_hourly_usd=Decimal("0.60"),
         volume_hourly_usd=Decimal("0.12"),
@@ -606,7 +606,7 @@ def test_benchmark_report_uses_exact_observed_duration_spot_and_volume_rate():
     assert benchmark.cost_per_million_steps == Decimal("0.1")
     assert benchmark.observed_cost_usd == Decimal("0.025")
     assert benchmark.to_dict() == {
-        "instance_type": "c7i.8xlarge",
+        "instance_type": "c7i.4xlarge",
         "environment_steps": 250_000,
         "elapsed_seconds": "125",
         "env_steps_per_second": 2000.0,
@@ -623,13 +623,13 @@ def test_benchmark_report_uses_exact_observed_duration_spot_and_volume_rate():
     [
         lambda: aws_all32.Benchmark("", 1.0, Decimal("0.60")),
         lambda: aws_all32.Benchmark(
-            "c7i.8xlarge", 0.0, Decimal("0.60")
+            "c7i.4xlarge", 0.0, Decimal("0.60")
         ),
         lambda: aws_all32.Benchmark(
-            "c7i.8xlarge", float("nan"), Decimal("0.60")
+            "c7i.4xlarge", float("nan"), Decimal("0.60")
         ),
         lambda: aws_all32.Benchmark(
-            "c7i.8xlarge", 1.0, Decimal("-0.01")
+            "c7i.4xlarge", 1.0, Decimal("-0.01")
         ),
     ],
 )
@@ -1923,13 +1923,13 @@ def test_spot_selection_is_deterministic_and_restricted(config):
                     "Timestamp": "2026-07-24T00:00:00+00:00",
                 },
                 {
-                    "InstanceType": "c7i.8xlarge",
+                    "InstanceType": "c7i.4xlarge",
                     "AvailabilityZone": "us-east-1z",
                     "SpotPrice": "0.2000",
                     "Timestamp": "2026-07-24T00:00:00+00:00",
                 },
                 {
-                    "InstanceType": "c7i.8xlarge",
+                    "InstanceType": "c7i.4xlarge",
                     "AvailabilityZone": "us-east-1f",
                     "SpotPrice": "0.7000",
                     "Timestamp": "2026-07-23T00:00:00+00:00",
@@ -1941,7 +1941,7 @@ def test_spot_selection_is_deterministic_and_restricted(config):
                     "Timestamp": "2026-07-24T00:00:00+00:00",
                 },
                 {
-                    "InstanceType": "c7i.8xlarge",
+                    "InstanceType": "c7i.4xlarge",
                     "AvailabilityZone": "us-east-1f",
                     "SpotPrice": "0.5568",
                     "Timestamp": "2026-07-24T00:00:00+00:00",
@@ -1953,7 +1953,7 @@ def test_spot_selection_is_deterministic_and_restricted(config):
     offers = cli.latest_spot_prices(reversed(config.instance_types))
 
     assert [(offer.instance_type, offer.availability_zone) for offer in offers] == [
-        ("c7i.8xlarge", "us-east-1f"),
+        ("c7i.4xlarge", "us-east-1f"),
         ("c7i.16xlarge", "us-east-1c"),
     ]
     assert offers[0].subnet_id == config.subnet_ids[5]
@@ -1973,11 +1973,11 @@ def test_spot_selection_rejects_stale_or_future_allowed_offer(
     cli, runner = _preflight_cli(config)
     cli.preflight(config)
     runner.add(
-        _spot_args(["c7i.8xlarge"]),
+        _spot_args(["c7i.4xlarge"]),
         {
             "SpotPriceHistory": [
                 {
-                    "InstanceType": "c7i.8xlarge",
+                    "InstanceType": "c7i.4xlarge",
                     "AvailabilityZone": "us-east-1a",
                     "SpotPrice": "0.5568",
                     "Timestamp": timestamp,
@@ -1987,7 +1987,7 @@ def test_spot_selection_rejects_stale_or_future_allowed_offer(
     )
 
     with pytest.raises(AwsPreflightError, match="current freshness window"):
-        cli.latest_spot_prices(["c7i.8xlarge"])
+        cli.latest_spot_prices(["c7i.4xlarge"])
 
 
 def test_spot_selection_rejects_type_not_allowed_by_preflight(config):
@@ -2003,18 +2003,18 @@ def test_spot_selection_rejects_non_string_type_cleanly(config):
     cli.preflight(config)
 
     with pytest.raises(AwsPreflightError, match="non-empty strings"):
-        cli.latest_spot_prices(["c7i.8xlarge", None])
+        cli.latest_spot_prices(["c7i.4xlarge", None])
 
 
 def test_spot_selection_normalizes_unhashable_availability_zone(config):
     cli, runner = _preflight_cli(config)
     cli.preflight(config)
     runner.add(
-        _spot_args(["c7i.8xlarge"]),
+        _spot_args(["c7i.4xlarge"]),
         {
             "SpotPriceHistory": [
                 {
-                    "InstanceType": "c7i.8xlarge",
+                    "InstanceType": "c7i.4xlarge",
                     "AvailabilityZone": [],
                     "SpotPrice": "0.5568",
                     "Timestamp": NOW.isoformat(),
@@ -2024,18 +2024,18 @@ def test_spot_selection_normalizes_unhashable_availability_zone(config):
     )
 
     with pytest.raises(AwsPreflightError, match="malformed Spot offer"):
-        cli.latest_spot_prices(["c7i.8xlarge"])
+        cli.latest_spot_prices(["c7i.4xlarge"])
 
 
 def test_spot_selection_rejects_malformed_allowed_offer(config):
     cli, runner = _preflight_cli(config)
     cli.preflight(config)
     runner.add(
-        _spot_args(["c7i.8xlarge"]),
+        _spot_args(["c7i.4xlarge"]),
         {
             "SpotPriceHistory": [
                 {
-                    "InstanceType": "c7i.8xlarge",
+                    "InstanceType": "c7i.4xlarge",
                     "AvailabilityZone": "us-east-1a",
                     "SpotPrice": "not-a-price",
                     "Timestamp": "2026-07-24T00:00:00+00:00",
@@ -2045,7 +2045,7 @@ def test_spot_selection_rejects_malformed_allowed_offer(config):
     )
 
     with pytest.raises(AwsPreflightError, match="malformed Spot offer"):
-        cli.latest_spot_prices(["c7i.8xlarge"])
+        cli.latest_spot_prices(["c7i.4xlarge"])
 
 
 def test_launch_sets_one_time_spot_and_terminate_on_shutdown(orchestrator):
@@ -2063,7 +2063,7 @@ def test_launch_sets_one_time_spot_and_terminate_on_shutdown(orchestrator):
         {"Key": "Phase", "Value": "benchmark"},
     ]
     assert request["ImageId"] == "ami-0123456789abcdef0"
-    assert request["InstanceType"] == "c7i.8xlarge"
+    assert request["InstanceType"] == "c7i.4xlarge"
     assert request["Placement"] == {"AvailabilityZone": "us-east-1a"}
     assert request["KeyName"] == orchestrator.config.key_name
     assert request["IamInstanceProfile"] == {
@@ -2096,7 +2096,7 @@ def test_launch_sets_one_time_spot_and_terminate_on_shutdown(orchestrator):
 def test_launch_checks_budget_before_run_instances(orchestrator):
     orchestrator.ledger = BudgetLedger(
         cap_usd=Decimal("50.00"),
-        spent_usd=Decimal("48.00"),
+        spent_usd=Decimal("48.50"),
         allocations=orchestrator.config.allocations,
     )
 
@@ -2159,7 +2159,7 @@ def test_launch_selects_cheapest_offer_and_pins_observed_rate(orchestrator):
             timestamp=NOW,
         ),
         SpotOffer(
-            instance_type="c7i.8xlarge",
+            instance_type="c7i.4xlarge",
             availability_zone="us-east-1a",
             subnet_id=orchestrator.config.subnet_ids[0],
             hourly_usd=Decimal("0.5568"),
@@ -2171,14 +2171,14 @@ def test_launch_selects_cheapest_offer_and_pins_observed_rate(orchestrator):
         "benchmark", Decimal("1")
     )
 
-    assert instance.instance_type == "c7i.8xlarge"
+    assert instance.instance_type == "c7i.4xlarge"
     assert instance.spot_hourly_usd == Decimal("0.5568")
 
 
 def test_benchmark_launch_can_pin_each_configured_candidate(orchestrator):
     orchestrator.aws.offers = (
         SpotOffer(
-            instance_type="c7i.8xlarge",
+            instance_type="c7i.4xlarge",
             availability_zone="us-east-1a",
             subnet_id=orchestrator.config.subnet_ids[0],
             hourly_usd=Decimal("0.50"),
@@ -2990,11 +2990,11 @@ def test_cli_launch_and_resume_accept_measured_configured_instance_type():
             "--max-hours",
             "4",
             "--instance-type",
-            "c7i.8xlarge",
+            "c7i.4xlarge",
         ]
     )
 
-    assert launch.instance_type == "c7i.8xlarge"
+    assert launch.instance_type == "c7i.4xlarge"
 
 
 def test_cli_preflight_dispatches_through_read_only_boundary(config):
@@ -3047,7 +3047,7 @@ def test_cli_status_uses_read_only_project_query(config):
                     "Instances": [
                         {
                             "InstanceId": "i-0123456789abcdef0",
-                            "InstanceType": "c7i.8xlarge",
+                            "InstanceType": "c7i.4xlarge",
                             "State": {"Name": "running"},
                             "PublicIpAddress": "203.0.113.10",
                         }
@@ -3069,7 +3069,7 @@ def test_cli_status_uses_read_only_project_query(config):
         "instances": [
             {
                 "instance_id": "i-0123456789abcdef0",
-                "instance_type": "c7i.8xlarge",
+                "instance_type": "c7i.4xlarge",
                 "public_ip": "203.0.113.10",
                 "state": "running",
             }
@@ -3119,7 +3119,7 @@ def test_cli_terminate_and_reconcile_are_idempotently_scoped(config, tmp_path):
                     "Instances": [
                         {
                             "InstanceId": instance_id,
-                            "InstanceType": "c7i.8xlarge",
+                            "InstanceType": "c7i.4xlarge",
                             "State": {"Name": "running"},
                         }
                     ]
@@ -3166,7 +3166,7 @@ def test_cli_terminate_and_reconcile_are_idempotently_scoped(config, tmp_path):
                     "Instances": [
                         {
                             "InstanceId": instance_id,
-                            "InstanceType": "c7i.8xlarge",
+                            "InstanceType": "c7i.4xlarge",
                             "State": {"Name": "running"},
                         }
                     ]
@@ -3299,7 +3299,7 @@ def test_cli_launch_preflights_starts_monitors_and_terminates(config, tmp_path):
     )
     payload = json.loads(stdout.getvalue())
     assert payload["instance_id"] == "i-0123456789abcdef0"
-    assert payload["costed_run"]["instance_hourly_usd"] == "1.428"
+    assert payload["costed_run"]["instance_hourly_usd"] == "0.714"
 
 
 def test_cli_fresh_phase_launch_passes_required_phase_worker_identity(
@@ -3357,7 +3357,7 @@ def _fake_benchmark_lifecycle(config):
     aws = FakeLifecycleAws(config)
     aws.offers = (
         SpotOffer(
-            instance_type="c7i.8xlarge",
+            instance_type="c7i.4xlarge",
             availability_zone="us-east-1a",
             subnet_id=config.subnet_ids[0],
             hourly_usd=Decimal("0.60"),
@@ -3383,7 +3383,7 @@ def _fake_benchmark_lifecycle(config):
     aws.run_instances_hook = assign_unique_instance_id
     remote = FakeRemote(clock)
     remote.benchmark_observations = {
-        "c7i.8xlarge": aws_all32.BenchmarkObservation(
+        "c7i.4xlarge": aws_all32.BenchmarkObservation(
             environment_steps=100_000,
             elapsed_seconds=Decimal("125"),
             peak_rss_gb=3.25,
@@ -3427,7 +3427,7 @@ def test_cli_benchmark_measures_both_candidates_selects_cost_winner_and_settles(
 
     assert result == 0
     assert [call[1:4] for call in remote.benchmark_calls] == [
-        ("c7i.8xlarge", 100_000, 900),
+        ("c7i.4xlarge", 100_000, 900),
         ("c7i.16xlarge", 100_000, 900),
     ]
     assert aws.terminated_ids == [
@@ -3436,12 +3436,12 @@ def test_cli_benchmark_measures_both_candidates_selects_cost_winner_and_settles(
     ]
     ledger = BudgetLedger.load(ledger_path)
     assert [run.instance_hourly_usd for run in ledger.runs] == [
-        Decimal("1.428"),
+        Decimal("0.714"),
         Decimal("2.856"),
     ]
     payload = json.loads(stdout.getvalue())
     assert payload["decision"] == "all_candidates_measured"
-    assert payload["selected_instance_type"] == "c7i.8xlarge"
+    assert payload["selected_instance_type"] == "c7i.4xlarge"
     assert payload["env_steps_per_second"] == 800.0
     assert payload["cost_per_million_steps"] == (
         "0.2121913580246913580246913580"
@@ -3491,9 +3491,9 @@ def test_cli_benchmark_keeps_completed_candidate_when_second_hits_spot_quota(
 
     payload = json.loads(stdout.getvalue())
     assert payload["decision"] == "candidate_unavailable"
-    assert payload["selected_instance_type"] == "c7i.8xlarge"
+    assert payload["selected_instance_type"] == "c7i.4xlarge"
     assert [item["instance_type"] for item in payload["candidates"]] == [
-        "c7i.8xlarge"
+        "c7i.4xlarge"
     ]
 
 
@@ -3516,9 +3516,9 @@ def test_cli_benchmark_stops_early_when_remaining_allocation_cannot_fit_candidat
         CostedRun(
             phase="benchmark",
             instance_id="i-prior-benchmark",
-            hours=Decimal("2"),
+            hours=Decimal("3.6"),
             instance_hourly_usd=config.on_demand_ceiling_usd[
-                "c7i.8xlarge"
+                "c7i.4xlarge"
             ],
             volume_hourly_usd=volume_hourly,
         )
@@ -3547,7 +3547,7 @@ def test_cli_benchmark_stops_early_when_remaining_allocation_cannot_fit_candidat
     payload = json.loads(stdout.getvalue())
     assert payload["decision"] == "allocation_exhausted"
     assert [candidate["instance_type"] for candidate in payload["candidates"]] == [
-        "c7i.8xlarge"
+        "c7i.4xlarge"
     ]
     assert aws.terminated_ids == ["i-00000000000000001"]
 
@@ -3590,9 +3590,9 @@ def test_cli_benchmark_refuses_exhausted_or_oversized_allocation_before_launch(
         CostedRun(
             phase="benchmark",
             instance_id="i-prior-benchmark",
-            hours=Decimal("2.5"),
+            hours=Decimal("5.1"),
             instance_hourly_usd=config.on_demand_ceiling_usd[
-                "c7i.8xlarge"
+                "c7i.4xlarge"
             ],
             volume_hourly_usd=volume_hourly,
         )
@@ -3658,7 +3658,7 @@ def test_cli_benchmark_running_project_query_blocks_before_launch(
         (
             {
                 "instance_id": "i-00000000000000009",
-                "instance_type": "c7i.8xlarge",
+                "instance_type": "c7i.4xlarge",
                 "public_ip": "203.0.113.9",
                 "state": "running",
             },
@@ -3765,7 +3765,7 @@ def test_cli_launch_persists_exact_reservation_before_mutation(
     )
 
     assert observed["requested_epoch_seconds"] == "1234.5"
-    assert observed["on_demand_hourly_usd"] == "1.428"
+    assert observed["on_demand_hourly_usd"] == "0.714"
     assert "shutdown -h +" in base64.b64decode(
         observed["request"]["UserData"], validate=True
     ).decode("utf-8")
@@ -3845,7 +3845,7 @@ def test_post_launch_state_save_failure_still_accounts_and_terminates(
     assert aws.terminated_ids == ["i-0123456789abcdef0"]
     ledger = BudgetLedger.load(ledger_path, cap_usd=config.cap_usd)
     assert ledger.runs[0].instance_id == "i-0123456789abcdef0"
-    assert ledger.runs[0].instance_hourly_usd == Decimal("1.428")
+    assert ledger.runs[0].instance_hourly_usd == Decimal("0.714")
 
 
 def test_launch_runs_fresh_full_preflight_immediately_before_mutation(
@@ -3873,14 +3873,14 @@ def test_capacity_rejection_falls_back_to_next_authorized_offer(
     aws = FakeLifecycleAws(config)
     aws.offers = (
         SpotOffer(
-            instance_type="c7i.8xlarge",
+            instance_type="c7i.4xlarge",
             availability_zone="us-east-1a",
             subnet_id=config.subnet_ids[0],
             hourly_usd=Decimal("0.50"),
             timestamp=NOW,
         ),
         SpotOffer(
-            instance_type="c7i.8xlarge",
+            instance_type="c7i.4xlarge",
             availability_zone="us-east-1b",
             subnet_id=config.subnet_ids[1],
             hourly_usd=Decimal("0.51"),
@@ -3912,7 +3912,7 @@ def test_capacity_rejection_falls_back_to_next_authorized_offer(
         orchestrator.preflight()
 
         launched = orchestrator.launch_guarded_instance(
-            "benchmark", Decimal("0.25"), instance_type="c7i.8xlarge"
+            "benchmark", Decimal("0.25"), instance_type="c7i.4xlarge"
         )
 
         reservation = store.load()
@@ -3942,14 +3942,14 @@ def test_exhausted_capacity_offers_leave_no_unresolved_reservation(
     aws = FakeLifecycleAws(config)
     aws.offers = (
         SpotOffer(
-            instance_type="c7i.8xlarge",
+            instance_type="c7i.4xlarge",
             availability_zone="us-east-1a",
             subnet_id=config.subnet_ids[0],
             hourly_usd=Decimal("0.50"),
             timestamp=NOW,
         ),
         SpotOffer(
-            instance_type="c7i.8xlarge",
+            instance_type="c7i.4xlarge",
             availability_zone="us-east-1b",
             subnet_id=config.subnet_ids[1],
             hourly_usd=Decimal("0.51"),
@@ -3981,7 +3981,7 @@ def test_exhausted_capacity_offers_leave_no_unresolved_reservation(
 
         with pytest.raises(AwsCapacityUnavailable):
             orchestrator.launch_guarded_instance(
-                "benchmark", Decimal("0.25"), instance_type="c7i.8xlarge"
+                "benchmark", Decimal("0.25"), instance_type="c7i.4xlarge"
             )
 
         assert store.load() is None
@@ -3995,14 +3995,14 @@ def test_ambiguous_launch_does_not_try_another_offer(config, tmp_path):
     aws = FakeLifecycleAws(config)
     aws.offers = (
         SpotOffer(
-            instance_type="c7i.8xlarge",
+            instance_type="c7i.4xlarge",
             availability_zone="us-east-1a",
             subnet_id=config.subnet_ids[0],
             hourly_usd=Decimal("0.50"),
             timestamp=NOW,
         ),
         SpotOffer(
-            instance_type="c7i.8xlarge",
+            instance_type="c7i.4xlarge",
             availability_zone="us-east-1b",
             subnet_id=config.subnet_ids[1],
             hourly_usd=Decimal("0.51"),
@@ -4033,7 +4033,7 @@ def test_ambiguous_launch_does_not_try_another_offer(config, tmp_path):
 
         with pytest.raises(TimeoutError, match="ambiguous launch"):
             orchestrator.launch_guarded_instance(
-                "benchmark", Decimal("0.25"), instance_type="c7i.8xlarge"
+                "benchmark", Decimal("0.25"), instance_type="c7i.4xlarge"
             )
 
         reservation = store.load()
@@ -4055,14 +4055,14 @@ def test_spot_quota_rejection_clears_reservation_without_az_retry(
     aws = FakeLifecycleAws(config)
     aws.offers = (
         SpotOffer(
-            instance_type="c7i.8xlarge",
+            instance_type="c7i.4xlarge",
             availability_zone="us-east-1a",
             subnet_id=config.subnet_ids[0],
             hourly_usd=Decimal("0.50"),
             timestamp=NOW,
         ),
         SpotOffer(
-            instance_type="c7i.8xlarge",
+            instance_type="c7i.4xlarge",
             availability_zone="us-east-1b",
             subnet_id=config.subnet_ids[1],
             hourly_usd=Decimal("0.51"),
@@ -4093,7 +4093,7 @@ def test_spot_quota_rejection_clears_reservation_without_az_retry(
 
         with pytest.raises(AwsSpotQuotaExceeded):
             orchestrator.launch_guarded_instance(
-                "benchmark", Decimal("0.25"), instance_type="c7i.8xlarge"
+                "benchmark", Decimal("0.25"), instance_type="c7i.4xlarge"
             )
 
         assert store.load() is None
@@ -4188,7 +4188,7 @@ def test_pending_project_instance_blocks_before_reservation(config, tmp_path):
         (
             {
                 "instance_id": "i-0123456789abcdef0",
-                "instance_type": "c7i.8xlarge",
+                "instance_type": "c7i.4xlarge",
                 "public_ip": None,
                 "state": "pending",
             },
@@ -4247,7 +4247,7 @@ def test_reconcile_settles_reservation_idempotently_before_clearing(
     aws = FakeLifecycleAws(config)
     instance_summary = {
         "instance_id": "i-0123456789abcdef0",
-        "instance_type": "c7i.8xlarge",
+        "instance_type": "c7i.4xlarge",
         "public_ip": "203.0.113.10",
         "state": "running",
     }
@@ -4512,7 +4512,7 @@ def test_reconcile_never_substitutes_unrelated_project_instance(
         store.save(reservation)
     unrelated = {
         "instance_id": "i-11111111111111111",
-        "instance_type": "c7i.8xlarge",
+        "instance_type": "c7i.4xlarge",
         "public_ip": "203.0.113.111",
         "state": "running",
     }
@@ -4765,7 +4765,7 @@ def test_reconcile_persists_recovered_identity_before_termination(
         store.save(reservation)
     recovered = {
         "instance_id": instance_id,
-        "instance_type": "c7i.8xlarge",
+        "instance_type": "c7i.4xlarge",
         "public_ip": "203.0.113.10",
         "state": "running",
     }
@@ -4831,7 +4831,7 @@ def test_reconcile_requires_terminal_confirmation_before_sidecar_clear(
         store.save(reservation)
     running = {
         "instance_id": instance_id,
-        "instance_type": "c7i.8xlarge",
+        "instance_type": "c7i.4xlarge",
         "public_ip": "203.0.113.10",
         "state": "running",
     }
@@ -4919,10 +4919,10 @@ def test_successful_run_accounts_at_conservative_on_demand_ceiling(
     )
 
     assert instance.spot_hourly_usd == Decimal("0.5568")
-    assert run.instance_hourly_usd == Decimal("1.428")
+    assert run.instance_hourly_usd == Decimal("0.714")
     assert BudgetLedger.load(
         tmp_path / "aws-spend.json"
-    ).runs[0].instance_hourly_usd == Decimal("1.428")
+    ).runs[0].instance_hourly_usd == Decimal("0.714")
 
 
 def test_ec2_settlement_uses_only_remaining_absolute_grace(

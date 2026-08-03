@@ -14,9 +14,9 @@ security_group_id: sg-03fc64395e32dea85
 key_name: mario-training-key
 instance_profile: defectlens-gpu-role
 s3_prefix: s3://defectlens-phase3-002559670021/marioai/all32/
-instance_types: [c7i.8xlarge, c7i.16xlarge]
+instance_types: [c7i.4xlarge, c7i.16xlarge]
 on_demand_ceiling_usd:
-  c7i.8xlarge: "1.428"
+  c7i.4xlarge: "0.714"
   c7i.16xlarge: "2.856"
 root_volume_gb: 100
 gp3_monthly_usd_per_gb: "0.08"
