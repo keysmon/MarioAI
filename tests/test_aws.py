@@ -1408,6 +1408,39 @@ def test_train_phase_benchmark_cli_preserves_exact_environment_step_units(
     }
 
 
+def test_train_phase_benchmark_can_separate_evidence_from_stdout(
+    monkeypatch, tmp_path
+):
+    import scripts.train_phase as phase_training
+
+    monkeypatch.setattr(
+        phase_training,
+        "_run_benchmark_workload",
+        lambda _environment_steps: (Decimal("50.25"), 3.5),
+    )
+    stdout = io.StringIO()
+    evidence_path = tmp_path / "benchmark-evidence.json"
+
+    result = phase_training.main(
+        [
+            "benchmark",
+            "--environment-steps",
+            "100000",
+            "--output",
+            str(evidence_path),
+        ],
+        stdout=stdout,
+    )
+
+    assert result == 0
+    assert stdout.getvalue() == ""
+    assert json.loads(evidence_path.read_text(encoding="utf-8")) == {
+        "environment_steps": 100_000,
+        "elapsed_seconds": "50.25",
+        "peak_rss_gb": 3.5,
+    }
+
+
 def test_train_phase_phase_cli_requires_identity_and_aware_deadline(
     monkeypatch, tmp_path
 ):
@@ -4954,6 +4987,8 @@ def test_ssh_remote_benchmark_uses_fresh_host_bootstrap_and_strict_json(
     assert "import marioai, torch" in calls[3][1]["input"]
     benchmark_script = calls[4][1]["input"]
     assert "scripts/train_phase.py benchmark" in benchmark_script
+    assert '--output "$evidence"' in benchmark_script
+    assert 'cat "$evidence"' in benchmark_script
     assert calls[4][0][-2:] == [
         shlex.quote("/home/ubuntu/MarioAI"),
         "250000",

@@ -1505,6 +1505,7 @@ def main(argv=None, *, stdout=None) -> int:
         required=True,
         type=_positive_integer,
     )
+    benchmark.add_argument("--output", type=Path)
     phase_worker = subparsers.add_parser("phase")
     phase_worker.add_argument(
         "--phase", required=True, choices=("phase_1", "phase_2")
@@ -1528,17 +1529,19 @@ def main(argv=None, *, stdout=None) -> int:
         elapsed_seconds, peak_rss_gb = _run_benchmark_workload(
             args.environment_steps
         )
-        destination = sys.stdout if stdout is None else stdout
-        json.dump(
-            {
-                "environment_steps": args.environment_steps,
-                "elapsed_seconds": str(elapsed_seconds),
-                "peak_rss_gb": peak_rss_gb,
-            },
-            destination,
-            sort_keys=True,
-        )
-        destination.write("\n")
+        payload = {
+            "environment_steps": args.environment_steps,
+            "elapsed_seconds": str(elapsed_seconds),
+            "peak_rss_gb": peak_rss_gb,
+        }
+        if args.output is None:
+            destination = sys.stdout if stdout is None else stdout
+            json.dump(payload, destination, sort_keys=True)
+            destination.write("\n")
+        else:
+            with args.output.open("w", encoding="utf-8") as destination:
+                json.dump(payload, destination, sort_keys=True)
+                destination.write("\n")
         return 0
     if args.command == "phase":
         phase_kwargs = {

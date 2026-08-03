@@ -1947,8 +1947,11 @@ set -eu
 repo=$1
 steps=$2
 cd "$repo"
-exec .venv/bin/python scripts/train_phase.py benchmark \
-  --environment-steps "$steps"
+evidence="$(mktemp)"
+trap 'rm -f "$evidence"' EXIT
+.venv/bin/python scripts/train_phase.py benchmark \
+  --environment-steps "$steps" --output "$evidence" >&2
+cat "$evidence"
 """
         stdout = self._run_remote_command(
             [
