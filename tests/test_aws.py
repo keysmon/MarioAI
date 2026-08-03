@@ -3137,12 +3137,12 @@ def _fake_benchmark_lifecycle(config):
     remote = FakeRemote(clock)
     remote.benchmark_observations = {
         "c7i.8xlarge": aws_all32.BenchmarkObservation(
-            environment_steps=250_000,
+            environment_steps=100_000,
             elapsed_seconds=Decimal("125"),
             peak_rss_gb=3.25,
         ),
         "c7i.16xlarge": aws_all32.BenchmarkObservation(
-            environment_steps=250_000,
+            environment_steps=100_000,
             elapsed_seconds=Decimal("100"),
             peak_rss_gb=5.5,
         ),
@@ -3180,8 +3180,8 @@ def test_cli_benchmark_measures_both_candidates_selects_cost_winner_and_settles(
 
     assert result == 0
     assert [call[1:4] for call in remote.benchmark_calls] == [
-        ("c7i.8xlarge", 250_000, 900),
-        ("c7i.16xlarge", 250_000, 900),
+        ("c7i.8xlarge", 100_000, 900),
+        ("c7i.16xlarge", 100_000, 900),
     ]
     assert aws.terminated_ids == [
         "i-00000000000000001",
@@ -3195,14 +3195,14 @@ def test_cli_benchmark_measures_both_candidates_selects_cost_winner_and_settles(
     payload = json.loads(stdout.getvalue())
     assert payload["decision"] == "all_candidates_measured"
     assert payload["selected_instance_type"] == "c7i.8xlarge"
-    assert payload["env_steps_per_second"] == 2000.0
+    assert payload["env_steps_per_second"] == 800.0
     assert payload["cost_per_million_steps"] == (
-        "0.08487654320987654320987654322"
+        "0.2121913580246913580246913580"
     )
     assert payload["peak_rss_gb"] == 3.25
     assert [candidate["environment_steps"] for candidate in payload["candidates"]] == [
-        250_000,
-        250_000,
+        100_000,
+        100_000,
     ]
 
 
