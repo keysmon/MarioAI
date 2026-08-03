@@ -469,6 +469,25 @@ def _validate_vecnormalize_checkpoint(
             (),
         )
     )
+    channels_order = environment["channels_order"]
+    frame_stack = environment["frame_stack"]
+    image_shape = environment["shape"]
+    if channels_order == "last":
+        expected_observation_shape = (
+            image_shape,
+            image_shape,
+            frame_stack,
+        )
+    elif channels_order == "first":
+        expected_observation_shape = (
+            frame_stack,
+            image_shape,
+            image_shape,
+        )
+    else:
+        raise AwsLifecycleError(
+            "trusted VecNormalize channel order is invalid"
+        )
     expected_settings = {
         "norm_obs": normalization["norm_obs"],
         "norm_reward": normalization["norm_reward"],
@@ -479,8 +498,7 @@ def _validate_vecnormalize_checkpoint(
     }
     if (
         action_count != environment["action_count"]
-        or observation_shape
-        != tuple(environment["observation_shape"])
+        or observation_shape != expected_observation_shape
         or any(
             getattr(vecnormalize, field, object()) != expected
             for field, expected in expected_settings.items()
@@ -747,8 +765,16 @@ def restore_checkpoint_bundle(
             budget_ledger_path=artifact_paths["budget_ledger"],
             manifest=manifest,
         )
-    except BaseException:
-        shutil.rmtree(staging_root)
+    except BaseException as error:
+        try:
+            shutil.rmtree(staging_root)
+        except FileNotFoundError:
+            pass
+        except OSError as cleanup_error:
+            error.add_note(
+                "checkpoint staging cleanup also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
         raise
 
 

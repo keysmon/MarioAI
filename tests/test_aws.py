@@ -5583,13 +5583,16 @@ def test_cloud_supervisor_executes_phase_worker_with_absolute_deadline(
 
 
 def _vecnormalize_bytes(
-    tmp_path: Path, *, clip_reward: float = 10.0
+    tmp_path: Path,
+    *,
+    clip_reward: float = 10.0,
+    observation_shape: tuple[int, int, int] = (84, 84, 4),
 ) -> bytes:
     """Return a real all-32 VecNormalize sidecar without creating Mario."""
 
     class SpaceEnv(gym.Env):
         observation_space = gym.spaces.Box(
-            0, 255, shape=(4, 84, 84), dtype=np.uint8
+            0, 255, shape=observation_shape, dtype=np.uint8
         )
         action_space = gym.spaces.Discrete(12)
 
@@ -5608,7 +5611,10 @@ def _vecnormalize_bytes(
                 {},
             )
 
-    sidecar_path = tmp_path / f"vec-{clip_reward}.pkl"
+    sidecar_path = (
+        tmp_path
+        / f"vec-{clip_reward}-{'x'.join(map(str, observation_shape))}.pkl"
+    )
     vecnormalize = VecNormalize(
         DummyVecEnv([lambda: SpaceEnv()]),
         norm_obs=False,
@@ -6574,6 +6580,75 @@ def test_restore_deserializes_and_rejects_vecnormalize_setting_mismatch(
             model_validator=lambda _path, _cfg: SimpleNamespace(
                 num_timesteps=250000
             ),
+        )
+
+
+def test_vecnormalize_validator_accepts_raw_channels_last_training_space(
+    tmp_path,
+):
+    from scripts import aws_all32
+
+    cfg = aws_all32._resolved_all32_config(
+        CONFIG_PATH.parents[1] / "configs" / "all32.yaml",
+        "phase_1",
+    )
+    signature = training.checkpoint_resume_signature(cfg, "phase_1")
+    sidecar = tmp_path / "vecnormalize.pkl"
+    sidecar.write_bytes(
+        _vecnormalize_bytes(
+            tmp_path,
+            observation_shape=(84, 84, 4),
+        )
+    )
+
+    aws_all32._validate_vecnormalize_checkpoint(sidecar, signature)
+
+
+def test_lineage_restore_failure_preserves_original_error_after_staging_cleanup(
+    config,
+    tmp_path,
+    monkeypatch,
+):
+    from scripts import aws_all32
+
+    class LineageStore:
+        def download(self, _uri, destination):
+            Path(destination).write_text(
+                json.dumps(
+                    {
+                        "kind": "marioai-phase-lineage",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+    def fail_restore(**_kwargs):
+        raise AwsLifecycleError("original lineage validation failure")
+
+    monkeypatch.setattr(
+        aws_all32,
+        "restore_phase_lineage",
+        fail_restore,
+    )
+    ledger_path = tmp_path / "aws-spend.json"
+    BudgetLedger(
+        cap_usd=config.cap_usd,
+        allocations=config.allocations,
+    ).save(ledger_path)
+
+    with pytest.raises(
+        AwsLifecycleError,
+        match="original lineage validation failure",
+    ):
+        aws_all32.restore_checkpoint_bundle(
+            config=config,
+            phase="phase_1",
+            checkpoint_s3_uri=(
+                f"{config.s3_prefix}models/all32-phase_1/latest.json"
+            ),
+            repo_dir=tmp_path,
+            ledger_path=ledger_path,
+            object_store=LineageStore(),
         )
 
 
