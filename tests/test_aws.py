@@ -2455,8 +2455,15 @@ def test_adapter_wraps_ambiguous_launch_timeout_without_retry(
     ] == [["ec2", "run-instances"]]
 
 
+@pytest.mark.parametrize(
+    "operation_suffix",
+    (
+        ":",
+        " (reached max retries: 2):",
+    ),
+)
 def test_adapter_distinguishes_definitive_capacity_rejection(
-    config, orchestrator
+    config, orchestrator, operation_suffix
 ):
     import scripts.aws_all32 as aws_module
 
@@ -2484,8 +2491,9 @@ def test_adapter_distinguishes_definitive_capacity_rejection(
         ["aws", "ec2", "run-instances"],
         stderr=(
             "An error occurred (InsufficientInstanceCapacity) when calling "
-            "the RunInstances operation: We currently do not have sufficient "
-            "capacity in the Availability Zone you requested."
+            f"the RunInstances operation{operation_suffix} We currently do "
+            "not have sufficient capacity in the Availability Zone you "
+            "requested."
         ),
     )
     orchestrator.preflight()

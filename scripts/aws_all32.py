@@ -1584,7 +1584,8 @@ class AwsCommandAdapter:
             )
             if re.search(
                 r"An error occurred \(InsufficientInstanceCapacity\) "
-                r"when calling the RunInstances operation:",
+                r"when calling the RunInstances operation"
+                r"(?: \(reached max retries: \d+\))?:",
                 stderr,
             ):
                 raise AwsCapacityUnavailable(
