@@ -3440,12 +3440,18 @@ def _settle_reservation(
     filtered_runs = tuple(
         run for run in ledger.runs if run not in prior_main_runs
     )
-    removed_cost = sum(
-        (run.cost_usd for run in prior_main_runs), Decimal("0")
+    represented_before = sum(
+        (run.cost_usd for run in ledger.runs), Decimal("0")
+    )
+    unrepresented_spend = max(
+        Decimal("0"), ledger.spent_usd - represented_before
+    )
+    remaining_represented_cost = sum(
+        (run.cost_usd for run in filtered_runs), Decimal("0")
     )
     base = BudgetLedger(
         cap_usd=ledger.cap_usd,
-        spent_usd=ledger.spent_usd - removed_cost,
+        spent_usd=remaining_represented_cost + unrepresented_spend,
         runs=filtered_runs,
         allocations=ledger.allocations,
     )

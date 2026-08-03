@@ -4227,6 +4227,74 @@ def test_pending_settlement_migrates_to_recovered_instance_without_reuse(
     ] == ["i-0123456789abcdef0"]
 
 
+def test_settlement_preserves_decimal_ledger_invariant_at_live_precision(
+    config, orchestrator
+):
+    from scripts.aws_all32 import LaunchReservation, _settle_reservation
+
+    orchestrator.preflight()
+    orchestrator.launch_guarded_instance("benchmark", Decimal("0.25"))
+    reservation = LaunchReservation(
+        client_token="live-precision-token",
+        state="launched",
+        phase="benchmark",
+        request=orchestrator.aws.last_run_instances_request,
+        instance_hourly_usd=Decimal("0.549000"),
+        on_demand_hourly_usd=Decimal("1.428"),
+        volume_hourly_usd=Decimal(
+            "0.01111111111111111111111111111"
+        ),
+        max_hours=Decimal("0.25"),
+        grace_hours=Decimal("0.25"),
+        requested_epoch_seconds=Decimal("1000"),
+        instance_id="i-08ad5e94bada33893",
+    )
+    runs = (
+        CostedRun(
+            phase="benchmark",
+            instance_id="i-0d577d0d9f910e217",
+            hours=Decimal("0.05432494789361111111111111111"),
+            instance_hourly_usd=Decimal("1.428"),
+            volume_hourly_usd=reservation.volume_hourly_usd,
+        ),
+        CostedRun(
+            phase="__launch_grace__",
+            instance_id="pending:older-token",
+            hours=Decimal("0.25"),
+            instance_hourly_usd=Decimal("1.428"),
+            volume_hourly_usd=reservation.volume_hourly_usd,
+        ),
+        CostedRun(
+            phase="benchmark",
+            instance_id="pending:older-token",
+            hours=Decimal("0.25"),
+            instance_hourly_usd=Decimal("1.428"),
+            volume_hourly_usd=reservation.volume_hourly_usd,
+        ),
+        CostedRun(
+            phase="benchmark",
+            instance_id=reservation.instance_id,
+            hours=Decimal("0.2063619193169444444444444444"),
+            instance_hourly_usd=Decimal("1.428"),
+            volume_hourly_usd=reservation.volume_hourly_usd,
+        ),
+    )
+    ledger = BudgetLedger(
+        cap_usd=config.cap_usd,
+        spent_usd=sum((run.cost_usd for run in runs), Decimal("0")),
+        runs=runs,
+        allocations=config.allocations,
+    )
+
+    settled = _settle_reservation(
+        ledger, reservation, instance_id=reservation.instance_id
+    )
+
+    assert settled.spent_usd >= sum(
+        (run.cost_usd for run in settled.runs), Decimal("0")
+    )
+
+
 def test_migrated_settlement_stays_real_when_token_later_disappears(
     config, orchestrator
 ):
