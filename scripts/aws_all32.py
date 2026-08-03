@@ -3526,12 +3526,10 @@ def _settle_reservation(
     main_run = CostedRun(
         phase=reservation.phase,
         instance_id=main_instance_id,
-        hours=max(
-            (run.hours for run in prior_main_runs),
-            default=reservation.max_hours,
-        )
-        if prior_main_runs
-        else reservation.max_hours,
+        hours=max((
+            reservation.max_hours,
+            *(run.hours for run in prior_main_runs),
+        )),
         instance_hourly_usd=reservation.on_demand_hourly_usd,
         volume_hourly_usd=reservation.volume_hourly_usd,
     )

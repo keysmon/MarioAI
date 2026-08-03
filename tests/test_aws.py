@@ -4652,6 +4652,55 @@ def test_settlement_preserves_decimal_ledger_invariant_at_live_precision(
     )
 
 
+def test_settlement_expands_partial_heartbeat_to_authorized_maximum(
+    config,
+    orchestrator,
+):
+    from scripts.aws_all32 import LaunchReservation, _settle_reservation
+
+    orchestrator.preflight()
+    orchestrator.launch_guarded_instance("phase_1", Decimal("4"))
+    instance_id = "i-0d4d90e6f448909e3"
+    reservation = LaunchReservation(
+        client_token="detached-controller-token",
+        state="launched",
+        phase="phase_1",
+        request=orchestrator.aws.last_run_instances_request,
+        instance_hourly_usd=Decimal("0.548"),
+        on_demand_hourly_usd=Decimal("1.428"),
+        volume_hourly_usd=Decimal("8") / Decimal("720"),
+        max_hours=Decimal("4"),
+        grace_hours=Decimal("0.25"),
+        requested_epoch_seconds=Decimal("1000"),
+        instance_id=instance_id,
+    )
+    heartbeat = CostedRun(
+        phase="phase_1",
+        instance_id=instance_id,
+        hours=Decimal("0.2650859381363888888888888889"),
+        instance_hourly_usd=reservation.on_demand_hourly_usd,
+        volume_hourly_usd=reservation.volume_hourly_usd,
+    )
+    ledger = BudgetLedger(
+        cap_usd=config.cap_usd,
+        allocations=config.allocations,
+    ).update_run(heartbeat)
+
+    settled = _settle_reservation(
+        ledger,
+        reservation,
+        instance_id=instance_id,
+    )
+
+    main_run = next(
+        run
+        for run in settled.runs
+        if run.phase == "phase_1" and run.instance_id == instance_id
+    )
+    assert main_run.hours == Decimal("4")
+    assert settled.spent_usd > ledger.spent_usd
+
+
 def test_migrated_settlement_stays_real_when_token_later_disappears(
     config, orchestrator
 ):
