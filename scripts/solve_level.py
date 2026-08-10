@@ -12,11 +12,13 @@ Usage: .venv/bin/python scripts/solve_level.py --level 1-3
 """
 import argparse
 import sys
+from dataclasses import dataclass, field
+from typing import Literal
 
 import gym_super_mario_bros
-from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
 from nes_py.wrappers import JoypadSpace
 
+from marioai.actions import resolve_action_set
 from marioai.curriculum import save_route
 
 NOOP, RIGHT, RIGHT_A, RIGHT_B, RIGHT_A_B, A, LEFT = range(7)
@@ -62,6 +64,102 @@ ARC_ACTIONS = (RIGHT_B, NOOP)         # ride the arc running / cut it short
 WAITS = tuple(range(0, 289, 16))      # NOOP frames before run-up: covers a
                                       # full slow-lift cycle (~300 frames)
 RIDES = (8, 60, 120, 180)             # NOOP frames after landing (lifts)
+
+
+@dataclass(frozen=True)
+class Pulse:
+    """One native-frame-aligned action pulse inside a solver macro."""
+
+    action: int
+    frames: int
+
+
+@dataclass(frozen=True)
+class Macro:
+    """A sequence of action pulses generated on four-frame boundaries."""
+
+    pulses: tuple[Pulse, ...]
+
+    @property
+    def frames(self):
+        return sum(pulse.frames for pulse in self.pulses)
+
+
+@dataclass(frozen=True)
+class MazeProgress:
+    wrong_branch: bool
+    next_branch: int
+
+
+@dataclass
+class MazeBranchMemory:
+    """Rejected stable branch IDs, scoped to one route snapshot junction."""
+
+    _rejected: list[tuple[tuple[int, int, int, object], set[int]]] = field(
+        default_factory=list
+    )
+
+    @staticmethod
+    def junction(history_entry) -> tuple[int, int, int, object]:
+        frame, x, y, snapshot = history_entry
+        return int(frame), int(x), int(y), snapshot
+
+    def _find(self, history_entry):
+        frame, x, y, snapshot = self.junction(history_entry)
+        for (saved_frame, saved_x, saved_y, saved_snapshot), branches in (
+            self._rejected
+        ):
+            if (
+                saved_frame == frame
+                and saved_x == x
+                and saved_y == y
+                and saved_snapshot is snapshot
+            ):
+                return branches
+        return None
+
+    def reject(self, history_entry, branch: int) -> None:
+        branches = self._find(history_entry)
+        if branches is None:
+            branches = set()
+            self._rejected.append((self.junction(history_entry), branches))
+        branches.add(branch)
+
+    def excluded(self, history_entry) -> frozenset[int]:
+        return frozenset(self._find(history_entry) or ())
+
+
+def level_mode(level: str) -> Literal["ground", "water", "maze"]:
+    if level in {"2-2", "7-2"}:
+        return "water"
+    if level in {"4-4", "7-4"}:
+        return "maze"
+    return "ground"
+
+
+def swim_candidates() -> tuple[Macro, ...]:
+    """Return 4-aligned right/swim and neutral/swim pulse sequences."""
+    macros = []
+    for right_frames in (8, 12, 16, 24):
+        for neutral_frames in (4, 8, 12):
+            base = (
+                Pulse(RIGHT_A_B, right_frames),
+                Pulse(A, neutral_frames),
+            )
+            macros.append(Macro(base))
+            macros.append(Macro(base * 2))
+    return tuple(macros)
+
+
+def maze_progress(
+    previous_x: int, current_x: int, branch: int
+) -> MazeProgress:
+    """Classify a castle maze's non-terminal backward route reset."""
+    wrong_branch = previous_x - current_x >= 256
+    return MazeProgress(
+        wrong_branch=wrong_branch,
+        next_branch=branch + 1 if wrong_branch else branch,
+    )
 
 
 def advance(env, action, n, log=None):
@@ -114,6 +212,29 @@ def push_history(history, entry):
         return history
     history.append(entry)
     return history[-(BACKTRACK_DEPTH + 4):]
+
+
+def commit_maze_candidate(search_history, mutable_history, frame0):
+    """Commit from the history actually searched, preserving its snapshot.
+
+    `mutable_history` may have replaced or evicted the selected restore entry
+    while Mario traversed a maze branch. Rebuild the prefix around the exact
+    entry from `search_history`; never look it up in the mutable copy.
+    """
+    selected = None
+    for entry in search_history:
+        if entry[0] == frame0:
+            selected = entry
+            break
+    if selected is None:
+        raise RuntimeError(
+            f"maze candidate restore frame {frame0} was not searched"
+        )
+    committed = [
+        entry for entry in mutable_history if entry[0] < frame0
+    ]
+    committed.append(selected)
+    return selected, committed[-(BACKTRACK_DEPTH + 4):]
 
 
 def grounded(env):
@@ -178,7 +299,14 @@ def try_candidate(env, snap, x0, y0, frontier, known, wait, offset, jump,
     return ok, False, info, trace
 
 
-def solve_obstacle(env, history):
+def _solve_ground_obstacle(
+    env,
+    history,
+    *,
+    excluded_branches=frozenset(),
+    minimum_branch=0,
+    include_branch=False,
+):
     """Search the macro menu and pick the BEST passing hop, not the first.
 
     Greedy first-ok selection committed descending dead-end hops (run 9:
@@ -203,17 +331,64 @@ def solve_obstacle(env, history):
     # winning launch at back=3+ was never reached (run 16, x=925). This
     # order sweeps ALL launch points with the cheap core menu before any
     # expensive wait slice is touched.
-    combos = ((back, wait, ride, jump, offset, hold, arc)
-              for wait, ride in extras
-              for back in range(1, depth + 1)
-              for jump in JUMP_ACTIONS
-              for offset in OFFSETS
-              for hold in HOLDS
-              for arc in ARC_ACTIONS)
+    if include_branch:
+        # A maze branch identifies only the generated macro, never the
+        # history-dependent rewind depth. After a wrong-route reset, the
+        # selected snapshot becomes the newest history entry; excluding the
+        # same macro ID must therefore remain valid when history gets shorter.
+        combos = (
+            (branch, back, wait, ride, jump, offset, hold, arc)
+            for branch, (wait, ride, jump, offset, hold, arc) in enumerate(
+                (
+                    (wait, ride, jump, offset, hold, arc)
+                    for wait, ride in extras
+                    for jump in JUMP_ACTIONS
+                    for offset in OFFSETS
+                    for hold in HOLDS
+                    for arc in ARC_ACTIONS
+                )
+            )
+            for back in range(1, depth + 1)
+        )
+    else:
+        # Preserve the legacy ground search's exact extras/back/macro order.
+        combos = (
+            (branch, back, wait, ride, jump, offset, hold, arc)
+            for branch, (
+                back,
+                wait,
+                ride,
+                jump,
+                offset,
+                hold,
+                arc,
+            ) in enumerate(
+                (
+                    (back, wait, ride, jump, offset, hold, arc)
+                    for wait, ride in extras
+                    for back in range(1, depth + 1)
+                    for jump in JUMP_ACTIONS
+                    for offset in OFFSETS
+                    for hold in HOLDS
+                    for arc in ARC_ACTIONS
+                )
+            )
+        )
     tried = 0
     first_pass_at = None
     passes = []  # (score, frame0, x0, snap, params, info, trace)
-    for back, wait, ride, jump, offset, hold, arc in combos:
+    for (
+        branch,
+        back,
+        wait,
+        ride,
+        jump,
+        offset,
+        hold,
+        arc,
+    ) in combos:
+        if branch < minimum_branch or branch in excluded_branches:
+            continue
         if tried >= MAX_TRIES or len(passes) >= K_PASSES:
             break
         if (first_pass_at is not None
@@ -231,7 +406,10 @@ def solve_obstacle(env, history):
             continue
         if flag_got:
             print(f"  FLAG reached in candidate: rewind to x={x0}")
-            return frame0, info, trace
+            result = (frame0, info, trace)
+            if include_branch:
+                return (*result, branch)
+            return result
         if first_pass_at is None:
             first_pass_at = tried
         # rewind penalty: with extras-outer enumeration, best-of-N compares
@@ -241,13 +419,23 @@ def solve_obstacle(env, history):
         # win at x=321 broke the previously-instant x=417). Genuinely
         # better terrain (+50..150 score) still justifies deep rewinds.
         score = int(info["x_pos"]) + 2 * int(info["y_pos"]) - 10 * back
-        passes.append((score, frame0, x0, snap,
-                       (wait, offset, jump, hold, arc, ride), info, trace))
+        passes.append(
+            (
+                score,
+                frame0,
+                x0,
+                snap,
+                (wait, offset, jump, hold, arc, ride),
+                info,
+                trace,
+                branch,
+            )
+        )
     if not passes:
         print(f"  giving up after {tried} candidates")
         return None
     passes.sort(key=lambda p: p[0], reverse=True)
-    score, frame0, x0, snap, params, info, trace = passes[0]
+    score, frame0, x0, snap, params, info, trace, branch = passes[0]
     wait, offset, jump, hold, arc, ride = params
     # re-execute the winner so the env holds its landed state (trace is in
     # solver-actions; replay each at SKIP cadence)
@@ -257,27 +445,121 @@ def solve_obstacle(env, history):
     print(f"  solved (best of {len(passes)}, score {score}): rewind to "
           f"x={x0}, wait={wait} offset={offset} jump={jump} hold={hold} "
           f"arc={arc} ride={ride} -> x={info['x_pos']} y={info['y_pos']}")
+    result = (frame0, info, trace)
+    if include_branch:
+        return (*result, branch)
+    return result
+
+
+def try_swim_candidate(env, snap, frontier, macro):
+    """Judge a swim sequence by survival/flag state and horizontal progress."""
+    env.unwrapped.load_state(snap)
+    trace = []
+    done = False
+    info = {}
+    for pulse in macro.pulses:
+        if pulse.frames % SKIP:
+            raise ValueError(
+                f"swim pulse {pulse.frames} is not aligned to skip={SKIP}"
+            )
+        done, info = advance(
+            env, pulse.action, pulse.frames // SKIP, trace
+        )
+        if info.get("flag_get"):
+            return True, True, info, trace
+        if done:
+            return False, False, info, trace
+    x = int(info.get("x_pos", 0))
+    return x > frontier + HOP_MIN, False, info, trace
+
+
+def _solve_swim_obstacle(env, history):
+    """Search pulse sequences without applying the ground-only landing judge."""
+    frontier = max(h[1] for h in history)
+    depth = min(BACKTRACK_DEPTH, len(history))
+    passes = []
+    for back in range(1, depth + 1):
+        frame0, x0, _, snap = history[-back]
+        for macro in swim_candidates():
+            ok, flag_got, info, trace = try_swim_candidate(
+                env, snap, frontier, macro
+            )
+            if not ok:
+                continue
+            if flag_got:
+                print(f"  FLAG reached in swim candidate: rewind to x={x0}")
+                return frame0, info, trace
+            score = int(info.get("x_pos", 0)) - 10 * back
+            passes.append((score, frame0, x0, snap, info, trace, macro))
+    if not passes:
+        print("  giving up after all aligned swim candidates")
+        return None
+    passes.sort(key=lambda item: item[0], reverse=True)
+    score, frame0, x0, snap, info, trace, macro = passes[0]
+    env.unwrapped.load_state(snap)
+    for action in trace:
+        advance(env, action, 1)
+    print(
+        f"  solved swim (score {score}): rewind to x={x0}, "
+        f"{len(macro.pulses)} pulses/{macro.frames} native frames -> "
+        f"x={info['x_pos']}"
+    )
     return frame0, info, trace
+
+
+def solve_obstacle(
+    env,
+    history,
+    mode="ground",
+    *,
+    excluded_branches=frozenset(),
+    minimum_branch=0,
+):
+    """Dispatch obstacle recovery without changing the solver-step cadence."""
+    if mode == "water":
+        return _solve_swim_obstacle(env, history)
+    return _solve_ground_obstacle(
+        env,
+        history,
+        excluded_branches=excluded_branches,
+        minimum_branch=minimum_branch,
+        include_branch=mode == "maze",
+    )
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--level", default="1-3")
+    ap.add_argument("--action-set", default="complex")
     ap.add_argument("--out", default=None,
                     help="route dir (default models/ft_<level>/waypoints)")
     ap.add_argument("--max-frames", type=int, default=60000,
                     help="route-length budget (NATIVE frames) before giving up")
-    ap.add_argument("--skip", type=int, default=1,
-                    help="native frames per solver step (policy cadence; use 4)")
+    ap.add_argument("--skip", type=int, default=4,
+                    help="native frames per solver step (policy cadence)")
     args = ap.parse_args()
     global SKIP
     SKIP = args.skip
+    if SKIP < 1:
+        ap.error("--skip must be >= 1")
+    mode = level_mode(args.level)
+    action_space = resolve_action_set(args.action_set)
+    if mode == "water" and any(
+        pulse.frames % SKIP
+        for macro in swim_candidates()
+        for pulse in macro.pulses
+    ):
+        ap.error("water pulse durations must align to --skip")
     out_dir = args.out or f"models/ft_{args.level}/waypoints"
+    route_metadata = {
+        "action_set": args.action_set,
+        "decision_skip": SKIP,
+    }
 
     env = JoypadSpace(
         gym_super_mario_bros.make(f"SuperMarioBros-{args.level}-v0",
                                   render_mode="rgb_array"),
-        SIMPLE_MOVEMENT,
+        action_space,
     )
     _, info = env.reset(seed=0)
     raw = env.unwrapped
@@ -292,10 +574,16 @@ def main():
     events = 0
     commit_counts = {}
     flag = False
+    previous_x = start_x
+    maze_branch = 0
+    maze_branches = MazeBranchMemory()
+    maze_restore = None
+    maze_minimum_branch = 0
 
     def handle_obstacle(obstacle_x):
         nonlocal history, waypoints, last_x, last_progress_frame, flag
         nonlocal was_grounded, events, commit_counts
+        nonlocal maze_branch, maze_restore, maze_minimum_branch
         events += 1
         solved = None
         if events > EVENT_CAP:
@@ -304,7 +592,24 @@ def main():
                   f"partial route.")
         else:
             for retry in range(3):
-                solved = solve_obstacle(env, history)
+                search_history = (
+                    [maze_restore]
+                    if mode == "maze" and maze_minimum_branch
+                    else history
+                )
+                solved = solve_obstacle(
+                    env,
+                    search_history,
+                    mode,
+                    excluded_branches=(
+                        maze_branches.excluded(maze_restore)
+                        if mode == "maze"
+                        and maze_minimum_branch
+                        and maze_restore is not None
+                        else frozenset()
+                    ),
+                    minimum_branch=maze_minimum_branch,
+                )
                 if solved is not None or len(history) <= 2:
                     break
                 # dead-end perch: BAN the newest landings (else the
@@ -314,34 +619,62 @@ def main():
                 # repeated failure at the same obstacle condemns the whole
                 # launch region (16px point-bans invite shuffling along a
                 # platform one locale at a time - run 15).
-                k = retry + 1
-                for h in history[-2:]:
-                    for dx in range(-k, k + 1):
-                        for dy in range(-k, k + 1):
-                            banned.add((h[1] // 16 + dx, h[2] // 16 + dy))
-                print(f"  retry {retry + 1}: banned {len(banned)} locales "
-                      f"(radius {k}), dropping 2 newest history entries "
-                      f"({len(history) - 2} left)")
+                if mode != "water":
+                    k = retry + 1
+                    for h in history[-2:]:
+                        for dx in range(-k, k + 1):
+                            for dy in range(-k, k + 1):
+                                banned.add(
+                                    (
+                                        h[1] // 16 + dx,
+                                        h[2] // 16 + dy,
+                                    )
+                                )
+                    print(
+                        f"  retry {retry + 1}: banned {len(banned)} "
+                        f"locales (radius {k}), dropping 2 newest history "
+                        f"entries ({len(history) - 2} left)"
+                    )
                 history = history[:-2]
         if solved is None:
-            save_native_route(out_dir + "-partial", args.level, actions,
-                              waypoints, partial=True, blocked_x=obstacle_x)
+            save_native_route(
+                out_dir + "-partial",
+                args.level,
+                actions,
+                waypoints,
+                **route_metadata,
+                partial=True,
+                blocked_x=obstacle_x,
+            )
             print(f"FAILED: no macro cleared x={obstacle_x}. Partial route "
                   f"saved to {out_dir}-partial for diagnosis.")
             sys.exit(1)
-        frame0, info, trace = solved
+        if mode == "maze":
+            frame0, info, trace, selected_branch = solved
+            restore_entry, committed_history = commit_maze_candidate(
+                search_history, history, frame0
+            )
+            maze_restore = restore_entry
+            maze_branch = selected_branch
+            maze_minimum_branch = 0
+        else:
+            frame0, info, trace = solved
         del actions[frame0:]          # rewind the route to the restore point
         actions.extend(trace)         # splice the successful macro in
-        history = [h for h in history if h[0] <= frame0]
+        history = (
+            committed_history
+            if mode == "maze"
+            else [entry for entry in history if entry[0] <= frame0]
+        )
         waypoints = [w for w in waypoints if w["frame"] <= frame0]
         last_x = int(info["x_pos"])
         last_progress_frame = len(actions)
-        was_grounded = True   # the judged splice state is grounded/riding
+        was_grounded = mode != "ground" or grounded(env)
         # belt-and-braces loop breaker: a locale committed twice without a
         # breakthrough is banned - no loop class survives two beats
         locale = (last_x // 16, int(info["y_pos"]) // 16)
         commit_counts[locale] = commit_counts.get(locale, 0) + 1
-        if commit_counts[locale] >= 2:
+        if mode != "water" and commit_counts[locale] >= 2:
             banned.add(locale)
         if info.get("flag_get"):
             flag = True
@@ -351,7 +684,8 @@ def main():
                                              raw.dump_state()))
 
     while len(actions) * SKIP < args.max_frames and not flag:
-        done, info = advance(env, RIGHT_B, 1, actions)
+        cruise_action = RIGHT_A_B if mode == "water" else RIGHT_B
+        done, info = advance(env, cruise_action, 1, actions)
         frame = len(actions)
         if info.get("flag_get"):
             flag = True
@@ -359,22 +693,62 @@ def main():
         if done:
             print(f"death at x={info['x_pos']} (frame {frame}); solving...")
             handle_obstacle(int(info["x_pos"]))
+            previous_x = last_x
             continue
         x = int(info["x_pos"])
+        if mode == "maze":
+            progress = maze_progress(previous_x, x, maze_branch)
+            if progress.wrong_branch:
+                if maze_restore is None:
+                    print(
+                        f"maze reset {previous_x}->{x} before a branch "
+                        "candidate was recorded; recovering from history"
+                    )
+                    handle_obstacle(x)
+                else:
+                    reset_from_x = previous_x
+                    maze_branches.reject(maze_restore, maze_branch)
+                    maze_branch = progress.next_branch
+                    maze_minimum_branch = maze_branch
+                    frame0, restore_x, restore_y, snap = maze_restore
+                    raw.load_state(snap)
+                    del actions[frame0:]
+                    history = [
+                        entry for entry in history if entry[0] <= frame0
+                    ]
+                    waypoints = [
+                        waypoint
+                        for waypoint in waypoints
+                        if waypoint["frame"] <= frame0
+                    ]
+                    last_x = restore_x
+                    last_progress_frame = frame0
+                    was_grounded = grounded(env)
+                    previous_x = restore_x
+                    print(
+                        f"maze branch {maze_branch - 1} reset "
+                        f"{reset_from_x}->{x}; restored x={restore_x}, "
+                        f"trying branch {maze_branch}"
+                    )
+                    handle_obstacle(restore_x)
+                previous_x = last_x
+                continue
         if x > last_x:
             last_x, last_progress_frame = x, frame
         elif frame - last_progress_frame > STALL_FRAMES // SKIP:
             print(f"stall at x={last_x} (frame {frame}); solving...")
             handle_obstacle(last_x)
+            previous_x = last_x
             continue
-        is_grounded = grounded(env)
+        is_grounded = mode == "water" or grounded(env)
         # snapshot every landing (airborne -> grounded transition) plus the
         # SNAP_EVERY cadence, but only ever GROUNDED states: landings are
         # the restore points that matter (platform tops, lift boardings),
         # and a lift-riding window shorter than SNAP_EVERY would otherwise
         # never be captured (this exact miss blocked run 4 at x=745)
         if (is_grounded and not was_grounded) or (
-                frame % max(1, SNAP_EVERY // SKIP) == 0 and is_grounded):
+            frame % max(1, SNAP_EVERY // SKIP) == 0 and is_grounded
+        ):
             history = push_history(history, (frame, x, int(info["y_pos"]),
                                              raw.dump_state()))
             if x - waypoints[-1]["x_pos"] >= WAYPOINT_EVERY_X:
@@ -382,15 +756,29 @@ def main():
                     {"index": len(waypoints), "frame": frame, "x_pos": x}
                 )
         was_grounded = is_grounded
+        previous_x = x
 
     if not flag:
-        save_native_route(out_dir + "-partial", args.level, actions,
-                          waypoints, partial=True, blocked_x=last_x)
+        save_native_route(
+            out_dir + "-partial",
+            args.level,
+            actions,
+            waypoints,
+            **route_metadata,
+            partial=True,
+            blocked_x=last_x,
+        )
         print(f"FAILED: frame budget exhausted before the flag (x={last_x}). "
               f"Partial route saved to {out_dir}-partial.")
         sys.exit(1)
 
-    native, wps = save_native_route(out_dir, args.level, actions, waypoints)
+    native, wps = save_native_route(
+        out_dir,
+        args.level,
+        actions,
+        waypoints,
+        **route_metadata,
+    )
     print(f"CLEARED {args.level}: {len(wps)} waypoints, "
           f"{len(native)}-frame route (skip={SKIP}) -> {out_dir}")
     for w in wps:

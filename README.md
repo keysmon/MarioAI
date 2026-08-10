@@ -70,7 +70,11 @@ died when quantized to skip 4. The aligned route clears by construction, and
 behavior cloning it with the exact `84x84 x 4` observation stack yielded a
 greedy clear plus **15/15 sampled clears** in the final probe.
 
-## How it works
+## How the legacy eight-level checkpoint works
+
+This diagram describes the historical v0.3.0 models, not the all-32
+acceptance pipeline. The shared all-32 policy replaces NatureCNN with the
+IMPALA residual encoder and emits one of 12 `COMPLEX_MOVEMENT` actions.
 
 ```
 raw NES frame (240x256x3)
@@ -100,24 +104,47 @@ An older battle-tested stack is pinned in `requirements-legacy.txt` (needs a one
 
 ## Usage
 
-```bash
-# Train the multi-task model across several levels:
-python -m marioai.train --config configs/default.yaml --run-name mario_multitask
+### All-32 shared policy pipeline (acceptance-capable)
 
-# Fine-tune that model on one stubborn level (transfer + specialize):
-python -m marioai.train --init-from models/mario_multitask/final.zip --levels 2-1 \
+```bash
+python -m marioai.train --config configs/all32.yaml --phase phase_1 --run-name all32-phase1
+python -m marioai.train --config configs/all32.yaml --phase phase_2 \
+  --resume models/all32-phase1/final.zip --run-name all32-phase2
+python -m marioai.evaluate --model models/all32-phase2/final.zip \
+  --levels all --episodes 15 --stochastic --seed 42000 \
+  --out reports/all32-phase2.json
+
+# Record a normalized 2x, infinite-loop GIF from the shared checkpoint:
+python -m marioai.record_gif --model models/all32-phase2/final.zip \
+  --level 2-1 --out assets/gifs/2-1.gif --rollouts 15
+```
+
+Only a `shared_complex_impala` report containing exactly 15 stochastic
+rollouts for each of all 32 stages can print acceptance `PASS`.
+
+### Legacy eight-level reproduction (diagnostic only)
+
+These commands reproduce the historical seven-action NatureCNN workflow.
+`--legacy-diagnostic` labels its JSON as
+`legacy_simple_nature_diagnostic`, which can never satisfy all-32 acceptance.
+
+```bash
+# Train and fine-tune the historical model:
+python -m marioai.train --config configs/default.yaml --run-name mario_multitask
+python -m marioai.train --config configs/default.yaml \
+  --init-from models/mario_multitask/final.zip --levels 2-1 \
   --lr 0.00005 --ent-coef 0.03 --timesteps 2000000 --run-name ft_2-1
 
-# Evaluate per-level clear-rate + mean reward:
-python -m marioai.evaluate --model models/ft_2-1/final.zip --levels 2-1
-
-# Record a smooth GIF (records N rollouts, keeps the cleanest):
-python -m marioai.record_gif --model models/ft_2-1/final.zip --level 2-1 --out assets/gifs/2-1.gif --rollouts 15
+# Emit explicitly non-acceptance legacy diagnostics:
+python -m marioai.evaluate --model models/ft_2-1/final.zip --levels 2-1 \
+  --episodes 15 --stochastic --legacy-diagnostic \
+  --out reports/legacy-ft-2-1-diagnostic.json
 
 # Reproduce the 1-3 machine demonstration and clone it into a PPO policy:
-python scripts/solve_level.py --level 1-3 --skip 4
+python scripts/solve_level.py --level 1-3 --skip 4 --action-set simple
 python scripts/behavior_clone_route.py \
   --route-dir models/ft_1-3/waypoints \
+  --action-set simple \
   --init-from models/mario_multitask/final.zip \
   --out models/ft_1-3/final.zip
 ```

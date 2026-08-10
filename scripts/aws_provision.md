@@ -1,89 +1,233 @@
-# AWS GPU Training Runbook (defectlens, us-east-1, <$50, on-demand)
+# Guarded all-32 AWS runbook
 
-Real training runs on an AWS on-demand GPU. Local machines run only the Phase 0
-spike and short sanity checks. Follow these steps in order.
+This workflow is authorized only for AWS profile `defectlens`, account
+`002559670021`, region `us-east-1`, and the resources pinned in
+`configs/aws-all32.yaml`. It trains one shared complex-action IMPALA policy.
+Do not add specialist policies, recurrence, or level conditioning during this
+run.
 
-## 0. Identity + quota preflight (do FIRST)
+Run every command from the repository root with a clean, tested commit. The
+ledger is `reports/aws-spend.json`; never delete or roll it back. All lifecycle
+commands use argument vectors, the configured on-demand ceilings for the
+safety ledger, and unconditional instance termination. The benchmark report
+uses the exact observed Spot rate and duration only for measured
+cost-per-million selection.
 
-```bash
-aws sts get-caller-identity --profile defectlens
-# Confirm account 002559670021.
-
-aws service-quotas get-service-quota --service-code ec2 \
-  --quota-code L-DB2E81BA --region us-east-1 --profile defectlens
-# L-DB2E81BA = "Running On-Demand G and VT instances" (measured in vCPUs).
-# g5.2xlarge needs 8 vCPUs. If the current value is < 8, request an increase and WAIT
-# (approval can take hours):
-aws service-quotas request-service-quota-increase --service-code ec2 \
-  --quota-code L-DB2E81BA --desired-value 8 --region us-east-1 --profile defectlens
-```
-
-## 1. Launch on-demand g5.2xlarge (Deep Learning AMI)
-
-Use the `launching-ec2-instance-with-best-practices` skill, OR launch manually with a
-recent Deep Learning OSS PyTorch AMI (Ubuntu, us-east-1), a 100 GB gp3 root volume, an
-SSH key, and a security group allowing only your IP on port 22. Tag `Project=MarioAI`.
-
-g5.2xlarge = 8 vCPUs + 1x A10G GPU. On-demand ~$1.21/hr; a full multi-task run is
-roughly 1-4 GPU-hours, comfortably under the $50 ceiling.
-
-## 2. Sync code + install (Linux CUDA torch)
+## 1. Read-only preflight and launch blocker
 
 ```bash
-# from your Mac:
-rsync -av --exclude .venv --exclude models --exclude runs --exclude .git \
-  ./ ubuntu@<ip>:~/MarioAI/
-
-# on the instance:
-ssh ubuntu@<ip>
-cd MarioAI
-python3.13 -m venv .venv && source .venv/bin/activate
-pip install -U pip
-pip install -r requirements.txt
-# Swap the CPU torch wheel for the CUDA build (matching the frozen torch version):
-pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu124
-pip install -e . --no-deps
-python -c "import torch; print('cuda:', torch.cuda.is_available())"   # expect: cuda: True
+.venv/bin/python scripts/aws_all32.py preflight \
+  --config configs/aws-all32.yaml
 ```
 
-If the exact CUDA torch wheel is unavailable, install the nearest available CUDA build
-of torch; the RL code is torch-version-tolerant. Re-run the spike as a sanity check:
-`python scripts/spike.py`.
+The JSON must identify account `002559670021`, the configured VPC/subnets,
+accessible S3 prefix, and at least one current allowed Spot offer. It must show
+no running `MarioAI-All32` instance.
 
-## 3. Train (see plan Tasks 10-11)
+For an independent operator check, run the exact query used as the launch
+blocker:
 
 ```bash
-# Milestone 1 - 1-1 proof gate:
-python -m marioai.train --config configs/default.yaml --levels 1-1 \
-  --timesteps 1000000 --run-name mario_1_1
-# Milestone 2 - multi-task:
-python -m marioai.train --config configs/default.yaml --run-name mario_multitask
+aws ec2 describe-instances \
+  --profile defectlens \
+  --region us-east-1 \
+  --filters \
+    Name=tag:Project,Values=MarioAI-All32 \
+    Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down \
+  --query 'Reservations[].Instances[].InstanceId' \
+  --output json
 ```
 
-Watch progress (SSH-tunnel TensorBoard):
+Any non-empty result blocks another launch. Run `reconcile`; do not start a
+second instance.
+
+## 2. Measured benchmark gate — maximum USD 4.00
+
+The fixed workload is exactly 100,000 Stable-Baselines environment/action
+steps. With frame skip 4, these are decision steps, not one million emulator
+frames.
 
 ```bash
-tensorboard --logdir runs --port 6006
-# from your Mac: ssh -L 6006:localhost:6006 ubuntu@<ip>, then open localhost:6006
+mkdir -p reports
+set -o pipefail
+.venv/bin/python scripts/aws_all32.py benchmark \
+  --config configs/aws-all32.yaml \
+  --ledger reports/aws-spend.json \
+  --max-spend 4.00 \
+  --ssh-key "$HOME/.ssh/mario-training-key.pem" \
+  | tee reports/aws-benchmark.json
 ```
 
-## 4. Record GIFs (headless), retrieve artifacts, then TERMINATE
+The command measures both configured candidates while the allocation can fit
+the next candidate's conservative runtime plus the single termination grace
+window. Otherwise it returns the best completed measurement with
+`decision: allocation_exhausted`. It always terminates and settles a launched
+candidate. The report records each candidate's `env_steps_per_second`,
+`cost_per_million_steps`, `peak_rss_gb`, and the
+`selected_instance_type`.
 
-`nes-py` renders `rgb_array` with no display, so GIF recording works on a bare box.
+Load the measured winner for later commands:
 
 ```bash
-# on the instance:
-scripts/record_all_gifs.sh models/mario_multitask/final.zip
-
-# from your Mac - pull artifacts down:
-rsync -av ubuntu@<ip>:~/MarioAI/models/ ./models/
-rsync -av ubuntu@<ip>:~/MarioAI/assets/gifs/ ./assets/gifs/
-
-# TERMINATE (not stop - a stopped instance still bills for its EBS volume):
-aws ec2 terminate-instances --instance-ids <id> --region us-east-1 --profile defectlens
-
-# Confirm nothing is still running:
-aws ec2 describe-instances --region us-east-1 --profile defectlens \
-  --filters Name=instance-state-name,Values=running \
-  --query 'Reservations[].Instances[].InstanceId'
+INSTANCE_TYPE="$(
+  .venv/bin/python -c \
+  'import json; print(json.load(open("reports/aws-benchmark.json", encoding="utf-8"))["selected_instance_type"])'
+)"
+printf '%s\n' "$INSTANCE_TYPE"
 ```
+
+Only `c7i.4xlarge` or `c7i.16xlarge` is valid. The lifecycle command rejects
+any other value before mutation.
+
+## 3. Launch and status
+
+Example phase-1 launch with a four-hour guarded maximum:
+
+```bash
+.venv/bin/python scripts/aws_all32.py launch \
+  --config configs/aws-all32.yaml \
+  --ledger reports/aws-spend.json \
+  --phase phase_1 \
+  --max-hours 4.00 \
+  --instance-type "$INSTANCE_TYPE" \
+  --ssh-key "$HOME/.ssh/mario-training-key.pem"
+```
+
+The launch performs another full preflight immediately before mutation,
+persists a crash-recoverable reservation first, and refuses a maximum runtime
+that cannot fit the phase allocation or hard USD 50 cap. Do not bypass the
+command with a raw `run-instances` call.
+
+For `phase_1` and `phase_2`, the remote supervisor runs the shared-policy
+phase worker automatically. It trains in fixed environment-step chunks,
+diagnoses every complete candidate, retains continuous last-candidate lineage
+separately from the promoted best, and deterministically reweights regressed
+levels for the next chunk. Its aware inner deadline is 60 seconds before the
+outer GNU `timeout`, reserving time to persist and sync complete artifacts.
+
+Check all project instances, or one exact ID:
+
+```bash
+.venv/bin/python scripts/aws_all32.py status \
+  --config configs/aws-all32.yaml
+
+.venv/bin/python scripts/aws_all32.py status \
+  --config configs/aws-all32.yaml \
+  --instance-id i-0123456789abcdef0
+```
+
+## 4. Reconcile after every run
+
+```bash
+.venv/bin/python scripts/aws_all32.py reconcile \
+  --config configs/aws-all32.yaml \
+  --ledger reports/aws-spend.json
+```
+
+Reconciliation terminates active `Project=MarioAI-All32` resources, settles
+the durable reservation conservatively, and clears it only after exact
+terminal confirmation. Repeat `status` and the independent blocker query
+until both are empty.
+
+## 5. Emergency termination
+
+First confirm the exact Project-tagged target with `status`, then request
+idempotent termination:
+
+```bash
+.venv/bin/python scripts/aws_all32.py terminate \
+  --config configs/aws-all32.yaml \
+  --instance-id i-0123456789abcdef0
+
+.venv/bin/python scripts/aws_all32.py reconcile \
+  --config configs/aws-all32.yaml \
+  --ledger reports/aws-spend.json
+```
+
+The command refuses an unowned or malformed instance ID. If SSH, training,
+sync, or accounting fails, preserve the error and run `reconcile`; never erase
+the launch sidecar manually.
+
+## 6. Resume exact phase lineage
+
+Use only the canonical phase-lineage head for the same shared phase:
+
+```bash
+.venv/bin/python scripts/aws_all32.py resume \
+  --config configs/aws-all32.yaml \
+  --ledger reports/aws-spend.json \
+  --phase phase_1 \
+  --max-hours 4.00 \
+  --instance-type "$INSTANCE_TYPE" \
+  --checkpoint-s3-uri \
+    s3://defectlens-phase3-002559670021/marioai/all32/models/all32-phase_1/latest.json \
+  --ssh-key "$HOME/.ssh/mario-training-key.pem"
+```
+
+`latest.json` is a small phase-lineage head, not a guessed checkpoint name.
+It hashes an immutable phase-state object that names the exact last candidate,
+promoted best, incumbent diagnostic report, and next level weights. Resume
+downloads only those named objects and each referenced complete
+model/config/signature/VecNormalize/ledger bundle. It verifies every hash,
+report-to-checkpoint pairing, policy/environment identity, timestep, and both
+checkpoint-ledger histories against the authoritative ledger before paid
+mutation. The same identities are rehashed immediately before
+`run-instances`.
+
+If interruption happened after a candidate bundle was persisted but before
+its diagnostic, the resumed phase diagnoses that last candidate first. It
+never promotes an undiagnosed or regressed last candidate automatically.
+Chunk progress is expressed in environment steps, so training continues from
+the exact last candidate while returning only the independently promoted
+best.
+
+## 7. Bootstrap phase 2 from the promoted phase-1 policy
+
+Phase 2 must continue the same shared policy. Restore the canonical phase-1
+lineage and explicitly bootstrap from its independently promoted best:
+
+```bash
+.venv/bin/python scripts/aws_all32.py resume \
+  --config configs/aws-all32.yaml \
+  --ledger reports/aws-spend.json \
+  --phase phase_2 \
+  --bootstrap-from-phase phase_1 \
+  --max-hours 4.00 \
+  --instance-type "$INSTANCE_TYPE" \
+  --checkpoint-s3-uri \
+    s3://defectlens-phase3-002559670021/marioai/all32/models/all32-phase_1/latest.json \
+  --ssh-key "$HOME/.ssh/mario-training-key.pem"
+```
+
+The bootstrap source is retained in phase-2 lineage for crash recovery and
+provenance. It is never diagnosed or promoted as phase-2 evidence; the first
+new phase-2 candidate is trained on all 32 levels, then diagnosed normally.
+
+## 8. Spend and evidence checks
+
+```bash
+.venv/bin/python -c \
+'from decimal import Decimal
+from pathlib import Path
+from marioai.budget import BudgetLedger
+ledger = BudgetLedger.load(Path("reports/aws-spend.json"), cap_usd=Decimal("50.00"))
+print("spent_usd =", ledger.spent_usd)
+print("remaining_usd =", ledger.remaining_usd)
+print("runs =", len(ledger.runs))
+assert ledger.spent_usd <= Decimal("50.00")'
+```
+
+Before another paid action, also inspect the benchmark and diagnostic evidence:
+
+```bash
+.venv/bin/python -m json.tool reports/aws-benchmark.json
+find models/all32-phase_1/diagnostics \
+  -type f -name '*.json' -print | sort
+.venv/bin/python -m json.tool models/all32-phase_1/latest.json
+```
+
+Chunk diagnostics are permanently separate from acceptance evidence: exactly
+three seeded stochastic rollouts per active stage can rank checkpoints through
+coverage, clears, and progress, but can never satisfy the final 15-rollout
+acceptance predicate. A regressed stage receives deterministic doubled weight
+in the next fixed-worker shared-policy assignment.
